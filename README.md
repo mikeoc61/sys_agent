@@ -67,7 +67,7 @@ matches reality — no more `apt` suggestions on a Mac.
 ### With uv (recommended)
 
 ```bash
-git clone git@github.com:<user>/sys_agent.git
+git clone https://github.com/mikeoc61/sys_agent.git
 cd sys_agent
 chmod +x sys_agent.py
 mkdir -p ~/.local/bin
@@ -81,7 +81,7 @@ dependency block; subsequent runs are instant.
 ### With pip + venv
 
 ```bash
-git clone git@github.com:<user>/sys_agent.git
+git clone https://github.com/mikeoc61/sys_agent.git
 cd sys_agent
 python3 -m venv .venv
 source .venv/bin/activate
