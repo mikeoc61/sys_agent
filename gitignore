@@ -21,8 +21,8 @@ env/
 .DS_Store
 Thumbs.db
 
-# Secrets — the real env file lives at ~/.openclaw/openclaw.env, but in case
-# anyone copies it into the project dir for testing, never commit it.
-openclaw.env
+# Secrets — never commit real env files. Only the .example template is tracked.
 .env
 *.local.env
+sys_agent.env
+.sys_agent.env

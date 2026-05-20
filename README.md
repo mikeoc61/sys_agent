@@ -91,11 +91,32 @@ pip install -r requirements.txt
 
 ## Configuration
 
-API keys can come from the shell environment or from a key-value file. The
-script checks for the file at `~/.openclaw/openclaw.env` by default; override
-with `SYS_ENV_FILE`. Shell-exported variables always win over file values.
+API keys can come from the shell environment or from a key-value file. If
+`SYS_ENV_FILE` is set, that path is used exclusively. Otherwise sys_agent
+searches the following locations in priority order and uses the first that
+exists:
 
-Example file (copy `openclaw.env.example`):
+1. `./.env` — current working directory (dotenv convention)
+2. `$XDG_CONFIG_HOME/sys_agent/.env` (default `~/.config/sys_agent/.env`)
+3. `~/.sys_agent.env` — home dotfile fallback
+
+Shell-exported variables always override file values.
+
+### Quick setup
+
+```bash
+mkdir -p ~/.config/sys_agent
+cp .env.example ~/.config/sys_agent/.env
+chmod 600 ~/.config/sys_agent/.env
+$EDITOR ~/.config/sys_agent/.env
+```
+
+The template (`.env.example`) is committed; the real `.env` is gitignored.
+
+### File format
+
+Shell-style `KEY=value`, one per line. `export` prefix and `#` comments
+are accepted; matching surrounding quotes are stripped.
 
 ```sh
 OPENAI_API_KEY=sk-...
@@ -115,7 +136,7 @@ SYS_ANTHROPIC_MODEL=claude-sonnet-4-6
 | `SYS_PROVIDER` | Skip provider prompt: `openai` or `anthropic` | (prompt) |
 | `SYS_OPENAI_MODEL` | OpenAI model string | `gpt-4o-mini` |
 | `SYS_ANTHROPIC_MODEL` | Anthropic model string | `claude-haiku-4-5-20251001` |
-| `SYS_ENV_FILE` | Path to KEY=value env file | `~/.openclaw/openclaw.env` |
+| `SYS_ENV_FILE` | Explicit env-file path; skips the search above | (search) |
 | `SYS_COLOR` | `on` / `off` / `auto` | `auto` |
 | `NO_COLOR` | If set, disables color regardless of `SYS_COLOR=auto` | — |
 

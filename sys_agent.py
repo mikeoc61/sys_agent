@@ -23,9 +23,16 @@ Env:      OPENAI_API_KEY            (one of these is required)
           SYS_PROVIDER               (skip prompt: openai|anthropic)
           SYS_OPENAI_MODEL           (default gpt-4o-mini)
           SYS_ANTHROPIC_MODEL        (default claude-haiku-4-5-20251001)
-          SYS_ENV_FILE               (default ~/.openclaw/openclaw.env)
+          SYS_ENV_FILE               (path to env file; overrides search)
           SYS_COLOR                  (on|off|auto, default auto)
           NO_COLOR                  (if set, disables color regardless)
+
+If SYS_ENV_FILE is not set, the script searches these locations in order
+and uses the first that exists:
+    ./.env
+    $XDG_CONFIG_HOME/sys_agent/.env  (default ~/.config/sys_agent/.env)
+    ~/.sys_agent.env
+Shell-exported vars always override file values.
 """
 
 from __future__ import annotations
@@ -60,7 +67,15 @@ DEFAULT_ANTHROPIC_MODEL = os.environ.get(
 )
 
 # Optional shell-style env file. Loaded if present; existing env vars win.
-ENV_FILE_DEFAULT = "~/.openclaw/openclaw.env"
+# Search order for env file when SYS_ENV_FILE is not set. First hit wins.
+# Values are expanded with os.path.expanduser/expandvars at lookup time.
+def _default_env_candidates() -> list[str]:
+    xdg = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
+    return [
+        ".env",                              # CWD (dotenv convention)
+        os.path.join(xdg, "sys_agent", ".env"),
+        "~/.sys_agent.env",                  # home dotfile fallback
+    ]
 
 # How much subprocess output to forward back to the model (chars).
 OUTPUT_MAX_CHARS = 8000
@@ -189,6 +204,22 @@ def load_env_file(path: str) -> int:
                 os.environ[key] = val
                 loaded += 1
     return loaded
+
+
+def find_env_file(explicit: str | None) -> str | None:
+    """
+    Return the first existing env-file path. If `explicit` is set, only that
+    path is tried (returning None if missing, so the caller can warn).
+    Otherwise the default candidate list is searched in priority order.
+    """
+    candidates = [explicit] if explicit else _default_env_candidates()
+    for p in candidates:
+        if not p:
+            continue
+        expanded = os.path.expanduser(os.path.expandvars(p))
+        if os.path.isfile(expanded):
+            return expanded
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -821,9 +852,16 @@ def run_repl(provider: Provider) -> None:
 # -----------------------------------------------------------------------------
 
 def main() -> None:
-    env_file = os.environ.get("SYS_ENV_FILE", ENV_FILE_DEFAULT)
-    load_env_file(env_file)
+    explicit = os.environ.get("SYS_ENV_FILE")
+    env_file = find_env_file(explicit)
     init_color()
+    if env_file:
+        n = load_env_file(env_file)
+        if n:
+            print(dim(f"[loaded {n} vars from {env_file}]"))
+    elif explicit:
+        # User pointed us at a specific file that doesn't exist — worth flagging
+        print(warn(f"[SYS_ENV_FILE={explicit} not found; relying on shell env]"))
     provider = select_provider()
     run_repl(provider)
 
