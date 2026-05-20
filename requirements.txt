@@ -1,0 +1,5 @@
+# Fallback for users who don't have uv. The script's authoritative dependency
+# list is the PEP 723 inline block at the top of sys_agent.py — keep this
+# file in sync if you bump versions there.
+openai>=1.40
+anthropic>=0.40,<2.0
