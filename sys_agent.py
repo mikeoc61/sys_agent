@@ -800,6 +800,11 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           the system before making changes.
         - One logical step per tool call. Avoid chaining unrelated commands
           on one line; it makes failures hard to diagnose.
+        - Commands run with captured stdout/stderr (no tty). Prefer
+          script-stable tooling: `apt-get` over `apt` on Debian/Ubuntu (apt
+          prints a CLI-stability warning when not on a tty); `dnf` is fine
+          on Fedora/RHEL. Add `--no-progress`, `-q`, or equivalent flags
+          when a tool offers them and the noise isn't useful.
         - After receiving command output, summarize the relevant findings
           and decide the next step.
         - When the task is complete, or you need user input, reply in plain
