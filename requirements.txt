@@ -3,3 +3,8 @@
 # file in sync if you bump versions there.
 openai>=1.40
 anthropic>=0.40,<2.0
+
+# macOS-only: real GNU readline replaces libedit so colored prompts render
+# correctly and Up/Down history navigation doesn't overwrite the prompt prefix.
+# PEP 508 env marker makes this a no-op on Linux/Windows.
+gnureadline>=8.1; sys_platform == 'darwin'

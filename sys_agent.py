@@ -4,6 +4,7 @@
 # dependencies = [
 #     "openai>=1.40",
 #     "anthropic>=0.40,<2.0",
+#     "gnureadline>=8.1; sys_platform == 'darwin'",
 # ]
 # ///
 """
@@ -37,6 +38,28 @@ Shell-exported vars always override file values.
 
 from __future__ import annotations
 
+# readline must be imported before any SSL-using library (openai, anthropic)
+# on macOS to avoid a segfault-on-exit quirk. Prefer gnureadline (proper GNU
+# readline as a drop-in for libedit, fixing colored prompts and history
+# redraw on macOS). Falls back to stdlib readline (GNU on Linux, libedit on
+# macOS without gnureadline). Falls back further to no readline (Windows).
+try:
+    import gnureadline as readline     # noqa: F401 — preferred backend
+    _HAVE_READLINE = True
+    _IS_LIBEDIT = False
+except ImportError:
+    try:
+        import readline                # noqa: F401 — stdlib fallback
+        _HAVE_READLINE = True
+        # macOS stdlib readline links to libedit, which strips ANSI escapes
+        # between \001/\002 markers — killing colored prompts and causing
+        # prefix redraw issues on history navigation. Detect to degrade
+        # gracefully if gnureadline failed to install for any reason.
+        _IS_LIBEDIT = bool(readline.__doc__ and "libedit" in readline.__doc__)
+    except ImportError:
+        _HAVE_READLINE = False
+        _IS_LIBEDIT = False
+
 import json
 import os
 import platform
@@ -44,6 +67,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import atexit
 from dataclasses import dataclass
 from typing import Any
 
@@ -112,6 +136,10 @@ DENY_SUBSTRINGS = (
     "chmod -R 777 /",
 )
 
+# readline history settings
+HISTORY_FILE_DEFAULT = "~/.config/sys_agent/history"
+HISTORY_MAX_LINES = 1000
+
 
 # -----------------------------------------------------------------------------
 # Color (ANSI escapes, no external deps)
@@ -172,6 +200,142 @@ def banner(t: str) -> str:     return _wrap(t, _ANSI.BOLD, _ANSI.CYAN)
 def ask(t: str) -> str:        return _wrap(t, _ANSI.BOLD, _ANSI.CYAN)
 def user_tag(t: str) -> str:   return _wrap(t, _ANSI.BOLD, _ANSI.CYAN)
 def agent_tag(t: str) -> str:  return _wrap(t, _ANSI.BOLD, _ANSI.GREEN)
+
+
+def rl_prompt(text: str) -> str:
+    """
+    Wrap a colored prompt for safe use with input() on GNU readline.
+    Markers \\001 and \\002 tell readline "this region is zero-width" — fixing
+    both cursor math and history-redraw behavior. On libedit (macOS default)
+    the markers cause ANSI to be stripped entirely, so callers should use
+    colored_input() instead of this helper directly.
+
+    No-op when color is disabled or readline is unavailable.
+    """
+    if not _color_enabled or not _HAVE_READLINE:
+        return text
+    import re
+    return re.sub(r"(\x1b\[[0-9;]*m)", "\001\\1\002", text)
+
+
+def colored_input(prompt: str) -> str:
+    """
+    Read a line of input with a colored prompt, choosing the right strategy
+    based on the readline backend:
+
+    - GNU readline (Linux/Pi): pass colored text through input() with
+      \\001/\\002 width-hint markers. Color renders; cursor math correct;
+      history Up-arrow redraws cleanly.
+    - libedit (macOS default): markers strip ANSI, so print the colored
+      prefix separately and call input(""). Color renders; cursor math
+      correct (empty prompt = 0 width). Tradeoff: history Up-arrow may
+      visually overwrite the prefix in some terminals — cosmetic only.
+    - No readline (Windows): plain input(prompt).
+    """
+    if _color_enabled and _IS_LIBEDIT:
+        print(prompt, end="", flush=True)
+        return input("")
+    return input(rl_prompt(prompt))
+
+
+def drop_last_history_entry() -> None:
+    """Remove the most recent readline history entry. Safe no-op without readline."""
+    if not _HAVE_READLINE:
+        return
+    try:
+        length = readline.get_current_history_length()
+        if length > 0:
+            readline.remove_history_item(length - 1)
+    except (ValueError, IndexError):
+        # Empty entry never added, or backend quirk — safe to ignore.
+        pass
+
+
+def input_no_history(prompt: str) -> str:
+    """
+    colored_input variant that drops the entered line from history. Used for
+    short-answer prompts (y/n/edit/quit, provider choice) that would only
+    pollute Up-arrow recall of real conversational prompts.
+    """
+    ans = colored_input(prompt)
+    drop_last_history_entry()
+    return ans
+
+
+# -----------------------------------------------------------------------------
+# readline (input history + line editing)
+# -----------------------------------------------------------------------------
+
+# Module-level path so /reset etc. can reference if needed later.
+_history_path: str | None = None
+
+
+def _decode_libedit_escapes() -> None:
+    """
+    libedit writes history with octal escapes for whitespace/backslash
+    (\\040 for space, \\011 for tab, \\134 for backslash). gnureadline reads
+    those as literal text, so a file written by libedit and loaded by
+    gnureadline shows "How\\040does\\040swap?" on Up-arrow recall.
+
+    Walk the loaded history once on startup; decode any entry that contains
+    libedit-style escapes. Idempotent — entries already plain pass through
+    unchanged. Called by init_readline after read_history_file.
+    """
+    if not _HAVE_READLINE:
+        return
+    n = readline.get_current_history_length()
+    for i in range(1, n + 1):
+        item = readline.get_history_item(i)
+        if not item or "\\0" not in item and "\\1" not in item:
+            continue
+        decoded = (item
+                   .replace("\\040", " ")
+                   .replace("\\011", "\t")
+                   .replace("\\012", "\n")
+                   .replace("\\134", "\\"))
+        if decoded != item:
+            readline.replace_history_item(i - 1, decoded)
+
+
+def init_readline() -> None:
+    """
+    Configure readline history persistence and length cap. Safe no-op when
+    readline is unavailable (Windows). Failures are non-fatal — printed once,
+    then the REPL continues without history persistence.
+    """
+    global _history_path
+    if not _HAVE_READLINE:
+        return
+    path = os.path.expanduser(HISTORY_FILE_DEFAULT)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as e:
+        print(dim(f"[readline: cannot create history dir: {e}]"))
+        return
+    # Load prior history if present; missing file is fine.
+    try:
+        readline.read_history_file(path)
+        _decode_libedit_escapes()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(dim(f"[readline: cannot read history: {e}]"))
+    # Cap history length on disk (in-memory cap set separately).
+    try:
+        readline.set_history_length(HISTORY_MAX_LINES)
+    except Exception:           # noqa: BLE001 — some libedit builds are picky
+        pass
+    _history_path = path
+
+
+def save_readline_history() -> None:
+    """Persist history on exit. Non-fatal on failure."""
+    if not _HAVE_READLINE or _history_path is None:
+        return
+    try:
+        readline.write_history_file(_history_path)
+    except OSError as e:
+        print(dim(f"[readline: cannot save history: {e}]"))
 
 
 # -----------------------------------------------------------------------------
@@ -381,11 +545,8 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
         print(warn("[auto-approve on] running."))
         return "run", None
     while True:
-        # Print colored prompt separately so readline (if linked) doesn't
-        # miscount cursor width on long inputs.
-        print(warn_bold("Run? [y]es / [n]o / [e]dit / [q]uit: "), end="", flush=True)
         try:
-            ans = input("").strip().lower()
+            ans = input_no_history(warn_bold("Run? [y]es / [n]o / [e]dit / [q]uit: ")).strip().lower()
         except EOFError:
             return "abort", None
         if ans in ("y", "yes", ""):
@@ -607,9 +768,8 @@ def select_provider() -> Provider:
     print(f"  [1] OpenAI     (model: {DEFAULT_OPENAI_MODEL})")
     print(f"  [2] Anthropic  (model: {DEFAULT_ANTHROPIC_MODEL})")
     while True:
-        print(ask("Choice [1/2]: "), end="", flush=True)
         try:
-            ans = input("").strip().lower()
+            ans = input_no_history(ask("Choice [1/2]: ")).strip().lower()
         except (EOFError, KeyboardInterrupt):
             sys.exit("\nno selection; exiting")
         if ans in ("1", "o", "openai"):
@@ -682,17 +842,17 @@ def run_repl(provider: Provider) -> None:
     print()
 
     while True:
-        # Colored prompt printed separately so readline (if linked into input())
-        # doesn't miscount cursor width on the escape codes. User-typed text
-        # remains plain (terminal echoes default).
-        print(user_tag("you>") + " ", end="", flush=True)
         try:
-            user_in = input("").strip()
+            user_in = colored_input(user_tag("you>") + " ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return
         if not user_in:
             continue
+
+        # Meta-commands shouldn't pollute Up-arrow recall of real prompts
+        if user_in.startswith("/"):
+            drop_last_history_entry()
 
         # REPL meta-commands
         if user_in in ("/exit", "/quit"):
@@ -855,12 +1015,13 @@ def main() -> None:
     explicit = os.environ.get("SYS_ENV_FILE")
     env_file = find_env_file(explicit)
     init_color()
+    init_readline()
+    atexit.register(save_readline_history)
     if env_file:
         n = load_env_file(env_file)
         if n:
             print(dim(f"[loaded {n} vars from {env_file}]"))
     elif explicit:
-        # User pointed us at a specific file that doesn't exist — worth flagging
         print(warn(f"[SYS_ENV_FILE={explicit} not found; relying on shell env]"))
     provider = select_provider()
     run_repl(provider)
