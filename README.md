@@ -7,6 +7,7 @@ approval. Single Python file. No frameworks.
 
 ```
 $ sys_agent
+[loaded 2 vars from /home/mikeoc/.config/sys_agent/.env]
 sys_agent  provider=anthropic  model=claude-haiku-4-5-20251001  host=pi5 (Linux/aarch64)
 meta: /exit  /reset  /info  /auto on|off  /tokens on|off  /color on|off
 
@@ -53,6 +54,11 @@ matches reality — no more `apt` suggestions on a Mac.
   running session totals and percentage of context window consumed.
 - **Color output**: semantic ANSI coloring with auto-detection
   (TTY/`NO_COLOR`) and runtime toggle.
+- **Persistent history**: line editing and history navigation via readline
+  (gnureadline on macOS). Conversational prompts persist to
+  `~/.config/sys_agent/history` across sessions; meta-commands and
+  short-answer prompts are excluded so Up-arrow recall stays useful.
+  See [Tips & shortcuts](#tips--shortcuts) for keystrokes.
 - **Zero install footprint with uv**: PEP 723 inline-script dependencies;
   `uv` handles the environment transparently.
 
@@ -61,6 +67,9 @@ matches reality — no more `apt` suggestions on a Mac.
 - Python ≥ 3.10
 - One of: `uv` (recommended) **or** pip + venv
 - An OpenAI and/or Anthropic API key
+- macOS/Linux for the full experience. On Windows, the stdlib lacks
+  `readline` — the script still runs, but loses history persistence,
+  Up/Down recall, and line-editing keystrokes.
 
 ## Install
 
@@ -78,6 +87,12 @@ sys_agent
 First invocation builds a cached environment from the script's inline
 dependency block; subsequent runs are instant.
 
+> **macOS**: the inline block pulls in `gnureadline` automatically
+> (`sys_platform == 'darwin'`) to replace the system libedit-backed
+> readline with proper GNU readline — colored prompts render correctly
+> and Up/Down history navigation redraws cleanly. Linux installs skip
+> this dependency.
+
 ### With pip + venv
 
 ```bash
@@ -88,6 +103,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ./sys_agent.py
 ```
+
+`requirements.txt` carries the same `gnureadline` macOS-only marker as
+the inline block.
 
 ## Configuration
 
@@ -140,6 +158,18 @@ SYS_ANTHROPIC_MODEL=claude-sonnet-4-6
 | `SYS_COLOR` | `on` / `off` / `auto` | `auto` |
 | `NO_COLOR` | If set, disables color regardless of `SYS_COLOR=auto` | — |
 
+### Files
+
+| Path | Purpose |
+|---|---|
+| `~/.config/sys_agent/.env` *(or one of the alternatives above)* | API keys and `SYS_*` overrides |
+| `~/.config/sys_agent/history` | Readline history (1000-line cap, persistent across sessions) |
+
+The history file is created on first exit. Only conversational prompts are
+retained — meta-commands (`/info`, `/exit`, etc.) and short-answer prompts
+(`y`/`n`, `1`/`2`) are excluded so Up-arrow recall stays useful. Clear with
+`> ~/.config/sys_agent/history` if you ever want a fresh slate.
+
 ## Usage
 
 Once running, type natural-language requests:
@@ -153,6 +183,24 @@ you> upgrade nginx to the latest stable version
 
 For mutating actions, the approval prompt is your safety net. Type `e` to edit
 the command before execution.
+
+### Tips & shortcuts
+
+Line editing is provided by readline (or gnureadline on macOS, installed
+automatically).
+
+| Key | Action |
+|---|---|
+| Up / Down | Cycle through prior conversational prompts |
+| Ctrl-R | Reverse-incremental search through history |
+| Ctrl-A / Ctrl-E | Jump to start / end of line |
+| Ctrl-W | Delete previous word |
+| Ctrl-U / Ctrl-K | Delete to start / end of line |
+| Tab | (No completion — sys_agent doesn't bind any) |
+
+History persists across sessions; recall surfaces only real prompts, so
+Up-arrow won't waste your time on `y`/`n` answers or meta-commands. To
+start with a clean slate: `> ~/.config/sys_agent/history`.
 
 ### Meta-commands
 
