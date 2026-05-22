@@ -869,10 +869,11 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           the system before making changes.
         - One logical step per tool call. Avoid chaining unrelated commands
           on one line; it makes failures hard to diagnose.
-        - Each command runs in a SEPARATE fresh shell. A `cd` in one command
-          does NOT carry over to the next. To operate in a directory, either
-          use absolute paths, or combine the cd into the same command
-          (e.g. `cd /var/log && ls -la`).
+        - Each run_command call executes in its OWN fresh shell. Shell state
+          does not persist between calls: a `cd`, an exported variable, or an
+          activated venv in one command is gone by the next. To act within a
+          directory, put the `cd` in the same command (`cd /var/log && ls`).
+          Absolute paths also work and are fine for one-off commands.
         - Commands run with captured stdout/stderr (no tty). Prefer
           script-stable tooling: `apt-get` over `apt` on Debian/Ubuntu (apt
           prints a CLI-stability warning when not on a tty); `dnf` is fine
