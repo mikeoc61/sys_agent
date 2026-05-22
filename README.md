@@ -5,27 +5,29 @@ LLM (OpenAI or Anthropic), gathers host facts so generated commands match the
 local environment, and executes those commands only after explicit user
 approval. Single Python file. No frameworks.
 
-```
+<!-- BEGIN EXAMPLE -->
+```ansi
 $ sys_agent
-[loaded 2 vars from /home/mikeoc/.config/sys_agent/.env]
-sys_agent  provider=anthropic  model=claude-haiku-4-5-20251001  host=pi5 (Linux/aarch64)
-meta: /exit  /reset  /info  /auto on|off  /tokens on|off  /color on|off
+[2m[loaded 2 vars from ~/.config/sys_agent/.env][0m
+[1;36msys_agent  provider=anthropic  model=claude-haiku-4-5-20251001  host=pi5 (Linux/aarch64)[0m
+[2mmeta: /help  /info  /reset  /auto on|off  /tokens on|off  /color on|off  /exit, /quit   — /help for details[0m
 
-you> what's eating disk on /var?
+[1;36myou>[0m what's eating disk on /var?
 
-────────────────────────────────────────────────────────────────────────
-COMMAND:  sudo du -sh /var/* 2>/dev/null | sort -rh | head -10
+[2m────────────────────────────────────────────────────────────[0m
+[1;93mCOMMAND:[0m  sudo du -sh /var/* 2>/dev/null | sort -rh | head -10
 REASON:   List the largest top-level subdirectories under /var
-CWD:      /home/mikeoc
-────────────────────────────────────────────────────────────────────────
-Run? [y]es / [n]o / [e]dit / [q]uit: y
-[exit=0]
+[2mCWD:      /home/mikeoc[0m
+[2m────────────────────────────────────────────────────────────[0m
+[1;33mRun? [y]es / [n]o / [e]dit / [q]uit:[0m y
+[32m[exit=0][0m
 1.4G  /var/lib
 820M  /var/log
 ...
 
-agent> /var/lib dominates at 1.4G. Want me to break that down next?
+[1;32magent>[0m /var/lib dominates at 1.4G. Want me to break that down next?
 ```
+<!-- END EXAMPLE -->
 
 ## Why
 
