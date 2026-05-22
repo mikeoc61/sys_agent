@@ -110,6 +110,12 @@ COMMAND_TIMEOUT = 60
 # Anthropic requires max_tokens; pick something generous for tool dialogs.
 ANTHROPIC_MAX_TOKENS = 4096
 
+# SDK-level retry count. Both the openai and anthropic SDKs implement
+# exponential backoff with jitter and honor Retry-After headers; they retry
+# on 408/409/429 and 5xx (including Anthropic's 529 overloaded_error).
+# Default SDK value is 2; bump for resilience on flaky networks / busy API.
+API_MAX_RETRIES = 5
+
 # Known context windows (May 2026). Used for context-% display; unknown models
 # fall back to printing absolute token counts. Update as new models ship.
 CONTEXT_WINDOWS: dict[str, int] = {
@@ -631,7 +637,7 @@ class OpenAIProvider(Provider):
             from openai import OpenAI
         except ImportError:
             sys.exit("openai SDK missing — uv should install via PEP 723 deps")
-        self.client = OpenAI()
+        self.client = OpenAI(max_retries=API_MAX_RETRIES)
         self.model = model
         self.name = "openai"
 
@@ -682,7 +688,7 @@ class AnthropicProvider(Provider):
             from anthropic import Anthropic
         except ImportError:
             sys.exit("anthropic SDK missing — uv should install via PEP 723 deps")
-        self.client = Anthropic()
+        self.client = Anthropic(max_retries=API_MAX_RETRIES)
         self.model = model
         self.name = "anthropic"
 
@@ -781,6 +787,34 @@ def select_provider() -> Provider:
 # -----------------------------------------------------------------------------
 # REPL
 # -----------------------------------------------------------------------------
+
+def explain_api_error(e: Exception) -> str:
+    """
+    Turn a raw SDK exception into a short, actionable message. The SDK has
+    already exhausted API_MAX_RETRIES by the time this is called, so these
+    are persistent failures, not transient blips.
+    """
+    s = str(e)
+    # status_code attribute is present on both SDKs' APIStatusError subclasses
+    code = getattr(e, "status_code", None)
+    if code == 529 or "overloaded" in s.lower():
+        return ("API overloaded (529) — the provider is at capacity. "
+                "Retries were exhausted. Wait a minute and resend, or try "
+                "the other provider (/exit and relaunch).")
+    if code == 429 or "rate limit" in s.lower():
+        return ("Rate limited (429) — you've hit a usage tier limit. "
+                "Wait before resending, or check your plan limits.")
+    if code == 401 or "authentication" in s.lower() or "api key" in s.lower():
+        return ("Authentication failed (401) — the API key is missing, "
+                "invalid, or expired. Check your env file / shell env.")
+    if code in (500, 502, 503, 504):
+        return (f"Provider server error ({code}) — transient on their end. "
+                "Retries were exhausted; resend shortly.")
+    if "connection" in s.lower() or "timeout" in s.lower():
+        return ("Network error reaching the API — check connectivity "
+                "(the Pi's wlan0 power-save quirk can cause this).")
+    return s          # fall back to the raw message for anything unrecognized
+
 
 def build_system_prompt(facts: dict[str, Any]) -> str:
     return textwrap.dedent(f"""
@@ -925,7 +959,7 @@ def run_repl(provider: Provider) -> None:
             try:
                 turn = provider.chat(messages, system)
             except Exception as e:          # noqa: BLE001
-                print(err_bold(f"[api error] {e}"))
+                print(err_bold(f"[api error] {explain_api_error(e)}"))
                 # Only pop on first iteration (orphan user msg);
                 # on later iterations the conversation is in a valid state.
                 if iteration == 0:
