@@ -63,6 +63,7 @@ except ImportError:
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -115,6 +116,18 @@ ANTHROPIC_MAX_TOKENS = 4096
 # on 408/409/429 and 5xx (including Anthropic's 529 overloaded_error).
 # Default SDK value is 2; bump for resilience on flaky networks / busy API.
 API_MAX_RETRIES = 5
+
+# Meta-command reference — single source of truth for /help and the startup
+# banner. (command, description). Keep in sync with the handlers in run_repl.
+META_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("/help",           "Show this command list and current toggle states"),
+    ("/info",           "Provider, model, session token usage, host facts"),
+    ("/reset",          "Clear conversation history and token counters"),
+    ("/auto on|off",    "Skip the per-command approval prompt (deny list still applies)"),
+    ("/tokens on|off",  "Toggle the per-turn token-usage line"),
+    ("/color on|off",   "Toggle ANSI color output"),
+    ("/exit, /quit",    "End the session"),
+)
 
 # Known context windows (May 2026). Used for context-% display; unknown models
 # fall back to printing absolute token counts. Update as new models ship.
@@ -220,7 +233,6 @@ def rl_prompt(text: str) -> str:
     """
     if not _color_enabled or not _HAVE_READLINE:
         return text
-    import re
     return re.sub(r"(\x1b\[[0-9;]*m)", "\001\\1\002", text)
 
 
@@ -697,9 +709,19 @@ class AnthropicProvider(Provider):
         return []
 
     def chat(self, messages: list[dict], system: str) -> ChatTurn:
+        # Send the system prompt as a cacheable block. The system prompt
+        # (instructions + host-facts JSON) is identical every turn, so
+        # marking it with cache_control lets Anthropic bill cache reads at
+        # ~10% of input rate after the first call. Cache TTL is 5 min,
+        # refreshed on each hit — fine for an interactive session.
+        system_blocks = [{
+            "type": "text",
+            "text": system,
+            "cache_control": {"type": "ephemeral"},
+        }]
         resp = self.client.messages.create(
             model=self.model,
-            system=system,
+            system=system_blocks,
             messages=messages,
             tools=ANTHROPIC_TOOLS,
             max_tokens=ANTHROPIC_MAX_TOKENS,
@@ -816,6 +838,19 @@ def explain_api_error(e: Exception) -> str:
     return s          # fall back to the raw message for anything unrecognized
 
 
+def print_help(auto_approve: bool, show_tokens: bool) -> None:
+    """Print the meta-command reference plus current toggle states."""
+    print(banner("Meta-commands:"))
+    width = max(len(cmd) for cmd, _ in META_COMMANDS)
+    for cmd, desc in META_COMMANDS:
+        print(f"  {cmd.ljust(width)}   {dim(desc)}")
+    print()
+    print(dim(
+        f"  state: auto-approve={auto_approve}  "
+        f"show-tokens={show_tokens}  color={_color_enabled}"
+    ))
+
+
 def build_system_prompt(facts: dict[str, Any]) -> str:
     return textwrap.dedent(f"""
         You are a command-line assistant operating directly on the user's host.
@@ -834,6 +869,10 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           the system before making changes.
         - One logical step per tool call. Avoid chaining unrelated commands
           on one line; it makes failures hard to diagnose.
+        - Each command runs in a SEPARATE fresh shell. A `cd` in one command
+          does NOT carry over to the next. To operate in a directory, either
+          use absolute paths, or combine the cd into the same command
+          (e.g. `cd /var/log && ls -la`).
         - Commands run with captured stdout/stderr (no tty). Prefer
           script-stable tooling: `apt-get` over `apt` on Debian/Ubuntu (apt
           prints a CLI-stability warning when not on a tty); `dnf` is fine
@@ -877,7 +916,8 @@ def run_repl(provider: Provider) -> None:
         f"sys_agent  provider={provider.name}  model={provider.model}  "
         f"host={facts['node']} ({facts['system']}/{facts['machine']})"
     ))
-    print(dim("meta: /exit  /reset  /info  /auto on|off  /tokens on|off  /color on|off"))
+    print(dim("meta: " + "  ".join(cmd for cmd, _ in META_COMMANDS)
+              + "   — /help for details"))
     print()
 
     while True:
@@ -896,6 +936,9 @@ def run_repl(provider: Provider) -> None:
         # REPL meta-commands
         if user_in in ("/exit", "/quit"):
             return
+        if user_in in ("/help", "/?"):
+            print_help(auto_approve, show_tokens)
+            continue
         if user_in == "/reset":
             messages = provider.initial_messages(system)
             session_in = session_out = last_in = last_out = 0
