@@ -290,6 +290,26 @@ def input_no_history(prompt: str) -> str:
     return ans
 
 
+def _input_prefilled(prompt: str, text: str) -> str:
+    """
+    input() with the readline line buffer pre-populated with `text`, so the
+    user edits the string in place instead of retyping it. Requires GNU
+    readline (set_pre_input_hook); libedit and the no-readline path fall back
+    to a bare prompt, leaving the command visible on the COMMAND: line above.
+    """
+    if (_HAVE_READLINE and not _IS_LIBEDIT
+            and hasattr(readline, "set_pre_input_hook")):
+        def _hook() -> None:
+            readline.insert_text(text)
+            readline.redisplay()
+        readline.set_pre_input_hook(_hook)
+        try:
+            return input(prompt)
+        finally:
+            readline.set_pre_input_hook(None)
+    return input(prompt)
+
+
 # -----------------------------------------------------------------------------
 # readline (input history + line editing)
 # -----------------------------------------------------------------------------
@@ -612,11 +632,11 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
         except EOFError:
             return "abort", None
         except KeyboardInterrupt:
-           # Ctrl-C here cancels just this command and returns to the REPL,
-           # matching command-level interrupt handling. Session-quit stays
-           # explicit: use 'q' or Ctrl-D.
-           print(fail("\n[interrupted — command skipped]"))            
-           return "skip", None
+            # Ctrl-C here cancels just this command and returns to the REPL,
+            # matching command-level interrupt handling. Session-quit stays
+            # explicit: use 'q' or Ctrl-D.
+            print(fail("\n[interrupted — command skipped]"))            
+            return "skip", None
         if ans in ("y", "yes", ""):
             return "run", None
         if ans in ("n", "no"):
@@ -624,9 +644,10 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
         if ans in ("q", "quit", "abort"):
             return "abort", None
         if ans in ("e", "edit"):
-            # edit prompt plain — it's a user input position
+            # edit prompt plain — it's a user input position. The command is
+            # pre-filled into the line buffer so it can be modified in place.
             try:
-                new = input("edit> ").strip()
+                new = _input_prefilled("edit> ", cmd).strip()
             except EOFError:
                 return "abort", None
             except KeyboardInterrupt:
