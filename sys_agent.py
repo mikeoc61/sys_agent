@@ -65,6 +65,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -106,8 +107,11 @@ def _default_env_candidates() -> list[str]:
 # How much subprocess output to forward back to the model (chars).
 OUTPUT_MAX_CHARS = 8000
 
-# Per-command wall-clock timeout (seconds).
-COMMAND_TIMEOUT = 60
+# Per-command wall-clock timeout (seconds). Override with SYS_COMMAND_TIMEOUT.
+# Default raised to 120s so package upgrades on slower hosts (e.g. a Pi) are
+# less likely to be killed mid-operation. On timeout the whole process group
+# is signalled (see execute()), so a killed apt-get does not orphan dpkg.
+COMMAND_TIMEOUT = int(os.environ.get("SYS_COMMAND_TIMEOUT", "120"))
 
 # Anthropic requires max_tokens; pick something generous for tool dialogs.
 ANTHROPIC_MAX_TOKENS = 4096
@@ -623,19 +627,63 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
                 return "run", new
 
 
+def _terminate_group(proc: subprocess.Popen) -> None:
+    """
+    Best-effort SIGTERM-then-SIGKILL of the command's entire process group.
+    subprocess's own timeout only kills the immediate child (the shell), which
+    leaves grandchildren (e.g. apt-get under /bin/sh) orphaned. Requires the
+    process to have been started with start_new_session=True. POSIX only; on
+    platforms without killpg this degrades to killing the direct child.
+    """
+    killpg = getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+    if not (killpg and getpgid):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        return
+    try:
+        pgid = getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            killpg(pgid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def execute(cmd: str) -> CmdResult:
     try:
-        proc = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=COMMAND_TIMEOUT
-        )
-        return CmdResult(cmd, proc.returncode, proc.stdout, proc.stderr)
-    except subprocess.TimeoutExpired as e:
-        return CmdResult(
-            cmd, 124,
-            (e.stdout or "") if isinstance(e.stdout, str) else "",
-            f"TIMEOUT after {COMMAND_TIMEOUT}s",
+        proc = subprocess.Popen(
+            cmd, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
         )
     except Exception as e:                  # noqa: BLE001
+        return CmdResult(cmd, 1, "", f"exec error: {e}")
+    try:
+        out, err = proc.communicate(timeout=COMMAND_TIMEOUT)
+        return CmdResult(cmd, proc.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        _terminate_group(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        return CmdResult(cmd, 124, out or "", f"TIMEOUT after {COMMAND_TIMEOUT}s")
+    except KeyboardInterrupt:
+        # Kill the group before unwinding so Ctrl-C never orphans a command.
+        _terminate_group(proc)
+        raise
+    except Exception as e:                  # noqa: BLE001
+        _terminate_group(proc)
         return CmdResult(cmd, 1, "", f"exec error: {e}")
 
 
@@ -652,8 +700,18 @@ class ToolCall:
 
 @dataclass
 class Usage:
-    input_tokens: int = 0       # tokens sent THIS call (≈ current context size)
+    input_tokens: int = 0       # non-cached input tokens sent THIS call
     output_tokens: int = 0      # tokens generated THIS call
+    cache_read: int = 0         # input tokens read from prompt cache (Anthropic)
+    cache_write: int = 0        # input tokens written to prompt cache (Anthropic)
+
+    @property
+    def context_tokens(self) -> int:
+        # True context size. Anthropic reports input_tokens as the non-cached
+        # portion only; cached tokens come back separately. OpenAI's
+        # prompt_tokens is already the full count, so cache_read/cache_write
+        # stay 0 there and this sum is a no-op.
+        return self.input_tokens + self.cache_read + self.cache_write
 
 
 @dataclass
@@ -787,6 +845,9 @@ class AnthropicProvider(Provider):
             usage=Usage(
                 input_tokens=getattr(resp.usage, "input_tokens", 0) or 0,
                 output_tokens=getattr(resp.usage, "output_tokens", 0) or 0,
+                cache_read=getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
+                cache_write=getattr(
+                    resp.usage, "cache_creation_input_tokens", 0) or 0,
             ),
         )
 
@@ -961,17 +1022,21 @@ def run_repl(provider: Provider) -> None:
     show_tokens = False                  # /tokens on|off
     session_in = 0                       # cumulative input tokens this session
     session_out = 0                      # cumulative output tokens this session
-    last_in = 0                          # input tokens on most recent call
-    last_out = 0                         # output tokens on most recent call
+    last_usage = Usage()                 # token usage from most recent call
     ctx_window = CONTEXT_WINDOWS.get(provider.model)   # may be None
 
-    def fmt_tokens(this_in: int, this_out: int) -> str:
+    def fmt_tokens(u: Usage) -> str:
+        ctx = u.context_tokens
         ctx_part = (
-            f"{this_in}/{ctx_window} ({100 * this_in / ctx_window:.1f}%)"
-            if ctx_window else f"{this_in} (window unknown)"
+            f"{ctx}/{ctx_window} ({100 * ctx / ctx_window:.1f}%)"
+            if ctx_window else f"{ctx} (window unknown)"
+        )
+        cache_part = (
+            f" cache(r={u.cache_read} w={u.cache_write})"
+            if (u.cache_read or u.cache_write) else ""
         )
         return dim(
-            f"[tokens turn: in={this_in} out={this_out}  "
+            f"[tokens turn: in={u.input_tokens} out={u.output_tokens}{cache_part}  "
             f"session: in={session_in} out={session_out}  "
             f"ctx: {ctx_part}]"
         )
@@ -1005,13 +1070,15 @@ def run_repl(provider: Provider) -> None:
             continue
         if user_in == "/reset":
             messages = provider.initial_messages(system)
-            session_in = session_out = last_in = last_out = 0
+            session_in = session_out = 0
+            last_usage = Usage()
             print(dim("[conversation reset, token counters cleared]"))
             continue
         if user_in == "/info":
+            ctx_used = last_usage.context_tokens
             ctx_str = (
-                f"{last_in}/{ctx_window} ({100 * last_in / ctx_window:.1f}%)"
-                if ctx_window and last_in
+                f"{ctx_used}/{ctx_window} ({100 * ctx_used / ctx_window:.1f}%)"
+                if ctx_window and ctx_used
                 else (str(ctx_window) if ctx_window else "unknown")
             )
             print(json.dumps({
@@ -1021,8 +1088,10 @@ def run_repl(provider: Provider) -> None:
                 "session": {
                     "input_tokens": session_in,
                     "output_tokens": session_out,
-                    "last_call_input_tokens": last_in,
-                    "last_call_output_tokens": last_out,
+                    "last_call_input_tokens": last_usage.input_tokens,
+                    "last_call_output_tokens": last_usage.output_tokens,
+                    "last_call_cache_read": last_usage.cache_read,
+                    "last_call_cache_write": last_usage.cache_write,
                     "context_used_last_call": ctx_str,
                 },
                 "auto_approve": auto_approve,
@@ -1052,7 +1121,8 @@ def run_repl(provider: Provider) -> None:
             # Host facts and toggles are preserved.
             system = build_system_prompt(facts)
             messages = provider.initial_messages(system)
-            session_in = session_out = last_in = last_out = 0
+            session_in = session_out = 0
+            last_usage = Usage()
             ctx_window = CONTEXT_WINDOWS.get(provider.model)
             print(dim(
                 f"[provider switched to {provider.name}; model={provider.model}; "
@@ -1085,7 +1155,8 @@ def run_repl(provider: Provider) -> None:
                 facts = gather_verbose_host_facts() if facts_verbose else gather_host_facts()
                 system = build_system_prompt(facts)
                 messages = provider.initial_messages(system)
-                session_in = session_out = last_in = last_out = 0
+                session_in = session_out = 0
+                last_usage = Usage()
                 print(dim("[host facts refreshed; conversation/token counters reset]"))
                 continue
             if len(parts) == 3 and parts[1] == "verbose" and parts[2] in ("on", "off"):
@@ -1093,7 +1164,8 @@ def run_repl(provider: Provider) -> None:
                 facts = gather_verbose_host_facts() if facts_verbose else gather_host_facts()
                 system = build_system_prompt(facts)
                 messages = provider.initial_messages(system)
-                session_in = session_out = last_in = last_out = 0
+                session_in = session_out = 0
+                last_usage = Usage()
                 print(dim(
                     f"[facts verbose = {facts_verbose}; host facts refreshed; "
                     "conversation/token counters reset]"
@@ -1116,7 +1188,7 @@ def run_repl(provider: Provider) -> None:
                 print(dim(f"[show_tokens = {show_tokens}]"))
             else:
                 # Bare /tokens prints current snapshot regardless of toggle
-                print(fmt_tokens(last_in, last_out))
+                print(fmt_tokens(last_usage))
                 print(dim(f"  show_tokens = {show_tokens}  (usage: /tokens on|off)"))
             continue
         if user_in.startswith("/color"):
@@ -1135,6 +1207,12 @@ def run_repl(provider: Provider) -> None:
         while True:
             try:
                 turn = provider.chat(messages, system)
+            except KeyboardInterrupt:
+                print(fail("\n[interrupted — request cancelled]"))
+                # Same orphan-user-message rule as the api-error path below.
+                if iteration == 0:
+                    messages.pop()
+                break
             except Exception as e:          # noqa: BLE001
                 print(err_bold(f"[api error] {explain_api_error(e)}"))
                 # Only pop on first iteration (orphan user msg);
@@ -1145,12 +1223,11 @@ def run_repl(provider: Provider) -> None:
             iteration += 1
 
             # Accumulate token usage from this API call
-            last_in = turn.usage.input_tokens
-            last_out = turn.usage.output_tokens
-            session_in += last_in
-            session_out += last_out
+            last_usage = turn.usage
+            session_in += last_usage.input_tokens
+            session_out += last_usage.output_tokens
             if show_tokens:
-                print(fmt_tokens(last_in, last_out))
+                print(fmt_tokens(last_usage))
 
             provider.append_assistant(messages, turn)
 
@@ -1203,7 +1280,13 @@ def run_repl(provider: Provider) -> None:
                     # tag colored, edited command body plain
                     print(f"{warn('[running edited]:')} {to_run}")
 
-                result = execute(to_run)
+                try:
+                    result = execute(to_run)
+                except KeyboardInterrupt:
+                    print(fail("\n[interrupted — command cancelled]"))
+                    results.append((tc.id, json.dumps(
+                        {"error": "user interrupted command"})))
+                    continue
                 exit_str = f"[exit={result.returncode}]"
                 print(ok(exit_str) if result.returncode == 0 else fail(exit_str))
                 if result.stdout:
