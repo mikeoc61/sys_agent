@@ -24,9 +24,12 @@ matches reality — no more `apt` suggestions on a Mac.
 
 - **Multi-provider**: OpenAI or Anthropic, selected at startup. Both keys
   present → interactive prompt. One key → auto-pick.
-- **Host-aware**: distro, shell, machine arch, and a probe of installed
-  tools (`apt`/`brew`/`systemctl`/`docker`/etc.) are injected into the
-  system prompt.
+- **Runtime provider/model switching**: use `/provider` and `/model` to
+  inspect or change the active backend during a live REPL session.
+- **Host-aware**: distro, shell, machine arch, package/init/container tool
+  probes, disk context, and installed tools (`apt`/`brew`/`systemctl`/
+  `docker`/etc.) are injected into the system prompt. Host facts can be
+  displayed, refreshed, and expanded with `/facts`.
 - **Approval-gated execution**: every proposed command is shown with its
   reason and CWD before it runs. Edit-before-run supported.
 - **Local hard-deny list**: a short list of catastrophic patterns
@@ -195,6 +198,49 @@ start with a clean slate: `> ~/.config/sys_agent/history`.
 | `/tokens on\|off` | Toggle per-turn token-usage line |
 | `/tokens` | Print current snapshot without changing toggle |
 | `/color on\|off` | Toggle ANSI color output |
+| `/provider` | Show current provider/model and available providers |
+| `/provider openai\|anthropic` | Switch provider and reset conversation/token counters |
+| `/model` | Show current model/context-window metadata |
+| `/model MODEL_NAME` | Switch the model used by the active provider |
+| `/facts` | Print current host facts |
+| `/facts refresh` | Re-probe host facts and reset conversation/token counters |
+| `/facts verbose on\|off` | Toggle expanded host fact collection and refresh facts |
+
+### Runtime provider/model switching
+
+Provider and model selection are no longer startup-only. During a session:
+
+```text
+/provider
+/provider openai
+/provider anthropic
+/model
+/model gpt-5.4-mini
+/model claude-sonnet-4-6
+```
+
+Switching providers resets the active conversation and token counters because
+OpenAI and Anthropic use different tool-call message formats. Host facts and
+REPL toggles are preserved.
+
+Changing the model keeps the same provider and session state. Unknown context
+windows are allowed; token display falls back to absolute token counts.
+
+### Refreshable host facts
+
+```text
+/facts
+/facts refresh
+/facts verbose on
+/facts verbose off
+```
+
+`/facts` prints the currently injected host metadata. `/facts refresh`
+re-probes the machine and rebuilds the system prompt. Verbose mode adds
+additional environment details such as CPU count, PATH, basic container
+detection, and network-tool availability. Refreshing host facts resets the
+active conversation and token counters so the model receives a clean, current
+system prompt.
 
 ## Safety model
 
@@ -252,6 +298,12 @@ The provider abstraction normalizes tool-call/tool-result message structure
 between the two APIs (OpenAI sends one `role: tool` message per call;
 Anthropic batches all `tool_result` blocks into a single user message). The
 REPL is provider-agnostic.
+
+### Runtime state
+
+The REPL tracks active provider, active model, host facts, verbosity, token
+counters, and conversation messages as mutable runtime state. `/provider`,
+`/model`, and `/facts` update that state without restarting the process.
 
 ## What this is not
 

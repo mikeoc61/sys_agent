@@ -65,6 +65,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import textwrap
@@ -126,6 +127,11 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/auto on|off",    "Skip the per-command approval prompt (deny list still applies)"),
     ("/tokens on|off",  "Toggle the per-turn token-usage line"),
     ("/color on|off",   "Toggle ANSI color output"),
+    ("/provider [name]", "Show or switch provider: openai|anthropic"),
+    ("/model [name]",    "Show or switch model for the active provider"),
+    ("/facts",           "Print current host facts"),
+    ("/facts refresh",   "Re-probe host facts and rebuild system prompt"),
+    ("/facts verbose on|off", "Toggle expanded host fact collection"),
     ("/exit, /quit",    "End the session"),
 )
 
@@ -463,6 +469,40 @@ def gather_host_facts() -> dict[str, Any]:
         "python3", "pip", "pip3", "uv", "poetry", "pipx",
     ]
     facts["available_tools"] = _which_many(candidates)
+
+    # Expanded but still privacy-conscious host facts. These are useful for
+    # selecting the right commands without requiring a first probing turn.
+    facts["hostname"] = socket.gethostname()
+    facts["package_managers"] = _which_many([
+        "apt", "apt-get", "dnf", "yum", "pacman", "zypper", "brew", "apk", "pkg"
+    ])
+    facts["init_tools"] = _which_many(["systemctl", "service", "launchctl", "rc-service"])
+    facts["container_tools"] = _which_many(["docker", "podman", "kubectl"])
+    facts["virtual_env"] = os.environ.get("VIRTUAL_ENV", "")
+
+    try:
+        usage = shutil.disk_usage(os.getcwd())
+        facts["cwd_disk"] = {
+            "total_gb": round(usage.total / (1024 ** 3), 2),
+            "free_gb": round(usage.free / (1024 ** 3), 2),
+        }
+    except OSError:
+        pass
+
+    return facts
+
+
+def gather_verbose_host_facts() -> dict[str, Any]:
+    facts = gather_host_facts()
+    facts["cpu_count"] = os.cpu_count()
+    facts["path"] = os.environ.get("PATH", "")
+
+    cgroup = _safe_read("/proc/1/cgroup", limit=4096).lower()
+    facts["container_detected"] = any(needle in cgroup for needle in ("docker", "containerd", "kubepods"))
+
+    network_tools = _which_many(["ip", "ifconfig", "netstat", "route"])
+    facts["network_tools"] = network_tools
+
     return facts
 
 
@@ -766,6 +806,28 @@ class AnthropicProvider(Provider):
 # Provider selection
 # -----------------------------------------------------------------------------
 
+
+def available_provider_names() -> list[str]:
+    names: list[str] = []
+    if os.environ.get("OPENAI_API_KEY"):
+        names.append("openai")
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        names.append("anthropic")
+    return names
+
+
+def make_provider(name: str, model: str | None = None) -> Provider:
+    normalized = name.strip().lower()
+    if normalized in ("openai", "o"):
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise ValueError("OPENAI_API_KEY is not set")
+        return OpenAIProvider(model or DEFAULT_OPENAI_MODEL)
+    if normalized in ("anthropic", "a", "claude"):
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise ValueError("ANTHROPIC_API_KEY is not set")
+        return AnthropicProvider(model or DEFAULT_ANTHROPIC_MODEL)
+    raise ValueError("provider must be openai or anthropic")
+
 def select_provider() -> Provider:
     have_openai = bool(os.environ.get("OPENAI_API_KEY"))
     have_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
@@ -891,6 +953,7 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
 
 def run_repl(provider: Provider) -> None:
     global _color_enabled
+    facts_verbose = False
     facts = gather_host_facts()
     system = build_system_prompt(facts)
     messages = provider.initial_messages(system)
@@ -967,6 +1030,76 @@ def run_repl(provider: Provider) -> None:
                 "color": _color_enabled,
                 "host": facts,
             }, indent=2))
+            continue
+        if user_in.startswith("/provider"):
+            parts = user_in.split()
+            if len(parts) == 1:
+                print(json.dumps({
+                    "current_provider": provider.name,
+                    "current_model": provider.model,
+                    "available_providers": available_provider_names(),
+                }, indent=2))
+                continue
+            if len(parts) != 2 or parts[1].lower() not in ("openai", "anthropic", "o", "a", "claude"):
+                print(dim("usage: /provider openai|anthropic"))
+                continue
+            try:
+                provider = make_provider(parts[1])
+            except ValueError as e:
+                print(err_bold(f"[provider switch failed] {e}"))
+                continue
+            # Provider message formats differ, so reset conversation on switch.
+            # Host facts and toggles are preserved.
+            system = build_system_prompt(facts)
+            messages = provider.initial_messages(system)
+            session_in = session_out = last_in = last_out = 0
+            ctx_window = CONTEXT_WINDOWS.get(provider.model)
+            print(dim(
+                f"[provider switched to {provider.name}; model={provider.model}; "
+                "conversation/token counters reset]"
+            ))
+            continue
+        if user_in.startswith("/model"):
+            parts = user_in.split(maxsplit=1)
+            if len(parts) == 1:
+                print(json.dumps({
+                    "provider": provider.name,
+                    "model": provider.model,
+                    "context_window": ctx_window,
+                }, indent=2))
+                continue
+            new_model = parts[1].strip()
+            if not new_model:
+                print(dim("usage: /model MODEL_NAME"))
+                continue
+            provider.model = new_model
+            ctx_window = CONTEXT_WINDOWS.get(provider.model)
+            print(dim(f"[model switched to {provider.model}]"))
+            continue
+        if user_in.startswith("/facts"):
+            parts = user_in.split()
+            if len(parts) == 1:
+                print(json.dumps(facts, indent=2))
+                continue
+            if len(parts) == 2 and parts[1] == "refresh":
+                facts = gather_verbose_host_facts() if facts_verbose else gather_host_facts()
+                system = build_system_prompt(facts)
+                messages = provider.initial_messages(system)
+                session_in = session_out = last_in = last_out = 0
+                print(dim("[host facts refreshed; conversation/token counters reset]"))
+                continue
+            if len(parts) == 3 and parts[1] == "verbose" and parts[2] in ("on", "off"):
+                facts_verbose = parts[2] == "on"
+                facts = gather_verbose_host_facts() if facts_verbose else gather_host_facts()
+                system = build_system_prompt(facts)
+                messages = provider.initial_messages(system)
+                session_in = session_out = last_in = last_out = 0
+                print(dim(
+                    f"[facts verbose = {facts_verbose}; host facts refreshed; "
+                    "conversation/token counters reset]"
+                ))
+                continue
+            print(dim("usage: /facts | /facts refresh | /facts verbose on|off"))
             continue
         if user_in.startswith("/auto"):
             parts = user_in.split()
