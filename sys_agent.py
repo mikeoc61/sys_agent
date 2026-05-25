@@ -611,6 +611,12 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
             ans = input_no_history(warn_bold("Run? [y]es / [n]o / [e]dit / [q]uit: ")).strip().lower()
         except EOFError:
             return "abort", None
+        except KeyboardInterrupt:
+           # Ctrl-C here cancels just this command and returns to the REPL,
+           # matching command-level interrupt handling. Session-quit stays
+           # explicit: use 'q' or Ctrl-D.
+           print(fail("\n[interrupted — command skipped]"))            
+           return "skip", None
         if ans in ("y", "yes", ""):
             return "run", None
         if ans in ("n", "no"):
@@ -623,6 +629,10 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
                 new = input("edit> ").strip()
             except EOFError:
                 return "abort", None
+            except KeyboardInterrupt:
+                # Cancel the edit, fall back to the y/n/e/q prompt.
+                print(fail("\n[edit cancelled]"))                
+                continue            
             if new:
                 return "run", new
 
@@ -1052,9 +1062,14 @@ def run_repl(provider: Provider) -> None:
     while True:
         try:
             user_in = colored_input(user_tag("you>") + " ").strip()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:            
             print()
             return
+        except KeyboardInterrupt:
+            # Ctrl-C at an idle prompt clears the line and re-prompts; it
+            # never ends the session. Quit explicitly: /exit, /quit, Ctrl-D.
+            print()
+            continue
         if not user_in:
             continue
 
