@@ -64,6 +64,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -79,6 +80,19 @@ from typing import Any
 # Config
 # -----------------------------------------------------------------------------
 
+# =============================================================================
+# PROVIDER & MODEL CONFIG
+# -----------------------------------------------------------------------------
+# Single source of truth for everything that changes on an LLM-release cadence.
+# When a new model ships, edit ONLY this section:
+#   1. add it to PROVIDER_MODELS under its provider,
+#   2. add a CONTEXT_WINDOWS entry so the context-% display works,
+#   3. if it introduces a new name prefix, extend PROVIDER_MODEL_PREFIXES.
+# Nothing below this section needs to change for a model update.
+# =============================================================================
+
+# Default model per provider, overridable via env. The default is intentionally
+# the cheapest/fastest tier; switch at runtime with /model.
 # OpenAI options (verified May 2026):
 #   gpt-4.1-nano  — $0.10/$0.40 per 1M tok, weakest tool use of the three
 #   gpt-4o-mini   — $0.15/$0.60, generous free-tier RPM, solid tool use
@@ -92,6 +106,49 @@ DEFAULT_OPENAI_MODEL = os.environ.get("SYS_OPENAI_MODEL", "gpt-4o-mini")
 DEFAULT_ANTHROPIC_MODEL = os.environ.get(
     "SYS_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"
 )
+
+# Known context windows (May 2026). Used for the context-% display; unknown
+# models fall back to printing absolute token counts.
+CONTEXT_WINDOWS: dict[str, int] = {
+    # OpenAI
+    "gpt-4.1-nano":  1_000_000,
+    "gpt-4o-mini":     128_000,
+    "gpt-5.4-mini":    400_000,
+    # Anthropic
+    "claude-haiku-4-5-20251001": 200_000,
+    "claude-sonnet-4-6":         200_000,
+    "claude-opus-4-7":           200_000,
+}
+
+# Known model names per provider — the suggestion list for /model and the
+# basis for sanity-checking. A name in this list switches silently; an
+# unlisted name whose prefix still matches the provider (see
+# PROVIDER_MODEL_PREFIXES) switches with a warning, so brand-new releases
+# work before this list is updated.
+PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
+    "openai": (
+        "gpt-4o-mini",
+        "gpt-4.1-nano",
+        "gpt-5.4-mini",
+    ),
+    "anthropic": (
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-6",
+        "claude-opus-4-7",
+    ),
+}
+
+# Model-name prefixes that legitimately belong to each provider. Used to
+# accept an unlisted-but-plausible model (with a warning) while still
+# rejecting a wrong-provider or nonsense name outright.
+PROVIDER_MODEL_PREFIXES: dict[str, tuple[str, ...]] = {
+    "openai": ("gpt-", "o1", "o3", "o4", "chatgpt-"),
+    "anthropic": ("claude-",),
+}
+
+# =============================================================================
+# RUNTIME TUNING
+# =============================================================================
 
 # Optional shell-style env file. Loaded if present; existing env vars win.
 # Search order for env file when SYS_ENV_FILE is not set. First hit wins.
@@ -139,58 +196,37 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/exit, /quit",    "End the session"),
 )
 
-# Known context windows (May 2026). Used for context-% display; unknown models
-# fall back to printing absolute token counts. Update as new models ship.
-CONTEXT_WINDOWS: dict[str, int] = {
-    # OpenAI
-    "gpt-4.1-nano":  1_000_000,
-    "gpt-4o-mini":     128_000,
-    "gpt-5.4-mini":    400_000,
-    # Anthropic
-    "claude-haiku-4-5-20251001": 200_000,
-    "claude-sonnet-4-6":         200_000,
-    "claude-opus-4-7":           200_000,
-}
+# Local hard-deny tables — these commands are never executed regardless of
+# provider or user approval. This is a backstop, not a security boundary: the
+# per-command approval prompt is the real gate. Matching is intent-based
+# (tokenised argv inspection), so a non-root path argument is allowed
+# (`rm -rf /home/x` runs) while the catastrophic shape is blocked
+# (`rm -rf /`, `rm -fr /`, `sudo rm -rf /*` do not).
 
-# Known model names per provider — the suggestion list for /model and the
-# basis for sanity-checking. A name in this list switches silently; an
-# unlisted name whose prefix still matches the provider (see
-# PROVIDER_MODEL_PREFIXES) switches with a warning, so brand-new releases
-# work before this list is updated. Add releases as they ship (and give them
-# a CONTEXT_WINDOWS entry so the context-% display works).
-PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
-    "openai": (
-        "gpt-4o-mini",
-        "gpt-4.1-nano",
-        "gpt-5.4-mini",
-    ),
-    "anthropic": (
-        "claude-haiku-4-5-20251001",
-        "claude-sonnet-4-6",
-        "claude-opus-4-7",
-    ),
-}
+# Fork bomb is matched against the WHOLE command — its separators are part
+# of the construct, so it must not be split into segments first.
+_FORKBOMB_RE = re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&?\s*\}\s*;\s*:")
 
-# Model-name prefixes that legitimately belong to each provider. Used to
-# accept an unlisted-but-plausible model (with a warning) while still
-# rejecting a wrong-provider or nonsense name outright.
-PROVIDER_MODEL_PREFIXES: dict[str, tuple[str, ...]] = {
-    "openai": ("gpt-", "o1", "o3", "o4", "chatgpt-"),
-    "anthropic": ("claude-",),
-}
+# Shell segment separators: ; newline && || | and a bare & (but not >& / 2>&1).
+_DENY_SEG_RE = re.compile(r";|\n|&&|\|\||\||(?<![>\d])&(?!>)")
 
-# Local hard-deny list — never executed regardless of provider or user OK.
-DENY_SUBSTRINGS = (
-    "rm -rf /",
-    "rm -rf /*",
-    "mkfs",
-    ":(){ :|:& };:",            # fork bomb
-    "dd if=/dev/zero of=/dev/",
-    "dd if=/dev/random of=/dev/",
-    "> /dev/sda",
-    "> /dev/nvme",
-    "chmod -R 777 /",
-)
+# Wrapper commands whose real target is a later token.
+_DENY_WRAPPERS = frozenset((
+    "sudo", "doas", "env", "nice", "ionice", "nohup", "time",
+    "command", "exec", "stdbuf", "setsid", "timeout",
+))
+# Wrapper options that consume the following token as their value.
+_DENY_OPTS_WITH_VALUE = frozenset((
+    "-u", "--user", "-g", "--group", "-n", "-c", "-C", "--chdir",
+    "-k", "--signal", "-s", "--kill-after",
+))
+
+_DENY_RECURSIVE_SHORT = re.compile(r"^-[a-zA-Z]*[rR][a-zA-Z]*$")
+_DENY_ROOT_TARGETS = frozenset(("/", "/*", "/.", "//"))
+_DENY_BLOCKDEV_RE = re.compile(r"/dev/(?:sd|nvme|mmcblk|vd|hd|disk|loop)\w*\Z")
+_DENY_OF_DEV_RE = re.compile(
+    r"\Aof=/dev/(?:sd|nvme|mmcblk|vd|hd|disk|loop)\w*", re.I)
+_DENY_REDIR_RE = re.compile(r"\A\d?>>?\|?(.*)\Z")
 
 # readline history settings
 HISTORY_FILE_DEFAULT = "~/.config/sys_agent/history"
@@ -634,10 +670,90 @@ class CmdResult:
         })
 
 
+def _deny_real_argv(tokens: list[str]) -> list[str]:
+    """Strip VAR=val assignments and wrapper commands; return the real argv."""
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if (not t.startswith("-") and "=" in t
+                and t.split("=", 1)[0].isidentifier()):
+            i += 1
+            continue
+        base = t.rsplit("/", 1)[-1]
+        if base in _DENY_WRAPPERS:
+            i += 1
+            while i < len(tokens) and tokens[i].startswith("-"):
+                consumes = tokens[i] in _DENY_OPTS_WITH_VALUE
+                i += 1
+                if consumes and i < len(tokens):
+                    i += 1
+            # timeout takes a mandatory positional DURATION before the command.
+            if base == "timeout" and i < len(tokens):
+                i += 1
+            continue
+        return tokens[i:]
+    return []
+
+
+def _deny_is_recursive(flags: list[str]) -> bool:
+    return any(f == "--recursive" or _DENY_RECURSIVE_SHORT.match(f)
+               for f in flags)
+
+
+def _deny_argv(argv: list[str]) -> str | None:
+    if not argv:
+        return None
+    cmd = argv[0].rsplit("/", 1)[-1]
+    args = argv[1:]
+    flags = [a for a in args if a.startswith("-") and a != "-"]
+    positionals = [a for a in args if not a.startswith("-")]
+    if cmd == "rm" and _deny_is_recursive(flags):
+        if any(p in _DENY_ROOT_TARGETS for p in positionals):
+            return "recursive delete targeting the filesystem root"
+    if cmd == "chmod" and _deny_is_recursive(flags):
+        # chmod's first positional is the mode; path operands follow.
+        if any(p in _DENY_ROOT_TARGETS for p in positionals[1:]):
+            return "recursive chmod on the filesystem root"
+    if cmd == "mkfs" or cmd.startswith("mkfs."):
+        return "filesystem format (mkfs)"
+    if cmd == "dd" and any(_DENY_OF_DEV_RE.match(a) for a in args):
+        return "dd writing directly to a raw block device"
+    return None
+
+
+def _deny_redirect(tokens: list[str]) -> str | None:
+    for j, t in enumerate(tokens):
+        m = _DENY_REDIR_RE.match(t)
+        if not m:
+            continue
+        target = m.group(1) or (tokens[j + 1] if j + 1 < len(tokens) else "")
+        if _DENY_BLOCKDEV_RE.match(target):
+            return "redirection overwriting a raw block device"
+    return None
+
+
 def is_denied(cmd: str) -> str | None:
-    for needle in DENY_SUBSTRINGS:
-        if needle in cmd:
-            return f"matches local deny rule: {needle!r}"
+    """
+    Return a human-readable reason if cmd matches a hard-deny rule, else None.
+    Intent-based: each ;|&&-separated segment is tokenised and its real argv
+    (past VAR=val assignments and sudo/env/timeout wrappers) is inspected, so
+    legitimate non-root targets are permitted and trivial reformatting
+    (flag order, extra spaces, /bin/rm) does not evade the rule.
+    """
+    if _FORKBOMB_RE.search(cmd):
+        return "fork bomb"
+    for seg in _DENY_SEG_RE.split(cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            # Unbalanced quotes — fall back to a whitespace split.
+            toks = seg.split()
+        why = _deny_argv(_deny_real_argv(toks)) or _deny_redirect(toks)
+        if why:
+            return why
     return None
 
 
