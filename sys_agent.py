@@ -132,7 +132,7 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/tokens on|off",  "Toggle the per-turn token-usage line"),
     ("/color on|off",   "Toggle ANSI color output"),
     ("/provider [name]", "Show or switch provider: openai|anthropic"),
-    ("/model [name]",    "Show or switch model for the active provider"),
+    ("/model [name]",    "Switch model for the active provider; no arg lists choices"),
     ("/facts",           "Print current host facts"),
     ("/facts refresh",   "Re-probe host facts and rebuild system prompt"),
     ("/facts verbose on|off", "Toggle expanded host fact collection"),
@@ -150,6 +150,33 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "claude-haiku-4-5-20251001": 200_000,
     "claude-sonnet-4-6":         200_000,
     "claude-opus-4-7":           200_000,
+}
+
+# Known model names per provider — the suggestion list for /model and the
+# basis for sanity-checking. A name in this list switches silently; an
+# unlisted name whose prefix still matches the provider (see
+# PROVIDER_MODEL_PREFIXES) switches with a warning, so brand-new releases
+# work before this list is updated. Add releases as they ship (and give them
+# a CONTEXT_WINDOWS entry so the context-% display works).
+PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
+    "openai": (
+        "gpt-4o-mini",
+        "gpt-4.1-nano",
+        "gpt-5.4-mini",
+    ),
+    "anthropic": (
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-6",
+        "claude-opus-4-7",
+    ),
+}
+
+# Model-name prefixes that legitimately belong to each provider. Used to
+# accept an unlisted-but-plausible model (with a warning) while still
+# rejecting a wrong-provider or nonsense name outright.
+PROVIDER_MODEL_PREFIXES: dict[str, tuple[str, ...]] = {
+    "openai": ("gpt-", "o1", "o3", "o4", "chatgpt-"),
+    "anthropic": ("claude-",),
 }
 
 # Local hard-deny list — never executed regardless of provider or user OK.
@@ -920,6 +947,44 @@ def make_provider(name: str, model: str | None = None) -> Provider:
         return AnthropicProvider(model or DEFAULT_ANTHROPIC_MODEL)
     raise ValueError("provider must be openai or anthropic")
 
+
+def _select_model(provider_name: str, current: str) -> str | None:
+    """
+    Print a numbered list of valid models for `provider_name` and prompt for
+    a choice. Returns the chosen model string, or None if the user cancelled
+    (Ctrl-C / Ctrl-D / empty input) — caller should keep the current model.
+    Accepts either the list number or an exact model name.
+    """
+    models = PROVIDER_MODELS.get(provider_name, ())
+    if not models:
+        print(err_bold(f"[no model list for provider {provider_name!r}]"))
+        return None
+    print(banner(f"Models for {provider_name}:"))
+    for idx, name in enumerate(models, 1):
+        marker = dim("  (current)") if name == current else ""
+        ctx = CONTEXT_WINDOWS.get(name)
+        ctx_str = dim(f"  [{ctx:,} ctx]") if ctx else ""
+        print(f"  [{idx}] {name}{ctx_str}{marker}")
+    try:
+        ans = input_no_history(ask("Choice [number or name, blank to cancel]: ")).strip()
+    except (EOFError, KeyboardInterrupt):
+        print(fail("\n[model unchanged]"))
+        return None
+    if not ans:
+        print(dim("[model unchanged]"))
+        return None
+    if ans.isdigit():
+        i = int(ans)
+        if 1 <= i <= len(models):
+            return models[i - 1]
+        print(err_bold(f"[invalid choice: {ans}]"))
+        return None
+    if ans in models:
+        return ans
+    print(err_bold(f"[not a valid model for {provider_name}: {ans!r}]"))
+    return None
+
+
 def select_provider() -> Provider:
     have_openai = bool(os.environ.get("OPENAI_API_KEY"))
     have_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
@@ -1167,18 +1232,29 @@ def run_repl(provider: Provider) -> None:
             continue
         if user_in.startswith("/model"):
             parts = user_in.split(maxsplit=1)
-            if len(parts) == 1:
-                print(json.dumps({
-                    "provider": provider.name,
-                    "model": provider.model,
-                    "context_window": ctx_window,
-                }, indent=2))
+            requested = parts[1].strip() if len(parts) == 2 else ""
+            known = PROVIDER_MODELS.get(provider.name, ())
+            prefixes = PROVIDER_MODEL_PREFIXES.get(provider.name, ())
+            if requested and requested in known:
+                chosen = requested
+            elif requested and requested.startswith(prefixes):
+                # Unlisted but the prefix matches this provider — likely a
+                # newer release. Accept it, but warn it is unrecognised.
+                print(warn(
+                    f"[warning: {requested!r} is not a known {provider.name} "
+                    "model — switching anyway; context-% may be unavailable]"
+                ))
+                chosen = requested
+            else:
+                # No arg, or a wrong-provider / nonsense name: show selector.
+                if requested:
+                    print(err_bold(
+                        f"[not a valid {provider.name} model: {requested!r}]"
+                    ))
+                chosen = _select_model(provider.name, provider.model)
+            if chosen is None or chosen == provider.model:
                 continue
-            new_model = parts[1].strip()
-            if not new_model:
-                print(dim("usage: /model MODEL_NAME"))
-                continue
-            provider.model = new_model
+            provider.model = chosen
             ctx_window = CONTEXT_WINDOWS.get(provider.model)
             print(dim(f"[model switched to {provider.model}]"))
             continue
