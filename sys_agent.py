@@ -344,12 +344,17 @@ def drop_last_history_entry() -> None:
 
 def input_no_history(prompt: str) -> str:
     """
-    colored_input variant that drops the entered line from history. Used for
-    short-answer prompts (y/n/edit/quit, provider choice) that would only
-    pollute Up-arrow recall of real conversational prompts.
+    colored_input variant for short-answer prompts (y/n/edit/quit, provider
+    choice) that should not land in Up-arrow recall.
+
+    When auto-history is disabled (the normal case — see init_readline),
+    nothing is added implicitly, so simply not calling add_history is enough
+    and there is nothing to drop. The drop is kept only as a fallback for
+    backends lacking set_auto_history, where input() still auto-adds.
     """
     ans = colored_input(prompt)
-    drop_last_history_entry()
+    if _HAVE_READLINE and not hasattr(readline, "set_auto_history"):
+        drop_last_history_entry()
     return ans
 
 
@@ -436,6 +441,18 @@ def init_readline() -> None:
         readline.set_history_length(HISTORY_MAX_LINES)
     except Exception:           # noqa: BLE001 — some libedit builds are picky
         pass
+    # Disable input()'s implicit history-add. It is unreliable across
+    # backends: stdlib GNU readline on Linux silently skips the add when the
+    # prompt carries \001/\002 width markers (as colored prompts do), so
+    # typed commands never reached history on the Pi. With auto-history off,
+    # history is added explicitly (see run_repl) — deterministic everywhere.
+    # libedit / older builds lack set_auto_history; there the implicit add
+    # still happens and input_no_history's drop handles short prompts.
+    if hasattr(readline, "set_auto_history"):
+        try:
+            readline.set_auto_history(False)
+        except Exception:       # noqa: BLE001
+            pass
     _history_path = path
 
 
@@ -1275,7 +1292,16 @@ def run_repl(provider: Provider) -> None:
         if not user_in:
             continue
 
-        # Meta-commands shouldn't pollute Up-arrow recall of real prompts
+        # Add the typed line to history explicitly. input()'s implicit add is
+        # disabled (init_readline) because it is unreliable with colored
+        # prompts on stdlib readline; doing it here makes recall deterministic
+        # across backends. Meta-commands are then dropped again so they do not
+        # pollute Up-arrow recall of real conversational prompts.
+        if _HAVE_READLINE:
+            try:
+                readline.add_history(user_in)
+            except Exception:   # noqa: BLE001
+                pass
         if user_in.startswith("/"):
             drop_last_history_entry()
 
