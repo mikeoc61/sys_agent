@@ -530,6 +530,333 @@ def _which_many(cmds: list[str]) -> list[str]:
     return [c for c in cmds if shutil.which(c)]
 
 
+# Pseudo / virtual filesystems and device classes we never want to surface.
+# Mirrors disk_smart.NO_SMART_PREFIXES plus filesystem-level pseudos.
+_DISK_SKIP_DEV_PREFIXES = ("loop", "ram", "zram", "dm-", "sr", "fd")
+_DISK_SKIP_FSTYPES = {
+    "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2",
+    "pstore", "bpf", "tracefs", "debugfs", "configfs", "fusectl",
+    "securityfs", "mqueue", "hugetlbfs", "autofs", "rpc_pipefs",
+    "binfmt_misc", "nsfs", "overlay", "squashfs", "ramfs",
+}
+# Mount-point prefixes that are noise for an agent (snap loops, container
+# layer mounts, init-time runtime dirs).
+_DISK_SKIP_MOUNT_PREFIXES = (
+    "/snap/", "/var/lib/docker/", "/var/lib/containers/",
+    "/run/", "/sys/", "/proc/", "/dev/",
+)
+
+# macOS-specific filtering. APFS exposes many synthetic firmlinks and
+# system snapshots; agent context wants user-visible volumes only.
+_DISK_SKIP_FSTYPES_DARWIN = {"devfs", "autofs", "lifs", "nullfs"}
+_DISK_SKIP_MOUNT_PREFIXES_DARWIN = (
+    "/System/Volumes/VM",
+    "/System/Volumes/Preboot",
+    "/System/Volumes/Update",
+    "/System/Volumes/xarts",
+    "/System/Volumes/iSCPreboot",
+    "/System/Volumes/Hardware",
+    "/System/Volumes/Recovery",
+    "/private/var/vm",
+)
+
+
+def _basename_to_disk(name: str) -> str:
+    """Map a partition name back to its parent disk basename.
+    sda1 -> sda; nvme0n1p3 -> nvme0n1; mmcblk0p2 -> mmcblk0."""
+    if name.startswith(("nvme", "mmcblk")):
+        idx = name.find("p")
+        return name[:idx] if idx > 0 and name[idx + 1:].isdigit() else name
+    return name.rstrip("0123456789") or name
+
+
+def _read_block_devices() -> dict[str, dict[str, Any]]:
+    """Return {basename: {model, size_bytes, rotational, bus, transport}} for
+    physical block devices. Uses lsblk when present, /sys fallback otherwise.
+    Unprivileged."""
+    devices: dict[str, dict[str, Any]] = {}
+    if shutil.which("lsblk"):
+        try:
+            res = subprocess.run(
+                ["lsblk", "-J", "-b", "-d", "-o",
+                 "NAME,TYPE,SIZE,ROTA,TRAN,MODEL,VENDOR"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if res.returncode == 0:
+                for d in json.loads(res.stdout).get("blockdevices", []):
+                    if d.get("type") != "disk":
+                        continue
+                    name = d["name"]
+                    if name.startswith(_DISK_SKIP_DEV_PREFIXES):
+                        continue
+                    devices[name] = {
+                        "model": (d.get("model") or "").strip() or None,
+                        "vendor": (d.get("vendor") or "").strip() or None,
+                        "size_bytes": int(d["size"]) if d.get("size") else None,
+                        "rotational": bool(int(d["rota"])) if d.get("rota") is not None else None,
+                        "transport": d.get("tran") or None,
+                    }
+        except (subprocess.SubprocessError, json.JSONDecodeError, ValueError, OSError):
+            pass
+    if devices:
+        return devices
+    # /sys fallback (no lsblk, or it errored)
+    try:
+        for entry in os.listdir("/sys/block"):
+            if entry.startswith(_DISK_SKIP_DEV_PREFIXES):
+                continue
+            base = f"/sys/block/{entry}"
+            size_sectors = _safe_read(f"{base}/size", limit=64)
+            rota = _safe_read(f"{base}/queue/rotational", limit=4)
+            model = _safe_read(f"{base}/device/model", limit=128)
+            devices[entry] = {
+                "model": model or None,
+                "vendor": None,
+                "size_bytes": int(size_sectors) * 512 if size_sectors.isdigit() else None,
+                "rotational": rota == "1" if rota in ("0", "1") else None,
+                "transport": None,
+            }
+    except OSError:
+        pass
+    return devices
+
+
+def _read_mounts() -> list[tuple[str, str, str, list[str]]]:
+    """Parse /proc/mounts -> [(source, mount_point, fstype, options)].
+    Filters pseudo-fs, snap loops, and other agent-noise mounts."""
+    out: list[tuple[str, str, str, list[str]]] = []
+    raw = _safe_read("/proc/mounts", limit=65536)
+    if not raw:
+        return out
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        src, mnt, fstype, opts = parts[0], parts[1], parts[2], parts[3]
+        if fstype in _DISK_SKIP_FSTYPES:
+            continue
+        if mnt.startswith(_DISK_SKIP_MOUNT_PREFIXES):
+            continue
+        # Octal-escape decode (\040 = space, \011 = tab) per fstab convention.
+        for esc, ch in (("\\040", " "), ("\\011", "\t"), ("\\134", "\\")):
+            mnt = mnt.replace(esc, ch)
+            src = src.replace(esc, ch)
+        out.append((src, mnt, fstype, opts.split(",")))
+    return out
+
+
+def _interesting_mount_opts(opts: list[str]) -> list[str]:
+    """Keep only mount options the LLM would actually use."""
+    keep = {"ro", "rw", "noatime", "relatime", "discard", "nodiratime",
+            "sync", "async", "nodev", "nosuid", "noexec", "ssd", "compress"}
+    return [o for o in opts if o in keep or o.startswith("compress=")]
+
+
+def _gather_disk_facts_darwin() -> dict[str, Any]:
+    """macOS host facts via `df -P -k`. Mount + fstype + usage only; no
+    device sub-record (would require diskutil per-device parsing for marginal
+    additional value). Same outer shape as the Linux path so the agent's
+    consumer code does not branch."""
+    out: dict[str, Any] = {"mounts": [], "unmounted_devices": []}
+    if not shutil.which("df"):
+        return out
+    try:
+        # -P = POSIX output (stable columns, no wrap); -k = 1K blocks;
+        # -T <type> would filter, but BSD df spells filtering differently
+        # from GNU df, so we filter in Python instead.
+        res = subprocess.run(
+            ["df", "-P", "-k"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if res.returncode != 0:
+            return out
+    except (subprocess.SubprocessError, OSError):
+        return out
+
+    # We need fstype too. `mount` is the reliable cross-mac source.
+    fstype_by_mount: dict[str, str] = {}
+    try:
+        mres = subprocess.run(
+            ["mount"], capture_output=True, text=True, timeout=5, check=False,
+        )
+        if mres.returncode == 0:
+            # Lines look like:  /dev/disk3s1s1 on / (apfs, ...)
+            import re as _re
+            for line in mres.stdout.splitlines():
+                m = _re.match(r"^(\S+) on (.+?) \(([^,)]+)", line)
+                if m:
+                    fstype_by_mount[m.group(2)] = m.group(3).strip()
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+    lines = res.stdout.splitlines()
+    if not lines:
+        return out
+    # First line is the header; skip it.
+    for line in lines[1:]:
+        parts = line.split(None, 5)
+        if len(parts) < 6:
+            continue
+        source, blocks_s, used_s, avail_s, _pct_s, mnt = parts
+        try:
+            blocks = int(blocks_s)
+            used_k = int(used_s)
+            avail_k = int(avail_s)
+        except ValueError:
+            continue
+
+        fstype = fstype_by_mount.get(mnt, "")
+        if fstype in _DISK_SKIP_FSTYPES_DARWIN:
+            continue
+        if mnt.startswith(_DISK_SKIP_MOUNT_PREFIXES_DARWIN):
+            continue
+        # devfs mounts surface as /dev — filter for safety even if `mount`
+        # output was missed.
+        if source == "devfs" or mnt == "/dev":
+            continue
+
+        total = blocks * 1024
+        used = used_k * 1024
+        free = avail_k * 1024
+        pct = round(100.0 * used / total, 1) if total else None
+        out["mounts"].append({
+            "mount": mnt,
+            "source": source,
+            "fstype": fstype or None,
+            "options": [],
+            "total_gb": round(total / (1024 ** 3), 2),
+            "free_gb": round(free / (1024 ** 3), 2),
+            "used_gb": round(used / (1024 ** 3), 2),
+            "percent_used": pct,
+        })
+    return out
+
+
+def _gather_disk_facts(verbose: bool = False) -> dict[str, Any]:
+    """Mount-first disk topology for the agent's host facts.
+
+    Linux: full picture - inventory + sizes + usage + fstype + rotational
+        + bus, plus optional 1s IO sample in verbose tier.
+    macOS: mount + fstype + usage only (no device sub-record, no IO sample).
+    Other platforms: empty stub; caller drops the key.
+
+    Outer shape is identical across platforms so consumer code never branches.
+    """
+    out: dict[str, Any] = {"mounts": [], "unmounted_devices": []}
+    system = platform.system()
+
+    if system == "Darwin":
+        return _gather_disk_facts_darwin()
+
+    if system != "Linux":
+        return out
+
+    devices = _read_block_devices()
+    mounts = _read_mounts()
+
+    # Map each mount to its underlying physical disk basename, where derivable.
+    mounted_disks: set[str] = set()
+    for src, mnt, fstype, opts in mounts:
+        dev_base: str | None = None
+        if src.startswith("/dev/"):
+            name = src[len("/dev/"):]
+            dev_base = _basename_to_disk(name)
+            if dev_base in devices:
+                mounted_disks.add(dev_base)
+
+        try:
+            st = os.statvfs(mnt)
+            total = st.f_blocks * st.f_frsize
+            free = st.f_bavail * st.f_frsize
+            used = total - (st.f_bfree * st.f_frsize)
+            pct = round(100.0 * used / total, 1) if total else None
+        except OSError:
+            total = free = used = pct = None
+
+        entry: dict[str, Any] = {
+            "mount": mnt,
+            "source": src,
+            "fstype": fstype,
+            "options": _interesting_mount_opts(opts),
+            "total_gb": round(total / (1024 ** 3), 2) if total else None,
+            "free_gb": round(free / (1024 ** 3), 2) if free else None,
+            "used_gb": round(used / (1024 ** 3), 2) if used else None,
+            "percent_used": pct,
+        }
+        if dev_base and dev_base in devices:
+            d = devices[dev_base]
+            entry["device"] = {
+                "name": f"/dev/{dev_base}",
+                "model": d.get("model"),
+                "transport": d.get("transport"),
+                "rotational": d.get("rotational"),
+                "size_gb": round(d["size_bytes"] / (1024 ** 3), 2)
+                            if d.get("size_bytes") else None,
+            }
+        out["mounts"].append(entry)
+
+    for name, d in devices.items():
+        if name in mounted_disks:
+            continue
+        out["unmounted_devices"].append({
+            "name": f"/dev/{name}",
+            "model": d.get("model"),
+            "transport": d.get("transport"),
+            "rotational": d.get("rotational"),
+            "size_gb": round(d["size_bytes"] / (1024 ** 3), 2)
+                        if d.get("size_bytes") else None,
+        })
+
+    if verbose:
+        out["io_sample"] = _sample_disk_io(devices.keys())
+
+    return out
+
+
+def _read_diskstats() -> dict[str, tuple[int, int]]:
+    """Parse /proc/diskstats -> {basename: (sectors_read, sectors_written)}.
+    Sector size is 512 bytes per the kernel ABI, independent of physical
+    block size."""
+    snap: dict[str, tuple[int, int]] = {}
+    raw = _safe_read("/proc/diskstats", limit=65536)
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) < 14:
+            continue
+        # fields: major minor name reads_completed reads_merged sectors_read
+        # ms_reading writes_completed writes_merged sectors_written ...
+        name = parts[2]
+        if name.startswith(_DISK_SKIP_DEV_PREFIXES):
+            continue
+        try:
+            snap[name] = (int(parts[5]), int(parts[9]))
+        except ValueError:
+            continue
+    return snap
+
+
+def _sample_disk_io(device_names) -> dict[str, dict[str, float]]:
+    """1-second delta sample of /proc/diskstats. MB/s read/write per disk.
+    Returns only entries for devices in `device_names` (the physical disks)."""
+    import time as _t
+    wanted = set(device_names)
+    first = _read_diskstats()
+    _t.sleep(1.0)
+    second = _read_diskstats()
+    result: dict[str, dict[str, float]] = {}
+    for name in wanted:
+        if name not in first or name not in second:
+            continue
+        sr1, sw1 = first[name]
+        sr2, sw2 = second[name]
+        # 512-byte sectors -> MB/s over 1s
+        result[name] = {
+            "read_mb_s": round((sr2 - sr1) * 512 / (1024 ** 2), 3),
+            "write_mb_s": round((sw2 - sw1) * 512 / (1024 ** 2), 3),
+        }
+    return result
+
+
 def gather_host_facts() -> dict[str, Any]:
     uname = platform.uname()
     facts: dict[str, Any] = {
@@ -571,6 +898,8 @@ def gather_host_facts() -> dict[str, Any]:
         "docker", "podman", "kubectl",
         # python ecosystem
         "python3", "pip", "pip3", "uv", "poetry", "pipx",
+        # disk / filesystem inspection
+        "lsblk", "findmnt", "df", "du", "blkid", "smartctl",
     ]
     facts["available_tools"] = _which_many(candidates)
 
@@ -593,6 +922,11 @@ def gather_host_facts() -> dict[str, Any]:
     except OSError:
         pass
 
+    # Mount-first disk topology (Linux). Unprivileged, ~5-10ms cost.
+    disk = _gather_disk_facts(verbose=False)
+    if disk["mounts"] or disk["unmounted_devices"]:
+        facts["disks"] = disk
+
     return facts
 
 
@@ -606,6 +940,13 @@ def gather_verbose_host_facts() -> dict[str, Any]:
 
     network_tools = _which_many(["ip", "ifconfig", "netstat", "route"])
     facts["network_tools"] = network_tools
+
+    # Live IO sample (1s window). Skipped on non-Linux or if default tier
+    # already produced no disk facts.
+    if "disks" in facts and platform.system() == "Linux":
+        sample = _gather_disk_facts(verbose=True).get("io_sample")
+        if sample:
+            facts["disks"]["io_sample"] = sample
 
     return facts
 
