@@ -100,9 +100,11 @@ from typing import Any
 DEFAULT_OPENAI_MODEL = os.environ.get("SYS_OPENAI_MODEL", "gpt-4o-mini")
 
 # Anthropic options (verified May 2026):
-#   claude-haiku-4-5-20251001  — fast/cheap, solid tool use
+#   claude-haiku-4-5-20251001  — fast/cheap, solid tool use, supports thinking
 #   claude-sonnet-4-6          — better reasoning, mid-tier price
-#   claude-opus-4-7            — flagship, premium
+#   claude-opus-4-7            — prior flagship, premium ($5/$25 per 1M tok)
+#   claude-opus-4-8            — current flagship, premium ($5/$25), adaptive
+#                                thinking; opt-in via /thinking, not the default
 DEFAULT_ANTHROPIC_MODEL = os.environ.get(
     "SYS_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"
 )
@@ -114,10 +116,12 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-4.1-nano":  1_000_000,
     "gpt-4o-mini":     128_000,
     "gpt-5.4-mini":    400_000,
-    # Anthropic
+    # Anthropic — Opus 4.6/4.7/4.8 and Sonnet 4.6 ship the full 1M window at
+    # standard pricing; Haiku 4.5 remains 200K.
     "claude-haiku-4-5-20251001": 200_000,
-    "claude-sonnet-4-6":         200_000,
-    "claude-opus-4-7":           200_000,
+    "claude-sonnet-4-6":       1_000_000,
+    "claude-opus-4-7":         1_000_000,
+    "claude-opus-4-8":         1_000_000,
 }
 
 # Known model names per provider — the suggestion list for /model and the
@@ -135,6 +139,7 @@ PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
         "claude-haiku-4-5-20251001",
         "claude-sonnet-4-6",
         "claude-opus-4-7",
+        "claude-opus-4-8",
     ),
 }
 
@@ -173,6 +178,52 @@ COMMAND_TIMEOUT = int(os.environ.get("SYS_COMMAND_TIMEOUT", "120"))
 # Anthropic requires max_tokens; pick something generous for tool dialogs.
 ANTHROPIC_MAX_TOKENS = 4096
 
+# Extended thinking on the Anthropic path. Off by default: thinking tokens are
+# output-billed (expensive on Opus) and unnecessary for routine commands.
+# Toggle per session with /thinking; SYS_THINKING sets the startup state.
+# Thinking is Anthropic-only and never touches the OpenAI path.
+#
+# The thinking API differs by model generation (see _thinking_mode):
+#   - "adaptive": thinking={"type":"adaptive"} + output_config={"effort": E}.
+#     The model decides per-turn whether/how much to think; depth is steered by
+#     effort, NOT budget_tokens. Interleaved thinking is auto-enabled (no beta
+#     header). Required on Opus 4.7/4.8 (manual budget 400s); recommended on
+#     Opus 4.6 / Sonnet 4.6. Sent via extra_body so an older SDK that predates
+#     these fields doesn't reject them at the typed-param layer.
+#   - "enabled": thinking={"type":"enabled","budget_tokens":N} + the interleaved
+#     beta header (lets reasoning span tool calls and budget exceed max_tokens).
+#     Used by Haiku 4.5 and older Claude 4 models, which lack adaptive/effort.
+ANTHROPIC_THINKING_DEFAULT = os.environ.get("SYS_THINKING", "off").strip().lower() == "on"
+
+# effort: low|medium|high|xhigh|max. Steers adaptive thinking depth; "high" is
+# the API default. Ignored on the "enabled" (Haiku/legacy) path.
+_VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+ANTHROPIC_THINKING_EFFORT_DEFAULT = os.environ.get("SYS_THINKING_EFFORT", "high").strip().lower()
+if ANTHROPIC_THINKING_EFFORT_DEFAULT not in _VALID_EFFORTS:
+    ANTHROPIC_THINKING_EFFORT_DEFAULT = "high"
+
+# budget_tokens for the legacy "enabled" path only (Haiku 4.5 / older).
+ANTHROPIC_THINKING_BUDGET = int(os.environ.get("SYS_THINKING_BUDGET", "4000"))
+
+# On a thinking turn the model needs headroom to reason AND answer/act; the
+# 4096 default would truncate. Anthropic suggests a large cap at high+ effort.
+# 32K stays under every current model's output ceiling (Haiku/Sonnet 64K,
+# Opus 128K) and only bills for tokens actually produced.
+ANTHROPIC_THINKING_MAX_TOKENS = int(os.environ.get("SYS_THINKING_MAX_TOKENS", "32000"))
+
+# Interleaved-thinking beta header — needed only on the "enabled" path. It is
+# deprecated/ignored on adaptive models, so it is NOT sent in adaptive mode.
+ANTHROPIC_INTERLEAVED_BETA = "interleaved-thinking-2025-05-14"
+
+# Models that still require the legacy enabled+budget_tokens thinking form.
+# Everything current uses adaptive+effort, so unknown models default to
+# adaptive (manual budgets are being removed across the lineup).
+def _thinking_mode(model: str) -> str:
+    """'enabled' for Haiku 4.5 / older Claude models, else 'adaptive'."""
+    if "haiku-4-5" in model:
+        return "enabled"
+    return "adaptive"
+
 # SDK-level retry count. Both the openai and anthropic SDKs implement
 # exponential backoff with jitter and honor Retry-After headers; they retry
 # on 408/409/429 and 5xx (including Anthropic's 529 overloaded_error).
@@ -186,6 +237,8 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/info",           "Provider, model, session token usage, host facts"),
     ("/reset",          "Clear conversation history and token counters"),
     ("/auto on|off",    "Skip the per-command approval prompt (deny list still applies)"),
+    ("/thinking on|off", "Toggle Anthropic extended thinking (takes effect next turn)"),
+    ("/effort [level]", "Adaptive thinking depth: low|medium|high|xhigh|max"),
     ("/tokens on|off",  "Toggle the per-turn token-usage line"),
     ("/color on|off",   "Toggle ANSI color output"),
     ("/provider [name]", "Show or switch provider: openai|anthropic"),
@@ -1252,6 +1305,7 @@ class ChatTurn:
     tool_calls: list[ToolCall]
     raw_message: Any           # provider-native dict, appended to history
     usage: Usage
+    thinking_text: str = ""    # extended-thinking scratchpad (Anthropic only)
 
 
 class Provider:
@@ -1261,7 +1315,10 @@ class Provider:
     def initial_messages(self, system: str) -> list[dict]:
         raise NotImplementedError
 
-    def chat(self, messages: list[dict], system: str) -> ChatTurn:
+    def chat(
+        self, messages: list[dict], system: str,
+        thinking: bool = False, effort: str = "high",
+    ) -> ChatTurn:
         raise NotImplementedError
 
     def append_assistant(self, messages: list[dict], turn: ChatTurn) -> None:
@@ -1287,7 +1344,13 @@ class OpenAIProvider(Provider):
         # OpenAI: system prompt is the first message
         return [{"role": "system", "content": system}]
 
-    def chat(self, messages: list[dict], system: str) -> ChatTurn:
+    def chat(
+        self, messages: list[dict], system: str,
+        thinking: bool = False, effort: str = "high",
+    ) -> ChatTurn:
+        # `thinking`/`effort` are Anthropic-only; ignored here so the call site
+        # can pass them uniformly. OpenAI reasoning models use a different
+        # mechanism.
         resp = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
@@ -1338,7 +1401,10 @@ class AnthropicProvider(Provider):
         # Anthropic: system prompt is a top-level parameter, not in messages
         return []
 
-    def chat(self, messages: list[dict], system: str) -> ChatTurn:
+    def chat(
+        self, messages: list[dict], system: str,
+        thinking: bool = False, effort: str = "high",
+    ) -> ChatTurn:
         # Send the system prompt as a cacheable block. The system prompt
         # (instructions + host-facts JSON) is identical every turn, so
         # marking it with cache_control lets Anthropic bill cache reads at
@@ -1349,21 +1415,64 @@ class AnthropicProvider(Provider):
             "text": system,
             "cache_control": {"type": "ephemeral"},
         }]
-        resp = self.client.messages.create(
+        kwargs: dict[str, Any] = dict(
             model=self.model,
             system=system_blocks,
             messages=messages,
             tools=ANTHROPIC_TOOLS,
             max_tokens=ANTHROPIC_MAX_TOKENS,
         )
+        if thinking:
+            # tool_choice stays unset (=auto), the only mode compatible with
+            # thinking. Raise the token cap so the model has room to reason
+            # AND answer/act in one turn.
+            kwargs["max_tokens"] = ANTHROPIC_THINKING_MAX_TOKENS
+            if _thinking_mode(self.model) == "adaptive":
+                # Opus 4.7/4.8, Sonnet 4.6, Opus 4.6. Manual budget_tokens 400s
+                # on Opus 4.7/4.8. Interleaved thinking is auto-enabled, so no
+                # beta header. Routed through extra_body so an older pinned SDK
+                # that predates these fields doesn't reject them.
+                kwargs["extra_body"] = {
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": effort},
+                }
+            else:
+                # Haiku 4.5 / older Claude 4: manual budget. The interleaved
+                # beta lets reasoning span tool calls and budget exceed
+                # max_tokens.
+                kwargs["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": ANTHROPIC_THINKING_BUDGET,
+                }
+                kwargs["extra_headers"] = {
+                    "anthropic-beta": ANTHROPIC_INTERLEAVED_BETA
+                }
+        if thinking:
+            # A thinking turn raises max_tokens high enough that the SDK's
+            # non-streaming guard refuses the request (it estimates worst-case
+            # duration from max_tokens and blocks anything that could exceed
+            # ~10 min on a slow model like Opus). Stream and reassemble the
+            # final Message — same object shape as create(), so parsing below
+            # is unchanged. .stream() accepts the same params incl. extra_body.
+            with self.client.messages.stream(**kwargs) as stream:
+                resp = stream.get_final_message()
+        else:
+            resp = self.client.messages.create(**kwargs)
         text_parts: list[str] = []
+        thinking_parts: list[str] = []
         calls: list[ToolCall] = []
         raw_content: list[dict] = []
         for block in resp.content:
-            # exclude_none keeps the echo-back payload minimal and valid
+            # Echo every block back unmodified — thinking blocks (with their
+            # signature) and redacted_thinking blocks MUST be preserved in the
+            # assistant turn during tool use, in original order, or the API
+            # rejects the next call. exclude_none keeps the payload valid;
+            # signature/thinking/data are non-null so they survive.
             raw_content.append(block.model_dump(exclude_none=True))
             if block.type == "text":
                 text_parts.append(block.text)
+            elif block.type == "thinking":
+                thinking_parts.append(block.thinking)
             elif block.type == "tool_use":
                 calls.append(ToolCall(
                     id=block.id,
@@ -1381,6 +1490,7 @@ class AnthropicProvider(Provider):
                 cache_write=getattr(
                     resp.usage, "cache_creation_input_tokens", 0) or 0,
             ),
+            thinking_text="\n".join(thinking_parts),
         )
 
     def append_tool_results(
@@ -1531,7 +1641,32 @@ def explain_api_error(e: Exception) -> str:
     return s          # fall back to the raw message for anything unrecognized
 
 
-def print_help(auto_approve: bool, show_tokens: bool) -> None:
+def thinking_active(provider: Provider, flag: bool) -> bool:
+    """True only when the thinking flag is set AND the provider honors it.
+
+    Thinking is Anthropic-only; on any other provider the flag is inert, so
+    callers should report *effective* state through this rather than the raw
+    flag to avoid implying thinking is running when it is not.
+    """
+    return flag and provider.name == "anthropic"
+
+
+def thinking_status(provider: Provider, flag: bool) -> str:
+    """Human-readable thinking state for displays: off / on / on-but-inactive."""
+    if not flag:
+        return "off"
+    if provider.name == "anthropic":
+        return "on"
+    return f"on (inactive: {provider.name})"
+
+
+def print_help(
+    provider: Provider,
+    auto_approve: bool,
+    show_tokens: bool,
+    thinking_enabled: bool,
+    effort: str,
+) -> None:
     """Print the meta-command reference plus current toggle states."""
     print(banner("Meta-commands:"))
     width = max(len(cmd) for cmd, _ in META_COMMANDS)
@@ -1540,7 +1675,10 @@ def print_help(auto_approve: bool, show_tokens: bool) -> None:
     print()
     print(dim(
         f"  state: auto-approve={auto_approve}  "
-        f"show-tokens={show_tokens}  color={_color_enabled}"
+        f"show-tokens={show_tokens}  "
+        f"thinking={thinking_status(provider, thinking_enabled)}  "
+        f"effort={effort}  "
+        f"color={_color_enabled}"
     ))
 
 
@@ -1590,6 +1728,8 @@ def run_repl(provider: Provider) -> None:
     messages = provider.initial_messages(system)
     auto_approve = False
     show_tokens = False                  # /tokens on|off
+    thinking_enabled = ANTHROPIC_THINKING_DEFAULT   # /thinking on|off
+    effort = ANTHROPIC_THINKING_EFFORT_DEFAULT       # /effort low..max (adaptive)
     session_in = 0                       # cumulative input tokens this session
     session_out = 0                      # cumulative output tokens this session
     last_usage = Usage()                 # token usage from most recent call
@@ -1611,9 +1751,17 @@ def run_repl(provider: Provider) -> None:
             f"ctx: {ctx_part}]"
         )
 
+    if thinking_enabled:
+        thinking_note = f"  thinking={thinking_status(provider, thinking_enabled)}"
+        if thinking_active(provider, thinking_enabled) \
+                and _thinking_mode(provider.model) == "adaptive":
+            thinking_note += f" effort={effort}"
+    else:
+        thinking_note = ""
     print(banner(
         f"sys_agent  provider={provider.name}  model={provider.model}  "
         f"host={facts['node']} ({facts['system']}/{facts['machine']})"
+        f"{thinking_note}"
     ))
     print(dim("meta: " + "  ".join(cmd for cmd, _ in META_COMMANDS)
               + "   — /help for details"))
@@ -1650,7 +1798,7 @@ def run_repl(provider: Provider) -> None:
         if user_in in ("/exit", "/quit"):
             return
         if user_in in ("/help", "/?"):
-            print_help(auto_approve, show_tokens)
+            print_help(provider, auto_approve, show_tokens, thinking_enabled, effort)
             continue
         if user_in == "/reset":
             messages = provider.initial_messages(system)
@@ -1680,6 +1828,10 @@ def run_repl(provider: Provider) -> None:
                 },
                 "auto_approve": auto_approve,
                 "show_tokens": show_tokens,
+                "thinking_enabled": thinking_enabled,
+                "thinking_active": thinking_active(provider, thinking_enabled),
+                "thinking_mode": _thinking_mode(provider.model) if provider.name == "anthropic" else None,
+                "effort": effort,
                 "color": _color_enabled,
                 "host": facts,
             }, indent=2))
@@ -1776,6 +1928,33 @@ def run_repl(provider: Provider) -> None:
             else:
                 print(dim(f"[auto-approve = {auto_approve}]  usage: /auto on|off"))
             continue
+        if user_in.startswith("/thinking"):
+            parts = user_in.split()
+            if len(parts) == 2 and parts[1] in ("on", "off"):
+                thinking_enabled = parts[1] == "on"
+                print(dim(
+                    f"[thinking = {thinking_status(provider, thinking_enabled)}]"
+                ))
+            else:
+                print(dim(
+                    f"[thinking = {thinking_status(provider, thinking_enabled)}]"
+                    "  usage: /thinking on|off"
+                ))
+            continue
+        if user_in.startswith("/effort"):
+            parts = user_in.split()
+            if len(parts) == 2 and parts[1].lower() in _VALID_EFFORTS:
+                effort = parts[1].lower()
+                hint = "" if _thinking_mode(provider.model) == "adaptive" \
+                    and provider.name == "anthropic" else \
+                    "  (applies to adaptive-thinking models only)"
+                print(dim(f"[effort = {effort}]{hint}"))
+            else:
+                print(dim(
+                    f"[effort = {effort}]  usage: /effort "
+                    f"{'|'.join(_VALID_EFFORTS)}"
+                ))
+            continue
         if user_in.startswith("/tokens"):
             parts = user_in.split()
             if len(parts) == 2 and parts[1] in ("on", "off"):
@@ -1798,10 +1977,20 @@ def run_repl(provider: Provider) -> None:
         messages.append({"role": "user", "content": user_in})
 
         # Inner loop: keep calling the model until it stops requesting tools.
+        # thinking_enabled is read once here and held constant for the whole
+        # turn — toggling /thinking mid-turn is impossible (input only happens
+        # at the outer prompt) and the API would silently ignore it anyway.
         iteration = 0
         while True:
+            if thinking_active(provider, thinking_enabled):
+                # Thinking turns stream-and-buffer (no live tokens), so signal
+                # work is in progress; the wait can be long at high effort.
+                print(dim("[thinking…]"), flush=True)
             try:
-                turn = provider.chat(messages, system)
+                turn = provider.chat(
+                    messages, system,
+                    thinking=thinking_enabled, effort=effort,
+                )
             except KeyboardInterrupt:
                 print(fail("\n[interrupted — request cancelled]"))
                 # Same orphan-user-message rule as the api-error path below.
@@ -1825,6 +2014,11 @@ def run_repl(provider: Provider) -> None:
                 print(fmt_tokens(last_usage))
 
             provider.append_assistant(messages, turn)
+
+            # Surface the reasoning scratchpad dimmed, ahead of any proposed
+            # command or the final answer. Only present when thinking is on.
+            if turn.thinking_text:
+                print(dim(textwrap.indent(turn.thinking_text, "  │ ")))
 
             if not turn.tool_calls:
                 if turn.text:

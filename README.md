@@ -24,6 +24,12 @@ matches reality — no more `apt` suggestions on a Mac.
 
 - **Multi-provider**: OpenAI or Anthropic, selected at startup. Both keys
   present → interactive prompt. One key → auto-pick.
+- **Host-aware prompt**: the input prompt carries the active hostname
+  (`you@m3mac>`, `you@raspberrypi>`) so you always know which machine you're
+  driving — no more running a Pi command on the Mac or vice versa.
+- **Extended thinking** (Anthropic): optional adaptive reasoning, opt-in per
+  session via `/thinking`. The scratchpad is surfaced inline; off by default
+  because thinking tokens bill as output. See [Extended thinking](#extended-thinking).
 - **Runtime provider/model switching**: use `/provider` and `/model` to
   inspect or change the active backend during a live REPL session.
 - **Host-aware**: distro, shell, machine arch, package/init/container tool
@@ -139,6 +145,11 @@ SYS_ANTHROPIC_MODEL=claude-sonnet-4-6
 | `SYS_PROVIDER` | Skip provider prompt: `openai` or `anthropic` | (prompt) |
 | `SYS_OPENAI_MODEL` | OpenAI model string | `gpt-4o-mini` |
 | `SYS_ANTHROPIC_MODEL` | Anthropic model string | `claude-haiku-4-5-20251001` |
+| `SYS_THINKING` | Startup state for extended thinking: `on` / `off` (Anthropic) | `off` |
+| `SYS_THINKING_EFFORT` | Adaptive thinking depth: `low`/`medium`/`high`/`xhigh`/`max` | `high` |
+| `SYS_THINKING_MAX_TOKENS` | Output-token cap on thinking turns | `32000` |
+| `SYS_THINKING_BUDGET` | Thinking budget for legacy models only (Haiku 4.5) | `4000` |
+| `SYS_COMMAND_TIMEOUT` | Per-command wall-clock timeout, seconds | `120` |
 | `SYS_ENV_FILE` | Explicit env-file path; skips the search above | (search) |
 | `SYS_COLOR` | `on` / `off` / `auto` | `auto` |
 | `NO_COLOR` | If set, disables color regardless of `SYS_COLOR=auto` | — |
@@ -157,13 +168,14 @@ retained — meta-commands (`/info`, `/exit`, etc.) and short-answer prompts
 
 ## Usage
 
-Once running, type natural-language requests:
+Once running, type natural-language requests. The prompt shows the active
+hostname, so it is always clear which machine will execute the command:
 
 ```
-you> show me which services are using the most RAM
-you> check why bitcoind is restarting
-you> what's the current load average and what process is dominating?
-you> upgrade nginx to the latest stable version
+you@m3mac>       show me which services are using the most RAM
+you@raspberrypi> check why bitcoind is restarting
+you@raspberrypi> what's the current load average and what process is dominating?
+you@m3mac>       upgrade nginx to the latest stable version
 ```
 
 For mutating actions, the approval prompt is your safety net. Type `e` to edit
@@ -195,6 +207,8 @@ start with a clean slate: `> ~/.config/sys_agent/history`.
 | `/reset` | Clear conversation history and token counters |
 | `/info` | Print provider/model, session token usage, host facts |
 | `/auto on\|off` | Skip approval prompt (hard-deny list still applies) |
+| `/thinking on\|off` | Toggle Anthropic extended thinking (takes effect next turn) |
+| `/effort [level]` | Adaptive thinking depth: `low`/`medium`/`high`/`xhigh`/`max` |
 | `/tokens on\|off` | Toggle per-turn token-usage line |
 | `/tokens` | Print current snapshot without changing toggle |
 | `/color on\|off` | Toggle ANSI color output |
@@ -242,6 +256,55 @@ detection, and network-tool availability. Refreshing host facts resets the
 active conversation and token counters so the model receives a clean, current
 system prompt.
 
+### Extended thinking
+
+Anthropic models support a reasoning pass before the model acts. It is **off by
+default**: thinking tokens are billed as output (expensive on Opus), and routine
+commands don't need it.
+
+```text
+/model claude-opus-4-8
+/thinking on
+/effort xhigh        # optional; default is high
+```
+
+Or from the environment:
+
+```sh
+SYS_THINKING=on SYS_THINKING_EFFORT=xhigh sys_agent
+```
+
+The thinking API differs by model generation, and sys_agent picks the right one
+automatically:
+
+- **Adaptive models** (Opus 4.8 / 4.7, Sonnet 4.6, Opus 4.6): the model decides
+  per turn whether and how much to think. Depth is controlled by **effort**
+  (`/effort`), not a token budget. Interleaved thinking is automatic. Manual
+  budgets are rejected with a 400 on Opus 4.7/4.8 — sys_agent never sends them
+  for these models.
+- **Legacy models** (Haiku 4.5 and older): use a fixed `budget_tokens` budget
+  (`SYS_THINKING_BUDGET`) plus the interleaved-thinking beta header so reasoning
+  can span tool calls. Effort does not apply here.
+
+Behavior, either way:
+
+- Reasoning is surfaced dimmed, with a `│` margin, ahead of any proposed command
+  or final answer.
+- The flag is read once at the start of each turn; toggling mid-turn applies on
+  the next turn (the API ignores a mid-turn toggle).
+- On a thinking turn the output cap is raised to `SYS_THINKING_MAX_TOKENS`
+  (default 32K) so the model has room to reason and act without truncation —
+  you are only billed for tokens actually produced.
+- Thinking turns are streamed internally (required by the SDK once the token
+  cap is large) and buffered until complete, so a `[thinking…]` marker is shown
+  while the model works; high-effort Opus turns can take a while.
+- **OpenAI**: both flags are inert. Displays say so — the banner and `/help`
+  show `thinking=on (inactive: openai)`, and `/info` reports `thinking_enabled`,
+  `thinking_active`, and `thinking_mode`.
+
+Reach for it on a non-obvious multi-step diagnosis (tricky `systemd`,
+partitioning, networking). For everyday work, leave it off and stay on Haiku.
+
 ## Safety model
 
 Three layers, weakest to strongest:
@@ -252,10 +315,13 @@ Three layers, weakest to strongest:
    read the line. Read the line.
 2. **Local hard-deny list** (always-on). A short set of irrecoverable command
    patterns is blocked before the approval prompt is even shown. The model
-   cannot disable this and `/auto on` cannot bypass it. See `DENY_SUBSTRINGS`
-   in `sys_agent.py`.
-3. **Command timeout** (60s wall-clock per command). Prevents runaway model
-   loops from hanging the REPL on a single command.
+   cannot disable this and `/auto on` cannot bypass it. Matching is
+   intent-based (argv inspection through wrappers like `sudo`/`env`/`timeout`).
+   See `is_denied()` and the `_DENY_*` / `_FORKBOMB_RE` tables in
+   `sys_agent.py`.
+3. **Command timeout** (120s wall-clock per command, configurable via
+   `SYS_COMMAND_TIMEOUT`). Prevents runaway model loops from hanging the REPL
+   on a single command.
 
 The deny list is intentionally short and pattern-matched. It is **not** a
 substitute for paying attention to the approval prompt. Sandbox the agent
