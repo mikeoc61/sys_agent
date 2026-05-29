@@ -1621,7 +1621,7 @@ def run_repl(provider: Provider) -> None:
 
     while True:
         try:
-            user_in = colored_input(user_tag("you>") + " ").strip()
+            user_in = colored_input(user_tag(f"you@{facts['node']}>") + " ").strip()
         except EOFError:            
             print()
             return
