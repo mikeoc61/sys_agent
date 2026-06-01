@@ -72,6 +72,7 @@ import subprocess
 import sys
 import textwrap
 import atexit
+import datetime
 from dataclasses import dataclass
 from typing import Any
 
@@ -241,6 +242,8 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/effort [level]", "Adaptive thinking depth: low|medium|high|xhigh|max"),
     ("/tokens on|off",  "Toggle the per-turn token-usage line"),
     ("/color on|off",   "Toggle ANSI color output"),
+    ("/audit [on|off]", "Show or toggle the command audit log"),
+    ("/history [N|all]", "Review recent command history from the audit log (paged)"),
     ("/provider [name]", "Show or switch provider: openai|anthropic"),
     ("/model [name]",    "Switch model for the active provider; no arg lists choices"),
     ("/facts",           "Print current host facts"),
@@ -517,6 +520,180 @@ def save_readline_history() -> None:
         readline.write_history_file(_history_path)
     except OSError as e:
         print(dim(f"[readline: cannot save history: {e}]"))
+
+
+# -----------------------------------------------------------------------------
+# Audit log (append-only JSONL record of proposed commands + disposition)
+# -----------------------------------------------------------------------------
+#
+# Distinct from readline history, which stores only your prompts. The audit log
+# records what the MODEL proposed and what happened to it (run/edit/skip/deny/
+# abort) plus the exit code — the forensic trail a 24/7 server role needs.
+#
+# Default-on. Disable with SYS_AUDIT_LOG=off (or empty). Override the path with
+# SYS_AUDIT_LOG=/some/path. Command OUTPUT bodies (stdout/stderr) are NOT logged
+# unless SYS_AUDIT_BODY=on, because output can carry secrets; even then bodies
+# are capped at OUTPUT_MAX_CHARS. The log is not rotated — it is one short JSON
+# line per command; truncate with `> ~/.config/sys_agent/audit.log` if needed.
+AUDIT_LOG_DEFAULT = "~/.config/sys_agent/audit.log"
+_AUDIT_OFF_VALUES = frozenset(("", "off", "0", "false", "none"))
+
+# Module-level state, set by init_audit() and the /audit REPL command.
+_audit_path: str | None = None
+_audit_body: bool = False
+
+
+def _resolve_audit_path(raw: str) -> str | None:
+    """Expand `raw` to an audit-log path and ensure its directory exists.
+    Returns None when `raw` requests disable, or on a dir-create failure
+    (printed once, dimmed). Non-fatal — a failure just disables auditing."""
+    if raw.strip().lower() in _AUDIT_OFF_VALUES:
+        return None
+    path = os.path.expanduser(os.path.expandvars(raw.strip()))
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    except OSError as e:
+        print(dim(f"[audit: cannot create log dir: {e}; auditing off]"))
+        return None
+    return path
+
+
+def init_audit() -> None:
+    """Resolve audit-log state from the environment at startup. Must run after
+    the env file is loaded so SYS_AUDIT_LOG/SYS_AUDIT_BODY from it are honored."""
+    global _audit_path, _audit_body
+    _audit_path = _resolve_audit_path(
+        os.environ.get("SYS_AUDIT_LOG", AUDIT_LOG_DEFAULT)
+    )
+    _audit_body = os.environ.get("SYS_AUDIT_BODY", "off").strip().lower() == "on"
+
+
+def write_audit(record: dict[str, Any]) -> None:
+    """Append one JSON record as a single line. No-op when auditing is off.
+    On a write failure, auditing is disabled (rather than re-erroring on every
+    subsequent command) after a one-line notice."""
+    global _audit_path
+    if _audit_path is None:
+        return
+    try:
+        with open(_audit_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(dim(f"[audit: write failed ({e}); auditing disabled]"))
+        _audit_path = None
+
+
+def _fmt_local_time(ts: str) -> tuple[str, str]:
+    """Convert a UTC 'Z' audit timestamp to (date, time) in the host's local
+    zone — humans reading a history want wall-clock, not UTC. Falls back to a
+    naive string split if the timestamp doesn't parse."""
+    try:
+        dt = (datetime.datetime
+              .strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+              .replace(tzinfo=datetime.timezone.utc)
+              .astimezone())
+        return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S")
+    except (ValueError, TypeError):
+        d, _, t = ts.partition("T")
+        return d, t.rstrip("Z")
+
+
+def render_history(path: str, limit: int | None) -> str | None:
+    """Read the audit-log JSONL at `path` and render a numbered, human-readable
+    history in host-local time. `limit` keeps only the most recent N records;
+    None shows all. Day-change separators disambiguate multi-session logs.
+    Returns the rendered text, or None when there is no history to show.
+
+    Effective command is the edited form when the user rewrote it; deny/skip/
+    abort are tagged and carry no exit code (they never ran)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            records: list[dict[str, Any]] = []
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue            # tolerate a partially-written tail line
+    except OSError:
+        return None
+    if not records:
+        return None
+
+    total = len(records)
+    shown = records if limit is None else records[-limit:]
+    span = "all" if (limit is None or limit >= total) else f"last {len(shown)}"
+    width = len(str(len(shown)))
+
+    lines = [dim(f"# audit history — {span} of {total} records  (host-local time)")]
+    last_date: str | None = None
+    for i, r in enumerate(shown, 1):
+        date, tm = _fmt_local_time(r.get("ts", ""))
+        if date != last_date:
+            lines.append(dim(f"── {date} ──"))
+            last_date = date
+        action = r.get("action", "?")
+        cmd = r.get("edited_command") or r.get("command", "")
+        why = r.get("explanation", "")
+        rc = r.get("returncode")
+
+        tag = ""
+        if action == "edit":
+            tag = warn(" [edited]")
+        elif action == "skip":
+            tag = dim(" [skipped]")
+        elif action == "deny":
+            tag = fail(f" [denied: {r.get('reason', '')}]")
+        elif action == "abort":
+            tag = fail(" [aborted]")
+        rc_str = fail(f" (exit {rc})") if rc not in (None, 0) else ""
+
+        line = f"{i:>{width}}.  {dim(tm)}  {cmd_label(cmd)}{tag}{rc_str}"
+        if why:
+            line += f"  {dim('— ' + why)}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def page_text(text: str) -> None:
+    """Display `text` through a pager when interactive; print plainly otherwise.
+    Honors $PAGER; defaults to `less -RFX` (color-safe, auto-quits when it fits
+    one screen), then `more`. Falls back to a plain print when there is no
+    pager, stdout is not a tty, or the pager fails to spawn."""
+    if not text.endswith("\n"):
+        text += "\n"
+    pager_argv: list[str] | None = None
+    if sys.stdout.isatty():
+        env_pager = os.environ.get("PAGER", "").strip()
+        if env_pager:
+            pager_argv = shlex.split(env_pager)
+        elif shutil.which("less"):
+            pager_argv = ["less", "-RFX"]
+        elif shutil.which("more"):
+            pager_argv = ["more"]
+    if not pager_argv:
+        print(text, end="")
+        return
+    try:
+        proc = subprocess.Popen(pager_argv, stdin=subprocess.PIPE, text=True)
+    except OSError:
+        print(text, end="")
+        return
+    try:
+        proc.communicate(text)
+    except (BrokenPipeError, KeyboardInterrupt):
+        # User quit the pager early (q) or Ctrl-C'd — non-destructive, like the
+        # rest of the REPL. Reap the child and return to the prompt.
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 # -----------------------------------------------------------------------------
@@ -1678,7 +1855,8 @@ def print_help(
         f"show-tokens={show_tokens}  "
         f"thinking={thinking_status(provider, thinking_enabled)}  "
         f"effort={effort}  "
-        f"color={_color_enabled}"
+        f"color={_color_enabled}  "
+        f"audit={'on' if _audit_path else 'off'}"
     ))
 
 
@@ -1721,7 +1899,7 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
 
 
 def run_repl(provider: Provider) -> None:
-    global _color_enabled
+    global _color_enabled, _audit_path
     facts_verbose = False
     facts = gather_host_facts()
     system = build_system_prompt(facts)
@@ -1750,6 +1928,44 @@ def run_repl(provider: Provider) -> None:
             f"session: in={session_in} out={session_out}  "
             f"ctx: {ctx_part}]"
         )
+
+    def audit(action: str, command: str, *, explanation: str = "",
+              edited: str | None = None, returncode: int | None = None,
+              truncated: bool | None = None, reason: str | None = None,
+              note: str | None = None,
+              stdout: str | None = None, stderr: str | None = None) -> None:
+        """Stamp the current host/provider/model onto a record and append it to
+        the audit log. Reads provider/facts live, so a mid-session /provider,
+        /model, or /facts switch is reflected. No-op when auditing is off."""
+        if _audit_path is None:
+            return
+        rec: dict[str, Any] = {
+            "ts": datetime.datetime.now(datetime.timezone.utc)
+                  .strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "host": facts.get("node", ""),
+            "provider": provider.name,
+            "model": provider.model,
+            "action": action,
+            "command": command,
+        }
+        if explanation:
+            rec["explanation"] = explanation
+        if edited is not None:
+            rec["edited_command"] = edited
+        if returncode is not None:
+            rec["returncode"] = returncode
+        if truncated is not None:
+            rec["truncated"] = truncated
+        if reason is not None:
+            rec["reason"] = reason
+        if note is not None:
+            rec["note"] = note
+        if _audit_body:
+            if stdout is not None:
+                rec["stdout"] = stdout[:OUTPUT_MAX_CHARS]
+            if stderr is not None:
+                rec["stderr"] = stderr[:OUTPUT_MAX_CHARS]
+        write_audit(rec)
 
     if thinking_enabled:
         thinking_note = f"  thinking={thinking_status(provider, thinking_enabled)}"
@@ -1833,6 +2049,9 @@ def run_repl(provider: Provider) -> None:
                 "thinking_mode": _thinking_mode(provider.model) if provider.name == "anthropic" else None,
                 "effort": effort,
                 "color": _color_enabled,
+                "audit_enabled": _audit_path is not None,
+                "audit_path": _audit_path,
+                "audit_body": _audit_body,
                 "host": facts,
             }, indent=2))
             continue
@@ -1973,6 +2192,51 @@ def run_repl(provider: Provider) -> None:
             else:
                 print(dim(f"[color = {_color_enabled}]  usage: /color on|off"))
             continue
+        if user_in.startswith("/audit"):
+            parts = user_in.split()
+            if len(parts) == 2 and parts[1] in ("on", "off"):
+                if parts[1] == "off":
+                    _audit_path = None
+                    print(dim("[audit = off]"))
+                else:
+                    raw = os.environ.get("SYS_AUDIT_LOG", AUDIT_LOG_DEFAULT)
+                    if raw.strip().lower() in _AUDIT_OFF_VALUES:
+                        raw = AUDIT_LOG_DEFAULT
+                    _audit_path = _resolve_audit_path(raw)
+                    print(dim(
+                        f"[audit = on  path={_audit_path}]" if _audit_path
+                        else "[audit = off (path unavailable)]"
+                    ))
+            elif len(parts) == 1:
+                if _audit_path:
+                    print(dim(
+                        f"[audit on  path={_audit_path}  body={_audit_body}]"
+                    ))
+                else:
+                    print(dim("[audit off]"))
+            else:
+                print(dim(
+                    f"[audit {'on' if _audit_path else 'off'}]  "
+                    "usage: /audit | /audit on|off"
+                ))
+            continue
+        if user_in.startswith("/history"):
+            parts = user_in.split()
+            limit: int | None = 50
+            if len(parts) == 2 and parts[1] == "all":
+                limit = None
+            elif len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 0:
+                limit = int(parts[1])
+            elif len(parts) >= 2:
+                print(dim("usage: /history | /history N | /history all"))
+                continue
+            hist_path = _audit_path or os.path.expanduser(AUDIT_LOG_DEFAULT)
+            text = render_history(hist_path, limit)
+            if text is None:
+                print(dim("[no audit history yet]"))
+            else:
+                page_text(text)
+            continue
 
         messages.append({"role": "user", "content": user_in})
 
@@ -2034,6 +2298,10 @@ def run_repl(provider: Provider) -> None:
                     # in the prior assistant turn; OpenAI is lenient but
                     # consistent state is cleaner.
                     results.append((tc.id, json.dumps({"error": "session aborted"})))
+                    audit("abort",
+                          (tc.arguments.get("command") or "").strip(),
+                          explanation=(tc.arguments.get("explanation") or "").strip(),
+                          note="session aborted")
                     continue
 
                 if tc.name != TOOL_NAME:
@@ -2053,15 +2321,18 @@ def run_repl(provider: Provider) -> None:
                     print(f"\n{err_bold('[blocked]')} {cmd}")
                     print(fail(f"   reason: {deny}"))
                     results.append((tc.id, json.dumps({"error": f"blocked locally: {deny}"})))
+                    audit("deny", cmd, explanation=why, reason=deny)
                     continue
 
                 action, edited = prompt_approval(cmd, why, auto_approve)
                 if action == "abort":
                     results.append((tc.id, json.dumps({"error": "user aborted"})))
                     aborted = True
+                    audit("abort", cmd, explanation=why)
                     continue
                 if action == "skip":
                     results.append((tc.id, json.dumps({"error": "user declined to run command"})))
+                    audit("skip", cmd, explanation=why)
                     continue
 
                 to_run = edited or cmd
@@ -2075,6 +2346,8 @@ def run_repl(provider: Provider) -> None:
                     print(fail("\n[interrupted — command cancelled]"))
                     results.append((tc.id, json.dumps(
                         {"error": "user interrupted command"})))
+                    audit("edit" if edited else "run", cmd,
+                          explanation=why, edited=edited, note="interrupted")
                     continue
                 exit_str = f"[exit={result.returncode}]"
                 print(ok(exit_str) if result.returncode == 0 else fail(exit_str))
@@ -2085,7 +2358,12 @@ def run_repl(provider: Provider) -> None:
                     print(warn("[stderr]"))
                     print(result.stderr.rstrip())
 
-                results.append((tc.id, result.as_tool_payload()))
+                payload = result.as_tool_payload()   # sets result.truncated
+                results.append((tc.id, payload))
+                audit("edit" if edited else "run", cmd, explanation=why,
+                      edited=edited, returncode=result.returncode,
+                      truncated=result.truncated,
+                      stdout=result.stdout, stderr=result.stderr)
 
             provider.append_tool_results(messages, results)
 
@@ -2111,6 +2389,9 @@ def main() -> None:
             print(dim(f"[loaded {n} vars from {env_file}]"))
     elif explicit:
         print(warn(f"[SYS_ENV_FILE={explicit} not found; relying on shell env]"))
+    init_audit()
+    if _audit_path:
+        print(dim(f"[audit log → {_audit_path}]"))
     provider = select_provider()
     run_repl(provider)
 

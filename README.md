@@ -50,6 +50,12 @@ matches reality — no more `apt` suggestions on a Mac.
   `~/.config/sys_agent/history` across sessions; meta-commands and
   short-answer prompts are excluded so Up-arrow recall stays useful.
   See [Tips & shortcuts](#tips--shortcuts) for keystrokes.
+- **Audit log**: append-only JSONL record of every command the model
+  proposes and its disposition (`run`/`edit`/`skip`/`deny`/`abort`) plus exit
+  code, written to `~/.config/sys_agent/audit.log`. The forensic trail a 24/7
+  server role needs — distinct from readline history, which stores only your
+  prompts. On by default; command output bodies are excluded unless opted in.
+  See [Audit log](#audit-log).
 - **Zero install footprint with uv**: PEP 723 inline-script dependencies;
   `uv` handles the environment transparently.
 
@@ -150,6 +156,8 @@ SYS_ANTHROPIC_MODEL=claude-sonnet-4-6
 | `SYS_THINKING_MAX_TOKENS` | Output-token cap on thinking turns | `32000` |
 | `SYS_THINKING_BUDGET` | Thinking budget for legacy models only (Haiku 4.5) | `4000` |
 | `SYS_COMMAND_TIMEOUT` | Per-command wall-clock timeout, seconds | `120` |
+| `SYS_AUDIT_LOG` | Audit-log path, or `off`/empty to disable | `~/.config/sys_agent/audit.log` |
+| `SYS_AUDIT_BODY` | Also log command stdout/stderr in the audit log (capped) | `off` |
 | `SYS_ENV_FILE` | Explicit env-file path; skips the search above | (search) |
 | `SYS_COLOR` | `on` / `off` / `auto` | `auto` |
 | `NO_COLOR` | If set, disables color regardless of `SYS_COLOR=auto` | — |
@@ -160,6 +168,7 @@ SYS_ANTHROPIC_MODEL=claude-sonnet-4-6
 |---|---|
 | `~/.config/sys_agent/.env` *(or one of the alternatives above)* | API keys and `SYS_*` overrides |
 | `~/.config/sys_agent/history` | Readline history (1000-line cap, persistent across sessions) |
+| `~/.config/sys_agent/audit.log` | Append-only JSONL command audit trail (path/disable via `SYS_AUDIT_LOG`) |
 
 The history file is created on first exit. Only conversational prompts are
 retained — meta-commands (`/info`, `/exit`, etc.) and short-answer prompts
@@ -212,6 +221,10 @@ start with a clean slate: `> ~/.config/sys_agent/history`.
 | `/tokens on\|off` | Toggle per-turn token-usage line |
 | `/tokens` | Print current snapshot without changing toggle |
 | `/color on\|off` | Toggle ANSI color output |
+| `/audit` | Show audit-log status (enabled, path, body capture) |
+| `/audit on\|off` | Toggle the command audit log at runtime |
+| `/history` | Review recent command history from the audit log, paged (last 50) |
+| `/history N \| all` | Show the last N entries, or the full log |
 | `/provider` | Show current provider/model and available providers |
 | `/provider openai\|anthropic` | Switch provider and reset conversation/token counters |
 | `/model` | Show current model/context-window metadata |
@@ -326,6 +339,75 @@ Three layers, weakest to strongest:
 The deny list is intentionally short and pattern-matched. It is **not** a
 substitute for paying attention to the approval prompt. Sandbox the agent
 (VM, container, `firejail`) if you want to test it on untrusted prompts.
+
+## Audit log
+
+A forensic record of what the agent did — **observability, not a control**. It
+does not prevent anything (the approval prompt and deny list do that); it
+records what was proposed and what happened, which is what you want after the
+fact on a 24/7 host.
+
+On by default. Each `run_command` the model proposes appends one JSON line to
+`~/.config/sys_agent/audit.log` capturing its disposition:
+
+| Field | When present | Meaning |
+|---|---|---|
+| `ts` | always | UTC timestamp, ISO-8601 (`Z`) |
+| `host` / `provider` / `model` | always | active host node and backend at execution time |
+| `action` | always | `run` / `edit` / `skip` / `deny` / `abort` |
+| `command` | always | the command the model proposed |
+| `explanation` | when given | the model's stated reason |
+| `edited_command` | `action=edit` | the command as you rewrote it before running |
+| `returncode` | run/edit | process exit code (`124` = timeout) |
+| `truncated` | run/edit | whether output to the model was clipped at `OUTPUT_MAX_CHARS` |
+| `reason` | `action=deny` | which hard-deny rule matched |
+| `note` | as needed | e.g. `interrupted`, `session aborted` |
+| `stdout` / `stderr` | only with `SYS_AUDIT_BODY=on` | command output, capped at `OUTPUT_MAX_CHARS` |
+
+Output **bodies are not logged by default** — stdout/stderr can carry secrets.
+Enable with `SYS_AUDIT_BODY=on` only if you accept that.
+
+```sh
+SYS_AUDIT_LOG=off sys_agent              # disable entirely
+SYS_AUDIT_LOG=/var/log/sys_agent.jsonl   # custom path
+SYS_AUDIT_BODY=on sys_agent              # include command output (capped)
+```
+
+At runtime: `/audit` shows status; `/audit on|off` toggles. Disposition follows
+provider/model/host live, so a mid-session `/provider`, `/model`, or `/facts`
+switch is reflected in subsequent records. The log is not rotated (one short
+line per command); truncate with `> ~/.config/sys_agent/audit.log`.
+
+### Reviewing history
+
+`/history` renders the log as a numbered, human-readable list in **host-local
+time** (the stored timestamps are UTC), paged through `$PAGER` (default
+`less -RFX`, falling back to `more`). Day-change separators disambiguate
+multi-session logs; edited commands show the form that actually ran, and
+`skip`/`deny`/`abort` entries are tagged.
+
+```text
+/history          # last 50 entries (default)
+/history 200      # last 200
+/history all      # entire log
+```
+
+```
+# audit history — last 50 of 312 records  (host-local time)
+── 2026-05-31 ──
+ 1.  17:11:36  systemctl status bitcoind   — Checked bitcoind service status
+ 2.  17:11:43  tail -100 debug.log | head -50 [edited]   — Reviewed log entries
+ 3.  17:11:49  bitcoin-cli getblockchaininfo (exit 1)   — Got blockchain status
+ 4.  17:16:29  rm -rf / [denied: recursive delete targeting the filesystem root]
+```
+
+For ad-hoc queries on the raw JSONL, `jq` is still the sharper tool:
+
+```sh
+jq -r 'select(.action=="run") | "\(.ts) [\(.returncode)] \(.command)"' \
+  ~/.config/sys_agent/audit.log
+jq 'select(.action=="deny")' ~/.config/sys_agent/audit.log
+```
 
 ## Architecture
 
