@@ -36,6 +36,12 @@ matches reality — no more `apt` suggestions on a Mac.
   probes, disk context, and installed tools (`apt`/`brew`/`systemctl`/
   `docker`/etc.) are injected into the system prompt. Host facts can be
   displayed, refreshed, and expanded with `/facts`.
+- **Runtime context**: a startup snapshot of the running services and the top
+  processes by memory is injected alongside the static facts, so the model
+  uses real unit/process names on the first turn instead of probing for them
+  (no more guessing `openclaw` when the unit is `openclaw-gateway`).
+  Privacy-preserving — process names only, never arguments — and refreshable
+  via `/facts`. See [Runtime snapshot](#runtime-snapshot-services-and-processes).
 - **Approval-gated execution**: every proposed command is shown with its
   reason and CWD before it runs. Edit-before-run supported.
 - **Local hard-deny list**: a short list of catastrophic patterns
@@ -156,6 +162,7 @@ SYS_ANTHROPIC_MODEL=claude-sonnet-4-6
 | `SYS_THINKING_MAX_TOKENS` | Output-token cap on thinking turns | `32000` |
 | `SYS_THINKING_BUDGET` | Thinking budget for legacy models only (Haiku 4.5) | `4000` |
 | `SYS_COMMAND_TIMEOUT` | Per-command wall-clock timeout, seconds | `120` |
+| `SYS_TOP_PROCESSES` | Top-N processes (by RSS) in the runtime snapshot | `10` |
 | `SYS_AUDIT_LOG` | Audit-log path, or `off`/empty to disable | `~/.config/sys_agent/audit.log` |
 | `SYS_AUDIT_BODY` | Also log command stdout/stderr in the audit log (capped) | `off` |
 | `SYS_ENV_FILE` | Explicit env-file path; skips the search above | (search) |
@@ -268,6 +275,46 @@ additional environment details such as CPU count, PATH, basic container
 detection, and network-tool availability. Refreshing host facts resets the
 active conversation and token counters so the model receives a clean, current
 system prompt.
+
+### Runtime snapshot: services and processes
+
+Alongside the static host facts, startup probes capture a point-in-time
+snapshot of what the machine is actually running, so the model uses real
+service and process names on the first turn instead of burning a round trip to
+discover them. Two keys are injected into the facts when non-empty:
+
+- **`running_services`** — the active services. On Linux, the running `systemd`
+  service units (`systemctl list-units --type=service --state=running`); empty
+  on hosts without `systemd`, or where the bus is unreachable (e.g. inside a
+  container). On macOS, the currently-running `launchctl` jobs with Apple
+  system agents and per-GUI-app jobs filtered out (see the platform note),
+  leaving the user-relevant daemons (Homebrew, vendor helpers, custom
+  LaunchAgents/Daemons).
+- **`top_processes`** — the top processes by resident memory (RSS), 10 by
+  default (`SYS_TOP_PROCESSES`). Processes sharing a name are aggregated into a
+  single entry with summed RSS and an instance `count`, so a worker pool reads
+  as one `gunicorn ×8` line rather than eight rows. On Linux this is read
+  straight from `/proc` — no `ps` dependency, so it behaves identically across
+  distros, init systems, and userlands; on macOS via `ps -axo rss=,comm=`.
+
+Both are a **snapshot taken at startup**, not live state: a process that is hot
+at launch may be idle later, and the service list reflects startup. The model
+is instructed to use them for naming and orientation but to confirm current
+state with a command before acting on a reading. `/facts refresh` re-probes.
+
+**Privacy.** Only the process *name* is recorded — the executable basename,
+never its arguments — so secrets passed on a command line (`--password=…`, API
+tokens) are dropped before anything is sent to the model.
+
+**Platform note.** The two service lists are intentionally asymmetric. Linux
+includes system units (`dbus`, `polkit`, `systemd-*`); macOS drops the
+equivalent Apple tier (`com.apple.*`) plus launchd's per-GUI-app jobs
+(`application.*`), because launchd registers hundreds of these that would
+otherwise bury the handful of services worth naming. The macOS filter lives in
+the `_DARWIN_SERVICE_SKIP_PREFIXES` tuple in `sys_agent.py`; extend it if a
+host's noise differs. Expect the service list to carry far more signal on a
+server — where it names your actual workload — than on a desktop, where it is
+mostly background updaters.
 
 ### Extended thinking
 

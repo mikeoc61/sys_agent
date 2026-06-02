@@ -1087,6 +1087,260 @@ def _sample_disk_io(device_names) -> dict[str, dict[str, float]]:
     return result
 
 
+# -----------------------------------------------------------------------------
+# Runtime snapshot (running services + top processes by memory)
+# -----------------------------------------------------------------------------
+# Gathered once at startup and injected into the system prompt so the model
+# knows real unit/process names on turn one — e.g. it proposes
+# `systemctl status openclaw-gateway` instead of burning round trips guessing
+# `openclaw`. This is a point-in-time SNAPSHOT, not live state: a process hot
+# at launch may be idle later, and the service list reflects startup. The
+# system prompt flags it as such; `/facts refresh` re-probes. Unprivileged.
+
+# Running-service list cap. Service counts are naturally bounded (tens, not
+# hundreds), so this only guards a pathological host from bloating the prompt;
+# it is intentionally generous so the unit you are asking about is never
+# silently dropped.
+RUNTIME_MAX_SERVICES = 80
+# Top-N processes by aggregate resident memory. Override with SYS_TOP_PROCESSES.
+RUNTIME_TOP_PROCESSES = int(os.environ.get("SYS_TOP_PROCESSES", "10"))
+# macOS only: launchd label prefixes dropped from the service list, leaving the
+# user-relevant daemons (Homebrew, vendor helpers, custom LaunchAgents/Daemons)
+# the model actually needs to name.
+#   com.apple.   — Apple-owned system agents (hundreds of them).
+#   application. — launchd's per-GUI-app jobs (label form
+#                  `application.<bundle-id>.<n>.<n>`); these mean "this app is
+#                  open" (Safari, Chrome, Mail, ...), not a service, and their
+#                  memory is already covered by top_processes.
+# Extend if a host's noise differs.
+_DARWIN_SERVICE_SKIP_PREFIXES = ("com.apple.", "application.")
+
+
+def _top_processes_by_rss_linux(limit: int) -> list[dict[str, Any]]:
+    """Top processes by aggregate RSS, read straight from /proc.
+
+    Deliberately avoids `ps`: /proc is the one interface that behaves the same
+    across distros, init systems, and userlands (procps vs busybox `ps` differ
+    on `-o` format support), which matters for a multi-distro tool.
+
+    Privacy: only basename(argv[0]) is kept; the rest of the command line —
+    which can carry tokens/passwords in argv — is discarded before anything is
+    recorded, so it never reaches the remote API. Processes sharing a name
+    (worker pools) are aggregated into one entry with summed RSS and an
+    instance count, which is the right signal for "what is using memory".
+    """
+    try:
+        page = os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        page = 4096
+    agg: dict[str, list[int]] = {}      # name -> [summed_rss_bytes, instances]
+    try:
+        pids = [e for e in os.listdir("/proc") if e.isdigit()]
+    except OSError:
+        return []
+    for pid in pids:
+        # statm fields: size resident shared text lib data dt (in pages).
+        statm = _safe_read(f"/proc/{pid}/statm", limit=128)
+        if not statm:
+            continue
+        try:
+            resident_pages = int(statm.split()[1])
+        except (IndexError, ValueError):
+            continue
+        if resident_pages == 0:
+            continue                    # kernel threads, fully-swapped, etc.
+        # cmdline is NUL-separated argv; empty for kernel threads. Read bytes
+        # directly (not _safe_read) to preserve the NUL boundaries.
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read(4096)
+        except OSError:
+            continue                    # process vanished mid-scan
+        if not raw:
+            continue                    # kernel thread (no userspace argv)
+        argv0 = raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
+        name = os.path.basename(argv0) or argv0
+        if not name:
+            continue
+        slot = agg.setdefault(name, [0, 0])
+        slot[0] += resident_pages * page
+        slot[1] += 1
+    ranked = sorted(agg.items(), key=lambda kv: kv[1][0], reverse=True)[:limit]
+    out: list[dict[str, Any]] = []
+    for name, (rss_bytes, instances) in ranked:
+        entry: dict[str, Any] = {
+            "name": name,
+            "rss_mb": round(rss_bytes / (1024 ** 2), 1),
+        }
+        if instances > 1:
+            entry["count"] = instances
+        out.append(entry)
+    return out
+
+
+def _running_services_linux(limit: int) -> list[str]:
+    """Running systemd service units via `systemctl`, when present.
+
+    Returns [] on non-systemd hosts (OpenRC, runit, sysvinit, ...): enumerating
+    every init system is out of scope, and on those hosts `top_processes` still
+    carries the naming signal through the process basename. Also returns []
+    when systemd is installed but unreachable (no bus — e.g. inside a
+    container), since list-units exits non-zero there. Script-stable flags
+    only, matching the guidance the prompt gives the model.
+    """
+    if not shutil.which("systemctl"):
+        return []
+    try:
+        res = subprocess.run(
+            ["systemctl", "list-units", "--type=service", "--state=running",
+             "--no-legend", "--plain", "--no-pager"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if res.returncode != 0:
+        return []
+    units: list[str] = []
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        # --plain --no-legend => "UNIT LOAD ACTIVE SUB DESCRIPTION"; take UNIT.
+        if parts and parts[0].endswith(".service"):
+            units.append(parts[0])
+            if len(units) >= limit:
+                break
+    return units
+
+
+def _top_processes_by_rss_darwin(limit: int) -> list[dict[str, Any]]:
+    """Top processes by aggregate RSS on macOS, via BSD `ps`.
+
+    macOS has no /proc, so this uses `ps -axo rss=,comm=`. `comm` is the full
+    executable PATH with no arguments (unlike `command`/`args`), which buys two
+    things: argv — and any secrets in it — never leaves the host, and macOS app
+    paths containing spaces survive, since basename() handles
+    `/Applications/Some App.app/Contents/MacOS/Some App` correctly whereas
+    whitespace-splitting `command` would not. `rss` is reported in 1024-byte
+    units. Same aggregation as Linux: programs sharing a name are summed with an
+    instance count.
+
+    NOTE: depends on macOS `ps -o comm=` emitting the full executable path
+    rather than the truncated accounting name (`ucomm`, MAXCOMLEN=16). If a
+    given macOS build truncates here, long names would clip the same way the
+    Linux /proc/comm cap does — validate on the Mac (see module header).
+    """
+    if not shutil.which("ps"):
+        return []
+    try:
+        res = subprocess.run(
+            ["ps", "-axo", "rss=,comm="],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if res.returncode != 0:
+        return []
+    agg: dict[str, list[int]] = {}      # name -> [summed_rss_kb, instances]
+    for line in res.stdout.splitlines():
+        # split(None, 1): first whitespace run separates rss from comm; the
+        # remainder is kept verbatim so spaces inside app paths are preserved.
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        rss_s, comm = parts
+        try:
+            rss_kb = int(rss_s)
+        except ValueError:
+            continue                    # header/garbage line
+        name = os.path.basename(comm.strip()) or comm.strip()
+        if not name:
+            continue
+        slot = agg.setdefault(name, [0, 0])
+        slot[0] += rss_kb
+        slot[1] += 1
+    ranked = sorted(agg.items(), key=lambda kv: kv[1][0], reverse=True)[:limit]
+    out: list[dict[str, Any]] = []
+    for name, (rss_kb, instances) in ranked:
+        entry: dict[str, Any] = {"name": name, "rss_mb": round(rss_kb / 1024, 1)}
+        if instances > 1:
+            entry["count"] = instances
+        out.append(entry)
+    return out
+
+
+def _running_services_darwin(limit: int) -> list[str]:
+    """Running launchd jobs on macOS via `launchctl list` — the analog to the
+    Linux systemd-unit list.
+
+    Filtered to currently-running jobs (numeric PID column) with Apple-owned
+    labels removed (`_DARWIN_SERVICE_SKIP_PREFIXES`). Scope is the invoking
+    user's launchd domain (unprivileged), mirroring the Linux probe running as
+    the invoking user. Label only — no paths or args. Note the naming-disambig
+    payoff is softer than the systemd case: launchd labels are reverse-DNS
+    (`homebrew.mxcl.postgresql`) and rarely diverge from what you'd guess the
+    way `openclaw` -> `openclaw-gateway.service` did.
+    """
+    if not shutil.which("launchctl"):
+        return []
+    try:
+        res = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if res.returncode != 0:
+        return []
+    labels: list[str] = []
+    # Output is TAB-separated: "PID\tStatus\tLabel", with a header row.
+    for line in res.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            parts = line.split()
+        if len(parts) < 3:
+            continue
+        pid, label = parts[0], parts[-1]
+        if not pid.isdigit():
+            continue                    # not currently running ("-")
+        if label.startswith(_DARWIN_SERVICE_SKIP_PREFIXES):
+            continue                    # Apple system noise
+        labels.append(label)
+        if len(labels) >= limit:
+            break
+    return labels
+
+
+def _gather_runtime_facts_darwin() -> dict[str, Any]:
+    """macOS runtime snapshot: launchd jobs + top processes by RSS, mirroring
+    the Linux probe's shape and aggregation.
+
+    NOT YET behaviorally verified on macOS from the Linux dev environment — the
+    parsers are fixture-tested, but two facts only the Mac can confirm: that
+    `ps -axo rss=,comm=` prints the full exec path (not the truncated `ucomm`),
+    and the exact `launchctl list` column format. Validate before trusting:
+        ps -axo rss=,comm= | sort -rn | head
+        launchctl list | head
+    """
+    return {
+        "running_services": _running_services_darwin(RUNTIME_MAX_SERVICES),
+        "top_processes": _top_processes_by_rss_darwin(RUNTIME_TOP_PROCESSES),
+    }
+
+
+def _gather_runtime_facts() -> dict[str, Any]:
+    """Startup runtime snapshot: {'running_services': [...], 'top_processes':
+    [...]}. Linux implemented; macOS stubbed; other platforms empty. Outer
+    shape is stable so `gather_host_facts` attaches only the non-empty keys."""
+    system = platform.system()
+    if system == "Linux":
+        return {
+            "running_services": _running_services_linux(RUNTIME_MAX_SERVICES),
+            "top_processes": _top_processes_by_rss_linux(RUNTIME_TOP_PROCESSES),
+        }
+    if system == "Darwin":
+        return _gather_runtime_facts_darwin()
+    return {}
+
+
 def gather_host_facts() -> dict[str, Any]:
     uname = platform.uname()
     facts: dict[str, Any] = {
@@ -1156,6 +1410,15 @@ def gather_host_facts() -> dict[str, Any]:
     disk = _gather_disk_facts(verbose=False)
     if disk["mounts"] or disk["unmounted_devices"]:
         facts["disks"] = disk
+
+    # Runtime snapshot: running services + top processes by memory. Lets the
+    # model use real unit/process names on turn one instead of guessing.
+    # Linux only today (macOS stubbed); only non-empty keys are attached.
+    runtime = _gather_runtime_facts()
+    if runtime.get("running_services"):
+        facts["running_services"] = runtime["running_services"]
+    if runtime.get("top_processes"):
+        facts["top_processes"] = runtime["top_processes"]
 
     return facts
 
@@ -1890,6 +2153,12 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           when a tool offers them and the noise isn't useful.
         - After receiving command output, summarize the relevant findings
           and decide the next step.
+        - `running_services` and `top_processes` (when present) are a snapshot
+          taken at startup, not live state: a process hot at launch may be
+          idle now, and the service list is from startup. Use them to get real
+          unit/process names right the first time (avoid guessing) and for
+          orientation — but confirm current state with a command before acting
+          on a reading. `/facts refresh` re-probes if they look stale.
         - When the task is complete, or you need user input, reply in plain
           text without calling a tool.
         - Never propose commands that wipe disks, format filesystems, or
