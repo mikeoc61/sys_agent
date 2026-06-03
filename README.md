@@ -1,9 +1,9 @@
 # sys_agent
 
 A minimal command-line agent that connects an arbitrary text prompt to a remote
-LLM (OpenAI or Anthropic), gathers host facts so generated commands match the
-local environment, and executes those commands only after explicit user
-approval. Single Python file. No frameworks.
+LLM (OpenAI, Anthropic, or DeepSeek), gathers host facts so generated commands
+match the local environment, and executes those commands only after explicit
+user approval. Single Python file. No frameworks.
 
 <!-- BEGIN EXAMPLE -->
 ![sys_agent example session](assets/example-session.svg)
@@ -22,13 +22,15 @@ matches reality — no more `apt` suggestions on a Mac.
 
 ## Features
 
-- **Multi-provider**: OpenAI or Anthropic, selected at startup. Both keys
-  present → interactive prompt. One key → auto-pick.
+- **Multi-provider**: OpenAI, Anthropic, or DeepSeek, selected at startup.
+  Multiple keys present → interactive prompt over those available. One key →
+  auto-pick. DeepSeek runs over its OpenAI-compatible endpoint, so it shares
+  the OpenAI tool-call message shape.
 - **Host-aware prompt**: the input prompt carries the active hostname
   (`you@m3mac>`, `you@raspberrypi>`) so you always know which machine you're
   driving — no more running a Pi command on the Mac or vice versa.
-- **Extended thinking** (Anthropic): optional adaptive reasoning, opt-in per
-  session via `/thinking`. The scratchpad is surfaced inline; off by default
+- **Extended thinking** (Anthropic / DeepSeek): optional reasoning pass, opt-in
+  per session via `/thinking`. The scratchpad is surfaced inline; off by default
   because thinking tokens bill as output. See [Extended thinking](#extended-thinking).
 - **Runtime provider/model switching**: use `/provider` and `/model` to
   inspect or change the active backend during a live REPL session.
@@ -69,7 +71,7 @@ matches reality — no more `apt` suggestions on a Mac.
 
 - Python ≥ 3.10
 - One of: `uv` (recommended) **or** pip + venv
-- An OpenAI and/or Anthropic API key
+- An OpenAI, Anthropic, and/or DeepSeek API key
 - macOS/Linux for the full experience. On Windows, the stdlib lacks
   `readline` — the script still runs, but loses history persistence,
   Up/Down recall, and line-editing keystrokes.
@@ -142,25 +144,29 @@ are accepted; matching surrounding quotes are stripped.
 ```sh
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
+DEEPSEEK_API_KEY=sk-...
 # Optional overrides
 SYS_PROVIDER=anthropic
 SYS_OPENAI_MODEL=gpt-5.4-mini
 SYS_ANTHROPIC_MODEL=claude-sonnet-4-6
+SYS_DEEPSEEK_MODEL=deepseek-v4-pro
 ```
 
 ### All environment variables
 
 | Var | Purpose | Default |
 |---|---|---|
-| `OPENAI_API_KEY` | OpenAI auth (one required) | — |
-| `ANTHROPIC_API_KEY` | Anthropic auth (one required) | — |
-| `SYS_PROVIDER` | Skip provider prompt: `openai` or `anthropic` | (prompt) |
+| `OPENAI_API_KEY` | OpenAI auth (one of the three required) | — |
+| `ANTHROPIC_API_KEY` | Anthropic auth (one of the three required) | — |
+| `DEEPSEEK_API_KEY` | DeepSeek auth (one of the three required) | — |
+| `SYS_PROVIDER` | Skip provider prompt: `openai`, `anthropic`, or `deepseek` | (prompt) |
 | `SYS_OPENAI_MODEL` | OpenAI model string | `gpt-4o-mini` |
 | `SYS_ANTHROPIC_MODEL` | Anthropic model string | `claude-haiku-4-5-20251001` |
-| `SYS_THINKING` | Startup state for extended thinking: `on` / `off` (Anthropic) | `off` |
-| `SYS_THINKING_EFFORT` | Adaptive thinking depth: `low`/`medium`/`high`/`xhigh`/`max` | `high` |
-| `SYS_THINKING_MAX_TOKENS` | Output-token cap on thinking turns | `32000` |
-| `SYS_THINKING_BUDGET` | Thinking budget for legacy models only (Haiku 4.5) | `4000` |
+| `SYS_DEEPSEEK_MODEL` | DeepSeek model string | `deepseek-v4-flash` |
+| `SYS_THINKING` | Startup state for extended thinking: `on` / `off` (Anthropic / DeepSeek) | `off` |
+| `SYS_THINKING_EFFORT` | Thinking depth: `low`/`medium`/`high`/`xhigh`/`max` (DeepSeek collapses to `high`/`max`) | `high` |
+| `SYS_THINKING_MAX_TOKENS` | Output-token cap on thinking turns (Anthropic only) | `32000` |
+| `SYS_THINKING_BUDGET` | Thinking budget for legacy Anthropic models only (Haiku 4.5) | `4000` |
 | `SYS_COMMAND_TIMEOUT` | Per-command wall-clock timeout, seconds | `120` |
 | `SYS_TOP_PROCESSES` | Top-N processes (by RSS) in the runtime snapshot | `10` |
 | `SYS_AUDIT_LOG` | Audit-log path, or `off`/empty to disable | `~/.config/sys_agent/audit.log` |
@@ -223,8 +229,8 @@ start with a clean slate: `> ~/.config/sys_agent/history`.
 | `/reset` | Clear conversation history and token counters |
 | `/info` | Print provider/model, session token usage, host facts |
 | `/auto on\|off` | Skip approval prompt (hard-deny list still applies) |
-| `/thinking on\|off` | Toggle Anthropic extended thinking (takes effect next turn) |
-| `/effort [level]` | Adaptive thinking depth: `low`/`medium`/`high`/`xhigh`/`max` |
+| `/thinking on\|off` | Toggle extended thinking — Anthropic / DeepSeek (takes effect next turn) |
+| `/effort [level]` | Thinking depth: `low`/`medium`/`high`/`xhigh`/`max` (DeepSeek collapses to `high`/`max`) |
 | `/tokens on\|off` | Toggle per-turn token-usage line |
 | `/tokens` | Print current snapshot without changing toggle |
 | `/color on\|off` | Toggle ANSI color output |
@@ -233,7 +239,7 @@ start with a clean slate: `> ~/.config/sys_agent/history`.
 | `/history` | Review recent command history from the audit log, paged (last 50) |
 | `/history N \| all` | Show the last N entries, or the full log |
 | `/provider` | Show current provider/model and available providers |
-| `/provider openai\|anthropic` | Switch provider and reset conversation/token counters |
+| `/provider openai\|anthropic\|deepseek` | Switch provider and reset conversation/token counters |
 | `/model` | Show current model/context-window metadata |
 | `/model MODEL_NAME` | Switch the model used by the active provider |
 | `/facts` | Print current host facts |
@@ -248,14 +254,17 @@ Provider and model selection are no longer startup-only. During a session:
 /provider
 /provider openai
 /provider anthropic
+/provider deepseek
 /model
 /model gpt-5.4-mini
 /model claude-sonnet-4-6
+/model deepseek-v4-pro
 ```
 
 Switching providers resets the active conversation and token counters because
-OpenAI and Anthropic use different tool-call message formats. Host facts and
-REPL toggles are preserved.
+the providers use different tool-call message formats (Anthropic batches
+`tool_result` blocks; OpenAI and DeepSeek send one `role: tool` message per
+call). Host facts and REPL toggles are preserved.
 
 Changing the model keeps the same provider and session state. Unknown context
 windows are allowed; token display falls back to absolute token counts.
@@ -318,9 +327,9 @@ mostly background updaters.
 
 ### Extended thinking
 
-Anthropic models support a reasoning pass before the model acts. It is **off by
-default**: thinking tokens are billed as output (expensive on Opus), and routine
-commands don't need it.
+Anthropic and DeepSeek models support a reasoning pass before the model acts.
+It is **off by default**: thinking tokens are billed as output (expensive on
+Opus), and routine commands don't need it.
 
 ```text
 /model claude-opus-4-8
@@ -328,42 +337,61 @@ commands don't need it.
 /effort xhigh        # optional; default is high
 ```
 
+DeepSeek works the same way — `/thinking on` with `deepseek-v4-flash` or
+`deepseek-v4-pro`; both tiers support thinking.
+
 Or from the environment:
 
 ```sh
 SYS_THINKING=on SYS_THINKING_EFFORT=xhigh sys_agent
 ```
 
-The thinking API differs by model generation, and sys_agent picks the right one
+The thinking API differs by model/provider, and sys_agent picks the right one
 automatically:
 
-- **Adaptive models** (Opus 4.8 / 4.7, Sonnet 4.6, Opus 4.6): the model decides
-  per turn whether and how much to think. Depth is controlled by **effort**
-  (`/effort`), not a token budget. Interleaved thinking is automatic. Manual
-  budgets are rejected with a 400 on Opus 4.7/4.8 — sys_agent never sends them
-  for these models.
-- **Legacy models** (Haiku 4.5 and older): use a fixed `budget_tokens` budget
+- **Anthropic adaptive** (Opus 4.8 / 4.7, Sonnet 4.6, Opus 4.6): the model
+  decides per turn whether and how much to think. Depth is controlled by
+  **effort** (`/effort`), not a token budget. Interleaved thinking is automatic.
+  Manual budgets are rejected with a 400 on Opus 4.7/4.8 — sys_agent never sends
+  them for these models.
+- **Anthropic legacy** (Haiku 4.5 and older): use a fixed `budget_tokens` budget
   (`SYS_THINKING_BUDGET`) plus the interleaved-thinking beta header so reasoning
   can span tool calls. Effort does not apply here.
+- **DeepSeek** (V4 Flash / Pro): thinking is enabled per turn via the request
+  body; depth maps from **effort** to DeepSeek's two grades — `xhigh`/`max` →
+  `max`, everything else → `high`. No token budget or max-tokens raise applies.
+  DeepSeek imposes a strict replay contract: once a thinking turn makes a tool
+  call, the reasoning scratchpad must be echoed back on every subsequent
+  assistant message or the next request 400s. sys_agent handles this internally
+  by preserving `reasoning_content` on each assistant turn, so multi-turn tool
+  use just works.
 
-Behavior, either way:
+Behavior, all paths:
 
 - Reasoning is surfaced dimmed, with a `│` margin, ahead of any proposed command
   or final answer.
 - The flag is read once at the start of each turn; toggling mid-turn applies on
   the next turn (the API ignores a mid-turn toggle).
+- A `[thinking…]` marker is shown while the model works; high-effort Opus turns
+  can take a while.
+
+Anthropic-specific:
+
 - On a thinking turn the output cap is raised to `SYS_THINKING_MAX_TOKENS`
   (default 32K) so the model has room to reason and act without truncation —
-  you are only billed for tokens actually produced.
+  you are only billed for tokens actually produced. (DeepSeek needs no such
+  raise.)
 - Thinking turns are streamed internally (required by the SDK once the token
-  cap is large) and buffered until complete, so a `[thinking…]` marker is shown
-  while the model works; high-effort Opus turns can take a while.
-- **OpenAI**: both flags are inert. Displays say so — the banner and `/help`
-  show `thinking=on (inactive: openai)`, and `/info` reports `thinking_enabled`,
-  `thinking_active`, and `thinking_mode`.
+  cap is large) and buffered until complete. DeepSeek uses a plain
+  non-streaming call.
+
+**OpenAI**: both flags are inert. Displays say so — the banner and `/help`
+show `thinking=on (inactive: openai)`, and `/info` reports `thinking_enabled`,
+`thinking_active`, and `thinking_mode`.
 
 Reach for it on a non-obvious multi-step diagnosis (tricky `systemd`,
-partitioning, networking). For everyday work, leave it off and stay on Haiku.
+partitioning, networking). For everyday work, leave it off and stay on a fast
+tier (Haiku, Flash).
 
 ## Safety model
 
@@ -467,10 +495,11 @@ jq 'select(.action=="deny")' ~/.config/sys_agent/audit.log
                  host_facts +    │     command output
                  conversation    │     (stdout, stderr, exit)
                                  ▼
-                  ┌────────────────────────────────────┐
-                  │      Provider abstraction          │
-                  │  OpenAIProvider | AnthropicProvider│
-                  └──────────────┬─────────────────────┘
+                  ┌─────────────────────────────────────────────┐
+                  │            Provider abstraction             │
+                  │ OpenAIProvider | AnthropicProvider |         │
+                  │ DeepSeekProvider (OpenAI-compatible)         │
+                  └──────────────┬──────────────────────────────┘
                                  │  HTTPS + tool calling
                                  ▼
                   ┌────────────────────────────────────┐
@@ -490,9 +519,12 @@ jq 'select(.action=="deny")' ~/.config/sys_agent/audit.log
 ```
 
 The provider abstraction normalizes tool-call/tool-result message structure
-between the two APIs (OpenAI sends one `role: tool` message per call;
-Anthropic batches all `tool_result` blocks into a single user message). The
-REPL is provider-agnostic.
+across the APIs (OpenAI and DeepSeek send one `role: tool` message per call;
+Anthropic batches all `tool_result` blocks into a single user message).
+`DeepSeekProvider` subclasses `OpenAIProvider` — same wire shape over DeepSeek's
+OpenAI-compatible endpoint — overriding only client construction (base URL +
+key) and the thinking path (`reasoning_effort` plus `reasoning_content`
+preservation). The REPL is provider-agnostic.
 
 ### Runtime state
 

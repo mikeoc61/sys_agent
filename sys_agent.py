@@ -21,9 +21,11 @@ Run:      ./sys_agent.py            (after chmod +x)
 
 Env:      OPENAI_API_KEY            (one of these is required)
           ANTHROPIC_API_KEY
-          SYS_PROVIDER               (skip prompt: openai|anthropic)
+          DEEPSEEK_API_KEY
+          SYS_PROVIDER               (skip prompt: openai|anthropic|deepseek)
           SYS_OPENAI_MODEL           (default gpt-4o-mini)
           SYS_ANTHROPIC_MODEL        (default claude-haiku-4-5-20251001)
+          SYS_DEEPSEEK_MODEL         (default deepseek-v4-flash)
           SYS_ENV_FILE               (path to env file; overrides search)
           SYS_COLOR                  (on|off|auto, default auto)
           NO_COLOR                  (if set, disables color regardless)
@@ -110,6 +112,27 @@ DEFAULT_ANTHROPIC_MODEL = os.environ.get(
     "SYS_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"
 )
 
+# DeepSeek options (verified Jun 2026, regular post-promo rates):
+#   deepseek-v4-flash  — $0.14/$0.28 per 1M tok, 284B/13B MoE, fast/cheap tier,
+#                        thinking + non-thinking, tool calling. Default.
+#   deepseek-v4-pro    — $1.74/$3.48 per 1M tok, 1.6T/49B MoE, flagship reasoning
+#                        (launch promo $0.435/$0.87 expired 2026-05-31).
+# OpenAI-compatible endpoint (see DeepSeekProvider); reasoning grades high|max.
+DEFAULT_DEEPSEEK_MODEL = os.environ.get("SYS_DEEPSEEK_MODEL", "deepseek-v4-flash")
+
+# Per-provider startup default, indexed by provider name. Used by
+# select_provider's interactive picker so it never instantiates an SDK client
+# just to label a menu row.
+DEFAULT_MODELS: dict[str, str] = {
+    "openai": DEFAULT_OPENAI_MODEL,
+    "anthropic": DEFAULT_ANTHROPIC_MODEL,
+    "deepseek": DEFAULT_DEEPSEEK_MODEL,
+}
+
+# DeepSeek's OpenAI-compatible base URL. The DeepSeek path reuses the openai
+# SDK pointed here (see DeepSeekProvider), so no extra dependency is needed.
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
 # Known context windows (May 2026). Used for the context-% display; unknown
 # models fall back to printing absolute token counts.
 CONTEXT_WINDOWS: dict[str, int] = {
@@ -123,6 +146,9 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "claude-sonnet-4-6":       1_000_000,
     "claude-opus-4-7":         1_000_000,
     "claude-opus-4-8":         1_000_000,
+    # DeepSeek — V4 Flash and Pro both ship the native 1M window.
+    "deepseek-v4-flash":       1_000_000,
+    "deepseek-v4-pro":         1_000_000,
 }
 
 # Known model names per provider — the suggestion list for /model and the
@@ -142,6 +168,10 @@ PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
         "claude-opus-4-7",
         "claude-opus-4-8",
     ),
+    "deepseek": (
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+    ),
 }
 
 # Model-name prefixes that legitimately belong to each provider. Used to
@@ -150,6 +180,7 @@ PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
 PROVIDER_MODEL_PREFIXES: dict[str, tuple[str, ...]] = {
     "openai": ("gpt-", "o1", "o3", "o4", "chatgpt-"),
     "anthropic": ("claude-",),
+    "deepseek": ("deepseek-",),
 }
 
 # =============================================================================
@@ -238,13 +269,13 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/info",           "Provider, model, session token usage, host facts"),
     ("/reset",          "Clear conversation history and token counters"),
     ("/auto on|off",    "Skip the per-command approval prompt (deny list still applies)"),
-    ("/thinking on|off", "Toggle Anthropic extended thinking (takes effect next turn)"),
-    ("/effort [level]", "Adaptive thinking depth: low|medium|high|xhigh|max"),
+    ("/thinking on|off", "Toggle extended thinking — Anthropic/DeepSeek (next turn)"),
+    ("/effort [level]", "Reasoning depth: low|medium|high|xhigh|max (adaptive/DeepSeek)"),
     ("/tokens on|off",  "Toggle the per-turn token-usage line"),
     ("/color on|off",   "Toggle ANSI color output"),
     ("/audit [on|off]", "Show or toggle the command audit log"),
     ("/history [N|all]", "Review recent command history from the audit log (paged)"),
-    ("/provider [name]", "Show or switch provider: openai|anthropic"),
+    ("/provider [name]", "Show or switch provider: openai|anthropic|deepseek"),
     ("/model [name]",    "Switch model for the active provider; no arg lists choices"),
     ("/facts",           "Print current host facts"),
     ("/facts refresh",   "Re-probe host facts and rebuild system prompt"),
@@ -1827,6 +1858,96 @@ class OpenAIProvider(Provider):
             })
 
 
+class DeepSeekProvider(OpenAIProvider):
+    """DeepSeek V4 (Flash/Pro) via the OpenAI-compatible ChatCompletions API.
+
+    Wire-compatible with OpenAIProvider — identical tool-call / tool-result
+    message shape — so it inherits initial_messages() and append_tool_results()
+    unchanged. Only two things differ and are overridden:
+
+      1. __init__ points the openai SDK at DeepSeek's base_url with the
+         DEEPSEEK_API_KEY (the SDK would otherwise default to OPENAI_API_KEY).
+      2. chat() honors extended thinking, which OpenAI's path ignores. DeepSeek
+         exposes it via reasoning_effort + thinking={"type":"enabled"} and
+         returns the scratchpad in a `reasoning_content` field beside `content`.
+
+    THINKING-MODE REPLAY CONTRACT (the subtle part): once a thinking-enabled
+    turn makes a tool call, DeepSeek REQUIRES `reasoning_content` to be present
+    on every assistant message replayed in subsequent requests, or the next
+    call fails with 400 "reasoning_content ... must be passed back". Because
+    this agent tool-calls on essentially every turn, that path is the norm, not
+    an edge case — it's the bug that broke Claude Code / Cursor / Roo on the V4
+    launch. So reasoning_content is preserved verbatim on the raw assistant
+    message (defaulting to "" — which DeepSeek ignores — when a turn produced
+    none, satisfying the all-or-nothing presence rule). This mirrors how the
+    Anthropic path must echo back thinking blocks with their signatures.
+    """
+
+    # Effort levels the sys_agent scale (low|medium|high|xhigh|max) maps onto.
+    # DeepSeek V4 grades reasoning as high|max only; per its docs xhigh/max ->
+    # max, and low/medium/high collapse to high.
+    @staticmethod
+    def _map_effort(effort: str) -> str:
+        return "max" if effort in ("xhigh", "max") else "high"
+
+    def __init__(self, model: str) -> None:
+        try:
+            from openai import OpenAI
+        except ImportError:
+            sys.exit("openai SDK missing — uv should install via PEP 723 deps")
+        key = os.environ.get("DEEPSEEK_API_KEY")
+        if not key:
+            raise ValueError("DEEPSEEK_API_KEY is not set")
+        self.client = OpenAI(
+            api_key=key, base_url=DEEPSEEK_BASE_URL, max_retries=API_MAX_RETRIES
+        )
+        self.model = model
+        self.name = "deepseek"
+
+    def chat(
+        self, messages: list[dict], system: str,
+        thinking: bool = False, effort: str = "high",
+    ) -> ChatTurn:
+        kwargs: dict[str, Any] = dict(
+            model=self.model,
+            messages=messages,
+            tools=OPENAI_TOOLS,
+            tool_choice="auto",
+        )
+        if thinking:
+            # Sent via extra_body (merged into the request JSON) rather than as
+            # typed kwargs, so neither field depends on the pinned openai SDK
+            # recognizing it — same defensive rationale as the Anthropic path.
+            kwargs["extra_body"] = {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": self._map_effort(effort),
+            }
+        resp = self.client.chat.completions.create(**kwargs)
+        msg = resp.choices[0].message
+        calls: list[ToolCall] = []
+        for tc in (msg.tool_calls or []):
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
+        reasoning = getattr(msg, "reasoning_content", None) or ""
+        raw = msg.model_dump(exclude_none=True)
+        # Always carry reasoning_content (verbatim, else "") so the replay
+        # contract holds for any /thinking toggle history within the session.
+        raw["reasoning_content"] = reasoning
+        return ChatTurn(
+            text=msg.content or "",
+            tool_calls=calls,
+            raw_message=raw,
+            usage=Usage(
+                input_tokens=getattr(resp.usage, "prompt_tokens", 0) or 0,
+                output_tokens=getattr(resp.usage, "completion_tokens", 0) or 0,
+            ),
+            thinking_text=reasoning,
+        )
+
+
 class AnthropicProvider(Provider):
     def __init__(self, model: str) -> None:
         try:
@@ -1956,6 +2077,8 @@ def available_provider_names() -> list[str]:
         names.append("openai")
     if os.environ.get("ANTHROPIC_API_KEY"):
         names.append("anthropic")
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        names.append("deepseek")
     return names
 
 
@@ -1969,7 +2092,11 @@ def make_provider(name: str, model: str | None = None) -> Provider:
         if not os.environ.get("ANTHROPIC_API_KEY"):
             raise ValueError("ANTHROPIC_API_KEY is not set")
         return AnthropicProvider(model or DEFAULT_ANTHROPIC_MODEL)
-    raise ValueError("provider must be openai or anthropic")
+    if normalized in ("deepseek", "d", "ds"):
+        if not os.environ.get("DEEPSEEK_API_KEY"):
+            raise ValueError("DEEPSEEK_API_KEY is not set")
+        return DeepSeekProvider(model or DEFAULT_DEEPSEEK_MODEL)
+    raise ValueError("provider must be openai, anthropic, or deepseek")
 
 
 def _select_model(provider_name: str, current: str) -> str | None:
@@ -2010,43 +2137,49 @@ def _select_model(provider_name: str, current: str) -> str | None:
 
 
 def select_provider() -> Provider:
-    have_openai = bool(os.environ.get("OPENAI_API_KEY"))
-    have_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    if not have_openai and not have_anthropic:
-        sys.exit("error: neither OPENAI_API_KEY nor ANTHROPIC_API_KEY is set")
+    available = available_provider_names()
+    if not available:
+        sys.exit("error: no API key set (need one of OPENAI_API_KEY, "
+                 "ANTHROPIC_API_KEY, DEEPSEEK_API_KEY)")
 
-    # Honor SYS_PROVIDER override (skips interactive prompt)
+    # Canonicalize the SYS_PROVIDER aliases the rest of the code accepts.
+    aliases = {
+        "o": "openai", "a": "anthropic", "claude": "anthropic",
+        "d": "deepseek", "ds": "deepseek",
+    }
+
+    # Honor SYS_PROVIDER override (skips interactive prompt).
     pref = os.environ.get("SYS_PROVIDER", "").strip().lower()
-    if pref in ("openai", "o"):
-        if not have_openai:
-            sys.exit("error: SYS_PROVIDER=openai but OPENAI_API_KEY not set")
-        return OpenAIProvider(DEFAULT_OPENAI_MODEL)
-    if pref in ("anthropic", "a", "claude"):
-        if not have_anthropic:
-            sys.exit("error: SYS_PROVIDER=anthropic but ANTHROPIC_API_KEY not set")
-        return AnthropicProvider(DEFAULT_ANTHROPIC_MODEL)
+    if pref:
+        canon = aliases.get(pref, pref)
+        if canon not in DEFAULT_MODELS:
+            sys.exit(f"error: SYS_PROVIDER={pref!r} is not a known provider "
+                     "(openai|anthropic|deepseek)")
+        if canon not in available:
+            sys.exit(f"error: SYS_PROVIDER={canon} but its API key is not set")
+        return make_provider(canon)
 
-    # Only one key available — no prompt needed
-    if have_openai and not have_anthropic:
-        print(dim("[only OPENAI_API_KEY available — using OpenAI]"))
-        return OpenAIProvider(DEFAULT_OPENAI_MODEL)
-    if have_anthropic and not have_openai:
-        print(dim("[only ANTHROPIC_API_KEY available — using Anthropic]"))
-        return AnthropicProvider(DEFAULT_ANTHROPIC_MODEL)
+    # Only one key available — no prompt needed.
+    if len(available) == 1:
+        only = available[0]
+        print(dim(f"[only {only} key available — using {only}]"))
+        return make_provider(only)
 
-    # Both available — prompt interactively
+    # Multiple available — prompt interactively over exactly those present.
+    labels = {"openai": "OpenAI", "anthropic": "Anthropic", "deepseek": "DeepSeek"}
     print(banner("Select LLM provider:"))
-    print(f"  [1] OpenAI     (model: {DEFAULT_OPENAI_MODEL})")
-    print(f"  [2] Anthropic  (model: {DEFAULT_ANTHROPIC_MODEL})")
+    for idx, name in enumerate(available, 1):
+        print(f"  [{idx}] {labels[name]:<10} (model: {DEFAULT_MODELS[name]})")
     while True:
         try:
-            ans = input_no_history(ask("Choice [1/2]: ")).strip().lower()
+            ans = input_no_history(ask(f"Choice [1-{len(available)}]: ")).strip().lower()
         except (EOFError, KeyboardInterrupt):
             sys.exit("\nno selection; exiting")
-        if ans in ("1", "o", "openai"):
-            return OpenAIProvider(DEFAULT_OPENAI_MODEL)
-        if ans in ("2", "a", "anthropic", "claude"):
-            return AnthropicProvider(DEFAULT_ANTHROPIC_MODEL)
+        if ans.isdigit() and 1 <= int(ans) <= len(available):
+            return make_provider(available[int(ans) - 1])
+        canon = aliases.get(ans, ans)
+        if canon in available:
+            return make_provider(canon)
 
 
 # -----------------------------------------------------------------------------
@@ -2084,20 +2217,32 @@ def explain_api_error(e: Exception) -> str:
 def thinking_active(provider: Provider, flag: bool) -> bool:
     """True only when the thinking flag is set AND the provider honors it.
 
-    Thinking is Anthropic-only; on any other provider the flag is inert, so
-    callers should report *effective* state through this rather than the raw
-    flag to avoid implying thinking is running when it is not.
+    Thinking is supported on Anthropic and DeepSeek; on any other provider the
+    flag is inert, so callers should report *effective* state through this
+    rather than the raw flag to avoid implying thinking is running when it is
+    not.
     """
-    return flag and provider.name == "anthropic"
+    return flag and provider.name in ("anthropic", "deepseek")
 
 
 def thinking_status(provider: Provider, flag: bool) -> str:
     """Human-readable thinking state for displays: off / on / on-but-inactive."""
     if not flag:
         return "off"
-    if provider.name == "anthropic":
+    if provider.name in ("anthropic", "deepseek"):
         return "on"
     return f"on (inactive: {provider.name})"
+
+
+def effort_applies(provider: Provider) -> bool:
+    """True when the active provider/model honors the effort setting:
+    DeepSeek (reasoning_effort) or an Anthropic adaptive-thinking model.
+    OpenAI and Anthropic legacy (Haiku 4.5) thinking ignore it."""
+    if provider.name == "deepseek":
+        return True
+    if provider.name == "anthropic":
+        return _thinking_mode(provider.model) == "adaptive"
+    return False
 
 
 def print_help(
@@ -2238,8 +2383,7 @@ def run_repl(provider: Provider) -> None:
 
     if thinking_enabled:
         thinking_note = f"  thinking={thinking_status(provider, thinking_enabled)}"
-        if thinking_active(provider, thinking_enabled) \
-                and _thinking_mode(provider.model) == "adaptive":
+        if thinking_active(provider, thinking_enabled) and effort_applies(provider):
             thinking_note += f" effort={effort}"
     else:
         thinking_note = ""
@@ -2315,7 +2459,10 @@ def run_repl(provider: Provider) -> None:
                 "show_tokens": show_tokens,
                 "thinking_enabled": thinking_enabled,
                 "thinking_active": thinking_active(provider, thinking_enabled),
-                "thinking_mode": _thinking_mode(provider.model) if provider.name == "anthropic" else None,
+                "thinking_mode": (
+                    _thinking_mode(provider.model) if provider.name == "anthropic"
+                    else ("reasoning_effort" if provider.name == "deepseek" else None)
+                ),
                 "effort": effort,
                 "color": _color_enabled,
                 "audit_enabled": _audit_path is not None,
@@ -2333,8 +2480,10 @@ def run_repl(provider: Provider) -> None:
                     "available_providers": available_provider_names(),
                 }, indent=2))
                 continue
-            if len(parts) != 2 or parts[1].lower() not in ("openai", "anthropic", "o", "a", "claude"):
-                print(dim("usage: /provider openai|anthropic"))
+            if len(parts) != 2 or parts[1].lower() not in (
+                "openai", "anthropic", "deepseek", "o", "a", "claude", "d", "ds"
+            ):
+                print(dim("usage: /provider openai|anthropic|deepseek"))
                 continue
             try:
                 provider = make_provider(parts[1])
@@ -2433,9 +2582,8 @@ def run_repl(provider: Provider) -> None:
             parts = user_in.split()
             if len(parts) == 2 and parts[1].lower() in _VALID_EFFORTS:
                 effort = parts[1].lower()
-                hint = "" if _thinking_mode(provider.model) == "adaptive" \
-                    and provider.name == "anthropic" else \
-                    "  (applies to adaptive-thinking models only)"
+                hint = "" if effort_applies(provider) else \
+                    "  (no effect on this provider/model)"
                 print(dim(f"[effort = {effort}]{hint}"))
             else:
                 print(dim(
