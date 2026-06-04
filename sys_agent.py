@@ -94,13 +94,19 @@ from typing import Any
 # Nothing below this section needs to change for a model update.
 # =============================================================================
 
-# Default model per provider, overridable via env. The default is intentionally
-# the cheapest/fastest tier; switch at runtime with /model.
+# Default model per provider, overridable via env. Defaults favor dependable
+# tool calling at a sensible price tier; switch at runtime with /model.
 # OpenAI options (verified May 2026):
 #   gpt-4.1-nano  — $0.10/$0.40 per 1M tok, weakest tool use of the three
-#   gpt-4o-mini   — $0.15/$0.60, generous free-tier RPM, solid tool use
-#   gpt-5.4-mini  — $0.75/$4.50, newer reasoning, best tool use of cheap tier
-DEFAULT_OPENAI_MODEL = os.environ.get("SYS_OPENAI_MODEL", "gpt-4o-mini")
+#   gpt-4o-mini   — $0.15/$0.60, generous free-tier RPM, but the chattiest
+#                   tier: under tool_choice=auto it tends to ASK ("Would you
+#                   like me to check…?") instead of emitting the run_command
+#                   call, stalling multi-step investigations.
+#   gpt-5.4-mini  — $0.75/$4.50, newer reasoning, best tool use of the tier.
+# Default is gpt-5.4-mini: for an agent that proposes and executes commands,
+# reliable tool-calling outweighs gpt-4o-mini's lower token price. Set
+# SYS_OPENAI_MODEL=gpt-4o-mini (or use /model) if cost dominates for you.
+DEFAULT_OPENAI_MODEL = os.environ.get("SYS_OPENAI_MODEL", "gpt-5.4-mini")
 
 # Anthropic options (verified May 2026):
 #   claude-haiku-4-5-20251001  — fast/cheap, solid tool use, supports thinking
@@ -2307,16 +2313,26 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           prints a CLI-stability warning when not on a tty); `dnf` is fine
           on Fedora/RHEL. Add `--no-progress`, `-q`, or equivalent flags
           when a tool offers them and the noise isn't useful.
-        - After receiving command output, summarize the relevant findings
-          and decide the next step.
+        - After receiving command output, summarize the findings and decide
+          the next step. If the next step is another command, issue it as a
+          run_command call in the same turn rather than describing it or
+          asking whether to proceed.
         - `running_services` and `top_processes` (when present) are a snapshot
           taken at startup, not live state: a process hot at launch may be
           idle now, and the service list is from startup. Use them to get real
           unit/process names right the first time (avoid guessing) and for
-          orientation — but confirm current state with a command before acting
-          on a reading. `/facts refresh` re-probes if they look stale.
-        - When the task is complete, or you need user input, reply in plain
-          text without calling a tool.
+          orientation. They are NOT a substitute for measurement: any question
+          about current state (memory/disk/CPU pressure, load, free space,
+          what is running now) must be answered from a live command this turn
+          (`free -h`, `df -h`, `uptime`, `ps`/`top`), not from the snapshot.
+          `/facts refresh` re-probes if they look stale.
+        - The approval prompt is the permission gate, not you. Do NOT ask the
+          user whether to run an inspection/read-only command ("Would you like
+          me to check…?") — propose it directly with run_command and let them
+          approve or decline. Reply in plain text without a tool call ONLY when
+          the task is genuinely finished, or when you need information only the
+          user has (a decision, a value, a disambiguation) — never merely to
+          ask permission to look.
         - Never propose commands that wipe disks, format filesystems, or
           irrecoverably destroy data. If such a step is genuinely required,
           flag it in plain text and ask the user to run it manually.
