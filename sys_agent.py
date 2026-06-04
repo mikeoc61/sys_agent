@@ -1640,7 +1640,14 @@ def is_denied(cmd: str) -> str | None:
 
 
 def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | None]:
-    """Returns (action, edited_cmd_or_none). action in {run, skip, abort}."""
+    """Returns (action, edited_cmd_or_none). action in {run, skip, stop}.
+
+    "run"  execute (optionally the edited command).
+    "skip" decline THIS command; the agent turn continues with the next call.
+    "stop" abort the whole agent turn and return to the idle prompt. This does
+           NOT end the session — session-quit stays explicit (/exit, /quit,
+           Ctrl-D at the idle prompt). 'q', Ctrl-C, and Ctrl-D here all stop.
+    """
     print()
     print(dim("─" * 72))
     # Command body stays plain (per preference); only the label is loud.
@@ -1653,32 +1660,36 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
         return "run", None
     while True:
         try:
-            ans = input_no_history(warn_bold("Run? [y]es / [n]o / [e]dit / [q]uit: ")).strip().lower()
+            ans = input_no_history(
+                warn_bold("Run? [y]es / [n]o / [e]dit / [q]uit-workflow: ")
+            ).strip().lower()
         except EOFError:
-            return "abort", None
+            # Ctrl-D at this sub-prompt stops the workflow (same as 'q'); it
+            # does not end the session — that is the idle prompt's job.
+            return "stop", None
         except KeyboardInterrupt:
-            # Ctrl-C here cancels just this command and returns to the REPL,
-            # matching command-level interrupt handling. Session-quit stays
-            # explicit: use 'q' or Ctrl-D.
-            print(fail("\n[interrupted — command skipped]"))            
-            return "skip", None
+            # Ctrl-C anywhere in a turn aborts the whole workflow, non-
+            # destructively, and returns to the idle prompt. The caller prints
+            # the canonical stop marker; just end the input line cleanly here.
+            print()
+            return "stop", None
         if ans in ("y", "yes", ""):
             return "run", None
         if ans in ("n", "no"):
             return "skip", None
-        if ans in ("q", "quit", "abort"):
-            return "abort", None
+        if ans in ("q", "quit", "stop", "abort"):
+            return "stop", None
         if ans in ("e", "edit"):
             # edit prompt plain — it's a user input position. The command is
             # pre-filled into the line buffer so it can be modified in place.
             try:
                 new = _input_prefilled("edit> ", cmd).strip()
             except EOFError:
-                return "abort", None
+                return "stop", None
             except KeyboardInterrupt:
                 # Cancel the edit, fall back to the y/n/e/q prompt.
-                print(fail("\n[edit cancelled]"))                
-                continue            
+                print(fail("\n[edit cancelled]"))
+                continue
             if new:
                 return "run", new
 
@@ -2655,6 +2666,10 @@ def run_repl(provider: Provider) -> None:
                 page_text(text)
             continue
 
+        # Snapshot history length so a mid-turn abort (Ctrl-C / 'q') can roll
+        # back to exactly this point — discarding the user msg, the assistant
+        # tool_use msg, and any tool_results from this turn (Design B).
+        turn_start = len(messages)
         messages.append({"role": "user", "content": user_in})
 
         # Inner loop: keep calling the model until it stops requesting tools.
@@ -2673,10 +2688,12 @@ def run_repl(provider: Provider) -> None:
                     thinking=thinking_enabled, effort=effort,
                 )
             except KeyboardInterrupt:
-                print(fail("\n[interrupted — request cancelled]"))
-                # Same orphan-user-message rule as the api-error path below.
-                if iteration == 0:
-                    messages.pop()
+                # Ctrl-C during the API call aborts the whole turn (Design B
+                # rollback): discard everything appended since the prompt so
+                # the conversation is left exactly as before this turn, valid
+                # for every provider. Does not end the session.
+                print(fail("\n[interrupted — stopping workflow]"))
+                del messages[turn_start:]
                 break
             except Exception as e:          # noqa: BLE001
                 print(err_bold(f"[api error] {explain_api_error(e)}"))
@@ -2708,19 +2725,8 @@ def run_repl(provider: Provider) -> None:
                 break
 
             results: list[tuple[str, str]] = []
-            aborted = False
+            stop_turn = False
             for tc in turn.tool_calls:
-                if aborted:
-                    # Anthropic requires a tool_result for every tool_use_id
-                    # in the prior assistant turn; OpenAI is lenient but
-                    # consistent state is cleaner.
-                    results.append((tc.id, json.dumps({"error": "session aborted"})))
-                    audit("abort",
-                          (tc.arguments.get("command") or "").strip(),
-                          explanation=(tc.arguments.get("explanation") or "").strip(),
-                          note="session aborted")
-                    continue
-
                 if tc.name != TOOL_NAME:
                     results.append((tc.id, json.dumps({"error": f"unknown tool: {tc.name}"})))
                     continue
@@ -2742,11 +2748,13 @@ def run_repl(provider: Provider) -> None:
                     continue
 
                 action, edited = prompt_approval(cmd, why, auto_approve)
-                if action == "abort":
-                    results.append((tc.id, json.dumps({"error": "user aborted"})))
-                    aborted = True
+                if action == "stop":
+                    # Abort the whole turn and roll back (Design B). No
+                    # tool_result is appended for this or any remaining call;
+                    # the assistant tool_use message is discarded below.
                     audit("abort", cmd, explanation=why)
-                    continue
+                    stop_turn = True
+                    break
                 if action == "skip":
                     results.append((tc.id, json.dumps({"error": "user declined to run command"})))
                     audit("skip", cmd, explanation=why)
@@ -2760,12 +2768,15 @@ def run_repl(provider: Provider) -> None:
                 try:
                     result = execute(to_run)
                 except KeyboardInterrupt:
+                    # execute() already killed the process group before
+                    # re-raising. Ctrl-C aborts the whole turn (Design B):
+                    # audit the kill, then stop and roll back below.
                     print(fail("\n[interrupted — command cancelled]"))
-                    results.append((tc.id, json.dumps(
-                        {"error": "user interrupted command"})))
                     audit("edit" if edited else "run", cmd,
-                          explanation=why, edited=edited, note="interrupted")
-                    continue
+                          explanation=why, edited=edited,
+                          note="interrupted (workflow stopped)")
+                    stop_turn = True
+                    break
                 exit_str = f"[exit={result.returncode}]"
                 print(ok(exit_str) if result.returncode == 0 else fail(exit_str))
                 if result.stdout:
@@ -2782,11 +2793,17 @@ def run_repl(provider: Provider) -> None:
                       truncated=result.truncated,
                       stdout=result.stdout, stderr=result.stderr)
 
-            provider.append_tool_results(messages, results)
+            if stop_turn:
+                # Roll the conversation back to before this user turn so the
+                # interrupted exchange leaves no trace and the next prompt is
+                # valid on every provider. NOTE: commands already executed are
+                # NOT undone — rollback only forgets them in-context; their
+                # host side effects (and audit records) stand.
+                del messages[turn_start:]
+                print(fail("[workflow stopped — back to prompt]"))
+                break
 
-            if aborted:
-                print(fail("[aborted]"))
-                return
+            provider.append_tool_results(messages, results)
             # otherwise loop back to feed tool results into the next chat call
 
 

@@ -45,7 +45,11 @@ matches reality — no more `apt` suggestions on a Mac.
   Privacy-preserving — process names only, never arguments — and refreshable
   via `/facts`. See [Runtime snapshot](#runtime-snapshot-services-and-processes).
 - **Approval-gated execution**: every proposed command is shown with its
-  reason and CWD before it runs. Edit-before-run supported.
+  reason and CWD before it runs. Per command you can run it, edit it before
+  running, or skip it (decline one step; the agent continues the turn). To
+  abandon a multi-command workflow that has gone off the rails, `q` or Ctrl-C
+  stops the whole turn and returns you to the prompt — without ending the
+  session. See [Interrupting a workflow](#interrupting-a-workflow).
 - **Local hard-deny list**: a short list of catastrophic patterns
   (`rm -rf /`, `mkfs`, fork bomb, raw `dd` to block devices) is blocked
   client-side regardless of model output or user approval.
@@ -200,8 +204,33 @@ you@raspberrypi> what's the current load average and what process is dominating?
 you@m3mac>       upgrade nginx to the latest stable version
 ```
 
-For mutating actions, the approval prompt is your safety net. Type `e` to edit
-the command before execution.
+For mutating actions, the approval prompt is your safety net. Per command:
+
+| Key | Action |
+|---|---|
+| `y` / Enter | Run the command |
+| `n` | Skip this command — the agent **continues** the turn with its next step |
+| `e` | Edit the command in place, then run the edited form |
+| `q` | **Stop the whole workflow** and return to the prompt (does *not* end the session) |
+
+### Interrupting a workflow
+
+`n` declines a single command and lets the agent carry on. When the agent is
+on the wrong path entirely, `q` (or Ctrl-C) abandons the **whole turn** and
+drops you back at the prompt to redirect it.
+
+Ctrl-C does this from anywhere in a turn — at the approval prompt, while a
+command is running (the command's process group is killed first), or while
+the model is still responding. This is the only way to break out of an
+`/auto on` run, where there is no per-command prompt.
+
+Stopping **rolls the conversation back** to the start of the turn, so the
+interrupted exchange leaves no trace and your next prompt starts clean. Note
+the rollback only forgets the attempt in-context — any command that already
+executed is **not** undone (its host side effects and audit record stand).
+
+Interrupting never ends the session. At an empty prompt, Ctrl-C just clears
+the current line. Quitting stays explicit: `/exit`, `/quit`, or Ctrl-D.
 
 ### Tips & shortcuts
 
@@ -225,7 +254,7 @@ start with a clean slate: `> ~/.config/sys_agent/history`.
 
 | Command | Effect |
 |---|---|
-| `/exit`, `/quit` | End session |
+| `/exit`, `/quit` | End the session (these and Ctrl-D are the only ways to quit) |
 | `/reset` | Clear conversation history and token counters |
 | `/info` | Print provider/model, session token usage, host facts |
 | `/auto on\|off` | Skip approval prompt (hard-deny list still applies) |
@@ -400,7 +429,10 @@ Three layers, weakest to strongest:
 1. **Approval prompt** (default-on, per-command). Every `run_command` shows
    the exact shell string, the model's stated reason, and the CWD before any
    subprocess is spawned. Default answer is `y` so casual `Enter` runs it —
-   read the line. Read the line.
+   read the line. Read the line. Per command: `y` run, `n` skip (the agent
+   continues), `e` edit, `q` stop the whole workflow. Ctrl-C stops the
+   workflow from anywhere in the turn — killing a running command's process
+   group first — and returns to the prompt; it never ends the session.
 2. **Local hard-deny list** (always-on). A short set of irrecoverable command
    patterns is blocked before the approval prompt is even shown. The model
    cannot disable this and `/auto on` cannot bypass it. Matching is
@@ -436,8 +468,13 @@ On by default. Each `run_command` the model proposes appends one JSON line to
 | `returncode` | run/edit | process exit code (`124` = timeout) |
 | `truncated` | run/edit | whether output to the model was clipped at `OUTPUT_MAX_CHARS` |
 | `reason` | `action=deny` | which hard-deny rule matched |
-| `note` | as needed | e.g. `interrupted`, `session aborted` |
+| `note` | as needed | e.g. `interrupted (workflow stopped)` |
 | `stdout` / `stderr` | only with `SYS_AUDIT_BODY=on` | command output, capped at `OUTPUT_MAX_CHARS` |
+
+`abort` records a workflow stopped at the approval prompt (`q` / Ctrl-C)
+before that command ran. A command interrupted *mid-execution* by Ctrl-C is
+logged as `run`/`edit` with `note: interrupted (workflow stopped)` — it did
+start, so its disposition is not `abort`.
 
 Output **bodies are not logged by default** — stdout/stderr can carry secrets.
 Enable with `SYS_AUDIT_BODY=on` only if you accept that.
