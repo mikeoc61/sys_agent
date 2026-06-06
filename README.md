@@ -151,7 +151,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 DEEPSEEK_API_KEY=sk-...
 # Optional overrides
 SYS_PROVIDER=anthropic
-SYS_OPENAI_MODEL=gpt-5.4-mini
+SYS_OPENAI_MODEL=gpt-4o-mini
 SYS_ANTHROPIC_MODEL=claude-sonnet-4-6
 SYS_DEEPSEEK_MODEL=deepseek-v4-pro
 ```
@@ -164,7 +164,7 @@ SYS_DEEPSEEK_MODEL=deepseek-v4-pro
 | `ANTHROPIC_API_KEY` | Anthropic auth (one of the three required) | — |
 | `DEEPSEEK_API_KEY` | DeepSeek auth (one of the three required) | — |
 | `SYS_PROVIDER` | Skip provider prompt: `openai`, `anthropic`, or `deepseek` | (prompt) |
-| `SYS_OPENAI_MODEL` | OpenAI model string | `gpt-4o-mini` |
+| `SYS_OPENAI_MODEL` | OpenAI model string (default favors reliable tool use; set `gpt-4o-mini` for lower cost) | `gpt-5.4-mini` |
 | `SYS_ANTHROPIC_MODEL` | Anthropic model string | `claude-haiku-4-5-20251001` |
 | `SYS_DEEPSEEK_MODEL` | DeepSeek model string | `deepseek-v4-flash` |
 | `SYS_THINKING` | Startup state for extended thinking: `on` / `off` (Anthropic / DeepSeek) | `off` |
@@ -259,7 +259,7 @@ start with a clean slate: `> ~/.config/sys_agent/history`.
 | `/info` | Print provider/model, session token usage, host facts |
 | `/auto on\|off` | Skip approval prompt (hard-deny list still applies) |
 | `/thinking on\|off` | Toggle extended thinking — Anthropic / DeepSeek (takes effect next turn) |
-| `/effort [level]` | Thinking depth: `low`/`medium`/`high`/`xhigh`/`max` (DeepSeek collapses to `high`/`max`) |
+| `/effort [level]` | Thinking depth — Anthropic adaptive (all 5), DeepSeek (`high`/`max`); shows the effective grade; needs `/thinking on` |
 | `/tokens on\|off` | Toggle per-turn token-usage line |
 | `/tokens` | Print current snapshot without changing toggle |
 | `/color on\|off` | Toggle ANSI color output |
@@ -403,6 +403,12 @@ Behavior, all paths:
   the next turn (the API ignores a mid-turn toggle).
 - A `[thinking…]` marker is shown while the model works; high-effort Opus turns
   can take a while.
+- `/effort` echoes the grade actually used, not just what you typed: on DeepSeek
+  it shows the clamped grade with a `(DeepSeek floor)` / `(DeepSeek ceiling)`
+  note (`low`–`high` → `high`, `xhigh`/`max` → `max`); on providers/models that
+  ignore effort it says `(no effect on this provider/model)`; and it appends
+  `needs /thinking on` when effort is set but thinking is off. The stored level
+  is your request, so switching to a finer-grained provider still honors it.
 
 Anthropic-specific:
 

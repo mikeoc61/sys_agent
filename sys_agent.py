@@ -276,7 +276,7 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/reset",          "Clear conversation history and token counters"),
     ("/auto on|off",    "Skip the per-command approval prompt (deny list still applies)"),
     ("/thinking on|off", "Toggle extended thinking — Anthropic/DeepSeek (next turn)"),
-    ("/effort [level]", "Reasoning depth: low|medium|high|xhigh|max (adaptive/DeepSeek)"),
+    ("/effort [level]", "Thinking depth low|medium|high|xhigh|max — Anthropic adaptive models (all 5), DeepSeek (high|max); needs /thinking on"),
     ("/tokens on|off",  "Toggle the per-turn token-usage line"),
     ("/color on|off",   "Toggle ANSI color output"),
     ("/audit [on|off]", "Show or toggle the command audit log"),
@@ -2262,6 +2262,57 @@ def effort_applies(provider: Provider) -> bool:
     return False
 
 
+def effective_effort(provider: Provider, effort: str) -> tuple[str, str]:
+    """Map a requested effort level to the grade the active provider will
+    actually run, plus a short note when the request was clamped.
+
+    DeepSeek's thinking mode exposes only two grades, so the five levels are
+    clamped: low/medium/high -> 'high' (its floor), xhigh/max -> 'max' (its
+    ceiling). Anthropic adaptive models honor all five verbatim. The stored
+    session effort keeps the user's requested level (so switching to a
+    finer-grained provider still honors it); this mapping is display-only.
+
+    Returns (shown_grade, note); note is "" unless clamping changed the value."""
+    if provider.name == "deepseek":
+        mapped = DeepSeekProvider._map_effort(effort)
+        if mapped != effort:
+            return mapped, "DeepSeek floor" if mapped == "high" else "DeepSeek ceiling"
+        return mapped, ""
+    return effort, ""
+
+
+def effort_display(provider: Provider, effort: str, thinking_on: bool) -> tuple[str, str]:
+    """(shown_grade, note) for any effort readout — the single source of truth
+    shared by the /effort set-confirmation and the bare readout, so the two
+    cannot drift. `note` is the parenthetical text (no parens), "" when there
+    is nothing to flag:
+      - provider ignores effort entirely  -> "no effect on this provider/model"
+      - DeepSeek clamped the grade         -> "DeepSeek floor" / "DeepSeek ceiling"
+      - effort honored but thinking is off -> append "needs /thinking on"
+    """
+    if not effort_applies(provider):
+        return effort, "no effect on this provider/model"
+    shown, clamp = effective_effort(provider, effort)
+    notes = [clamp] if clamp else []
+    if not thinking_on:
+        notes.append("needs /thinking on")
+    return shown, "; ".join(notes)
+
+
+def _effort_usage_levels(provider: Provider) -> tuple[str, ...]:
+    """Distinct effort grades worth offering for the active provider, in
+    order. DeepSeek collapses the five inputs to two effective grades, so a
+    flat low|medium|high|xhigh|max hint overstates the choices; this returns
+    ("high", "max") there and all five elsewhere. All five remain *accepted*
+    inputs everywhere (DeepSeek clamps); this only shapes the usage hint."""
+    seen: list[str] = []
+    for lvl in _VALID_EFFORTS:
+        grade, _ = effective_effort(provider, lvl)
+        if grade not in seen:
+            seen.append(grade)
+    return tuple(seen)
+
+
 def print_help(
     provider: Provider,
     auto_approve: bool,
@@ -2607,16 +2658,19 @@ def run_repl(provider: Provider) -> None:
             continue
         if user_in.startswith("/effort"):
             parts = user_in.split()
+            # Valid set vs. bare/invalid query both render through the same
+            # readout, so the no-effect / clamp / thinking annotation is
+            # identical whether you set effort or just inspect it.
             if len(parts) == 2 and parts[1].lower() in _VALID_EFFORTS:
                 effort = parts[1].lower()
-                hint = "" if effort_applies(provider) else \
-                    "  (no effect on this provider/model)"
-                print(dim(f"[effort = {effort}]{hint}"))
+                with_usage = False
             else:
-                print(dim(
-                    f"[effort = {effort}]  usage: /effort "
-                    f"{'|'.join(_VALID_EFFORTS)}"
-                ))
+                with_usage = True
+            shown, note = effort_display(provider, effort, thinking_enabled)
+            note_str = f"  ({note})" if note else ""
+            usage = (f"  usage: /effort {'|'.join(_effort_usage_levels(provider))}"
+                     if with_usage else "")
+            print(dim(f"[effort = {shown}]{note_str}{usage}"))
             continue
         if user_in.startswith("/tokens"):
             parts = user_in.split()
