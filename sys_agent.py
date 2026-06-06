@@ -73,6 +73,9 @@ import socket
 import subprocess
 import sys
 import textwrap
+import threading
+import time
+import itertools
 import atexit
 import datetime
 from dataclasses import dataclass
@@ -557,6 +560,86 @@ def save_readline_history() -> None:
         readline.write_history_file(_history_path)
     except OSError as e:
         print(dim(f"[readline: cannot save history: {e}]"))
+
+
+# -----------------------------------------------------------------------------
+# Activity indicator (liveness during the blocking model call)
+# -----------------------------------------------------------------------------
+#
+# provider.chat() blocks with no output, so without a cue the REPL looks hung
+# — worst on a slow link or a high-effort reasoning turn. On a TTY this paints
+# a spinner + elapsed-seconds counter on one line and erases it when the call
+# returns; off a TTY (piped/redirected) or on TERM=dumb it prints one static
+# marker so logs stay clean. Disable entirely with SYS_PROGRESS=off. Stdlib
+# only; the worker writes stdout solely while the main thread is parked in
+# chat(), and is stopped+joined before the line is cleared, so writes never race.
+SHOW_PROGRESS = os.environ.get("SYS_PROGRESS", "on").strip().lower() != "off"
+_SPINNER_INTERVAL = 0.1                 # seconds between frames
+_SPINNER_DELAY = 1.5                    # suppress the spinner for ops faster than this
+
+
+def _spinner_frames() -> tuple[str, ...]:
+    """ASCII spinner — renders in every terminal/font. (Braille glyphs look
+    nicer but are font-dependent and came out invisible in some terminals,
+    leaving only the elapsed counter visible.)"""
+    return ("|", "/", "-", "\\")
+
+
+class Activity:
+    """Context manager that shows the model is working during provider.chat().
+
+    TTY: a background daemon thread paints `<spinner> <label>… <n>s` on one
+    line until __exit__, which stops + joins it and erases the line (CR+EL).
+    Non-TTY / TERM=dumb: one static `[<label>…]` line, no control characters.
+    SYS_PROGRESS=off: nothing. The thread writes only while the caller is
+    blocked in chat(), and is joined before the clear, so no write races.
+    """
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._painted = False
+        self._animate = (
+            SHOW_PROGRESS
+            and sys.stdout.isatty()
+            and os.environ.get("TERM", "") != "dumb"
+        )
+
+    def __enter__(self) -> "Activity":
+        if not SHOW_PROGRESS:
+            return self
+        if not self._animate:
+            print(dim(f"[{self.label}…]"), flush=True)
+            return self
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        start = time.monotonic()
+        # Hold off painting until the op has run longer than the threshold;
+        # if it finishes first, return without ever drawing (no flash).
+        if self._stop.wait(_SPINNER_DELAY):
+            return
+        self._painted = True
+        for frame in itertools.cycle(_spinner_frames()):
+            if self._stop.is_set():
+                break
+            elapsed = int(time.monotonic() - start)
+            sys.stdout.write("\r" + dim(f"{frame} {self.label}… {elapsed}s "))
+            sys.stdout.flush()
+            self._stop.wait(_SPINNER_INTERVAL)
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        if self._painted:
+            # CR + erase-to-EOL so the response starts on a clean line.
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
 
 
 # -----------------------------------------------------------------------------
@@ -2748,15 +2831,18 @@ def run_repl(provider: Provider) -> None:
         # at the outer prompt) and the API would silently ignore it anyway.
         iteration = 0
         while True:
-            if thinking_active(provider, thinking_enabled):
-                # Thinking turns stream-and-buffer (no live tokens), so signal
-                # work is in progress; the wait can be long at high effort.
-                print(dim("[thinking…]"), flush=True)
+            # Liveness cue during the blocking call (thinking turns can be
+            # long). Activity stops + clears its line on __exit__ — including
+            # the KeyboardInterrupt path below, before the rollback prints.
+            act_label = ("thinking"
+                         if thinking_active(provider, thinking_enabled)
+                         else "working")
             try:
-                turn = provider.chat(
-                    messages, system,
-                    thinking=thinking_enabled, effort=effort,
-                )
+                with Activity(act_label):
+                    turn = provider.chat(
+                        messages, system,
+                        thinking=thinking_enabled, effort=effort,
+                    )
             except KeyboardInterrupt:
                 # Ctrl-C during the API call aborts the whole turn (Design B
                 # rollback): discard everything appended since the prompt so
@@ -2836,7 +2922,8 @@ def run_repl(provider: Provider) -> None:
                     print(f"{warn('[running edited]:')} {to_run}")
 
                 try:
-                    result = execute(to_run)
+                    with Activity("running"):
+                        result = execute(to_run)
                 except KeyboardInterrupt:
                     # execute() already killed the process group before
                     # re-raising. Ctrl-C aborts the whole turn (Design B):

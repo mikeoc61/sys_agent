@@ -57,6 +57,11 @@ matches reality — no more `apt` suggestions on a Mac.
   running session totals and percentage of context window consumed.
 - **Color output**: semantic ANSI coloring with auto-detection
   (TTY/`NO_COLOR`) and runtime toggle.
+- **Activity indicator**: a spinner with an elapsed-seconds counter during the
+  model call and during command execution, so the REPL never looks hung on a
+  slow turn or a long-running command. Suppressed for operations under ~1.5s,
+  shown as a single static marker when output isn't a TTY, and disabled
+  entirely with `SYS_PROGRESS=off`.
 - **Persistent history**: line editing and history navigation via readline
   (gnureadline on macOS). Conversational prompts persist to
   `~/.config/sys_agent/history` across sessions; meta-commands and
@@ -178,6 +183,7 @@ SYS_DEEPSEEK_MODEL=deepseek-v4-pro
 | `SYS_ENV_FILE` | Explicit env-file path; skips the search above | (search) |
 | `SYS_COLOR` | `on` / `off` / `auto` | `auto` |
 | `NO_COLOR` | If set, disables color regardless of `SYS_COLOR=auto` | — |
+| `SYS_PROGRESS` | Activity spinner during model calls / command execution: `on`/`off` | `on` |
 
 ### Files
 
