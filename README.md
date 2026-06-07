@@ -12,13 +12,14 @@ user approval. Single Python file. No frameworks.
 ## Why
 
 Off-the-shelf agentic CLIs (aider, claude-code, etc.) optimize for code
-authoring. This one optimizes for a different loop: ad-hoc system
-administration, infrastructure debugging, and "what's the right command on
-*this* host?" questions where the answer depends on distro, init system,
-installed package manager, and which tools happen to be on PATH.
+authoring. This agent optimizes for a different loop: ad-hoc system
+administration, infrastructure tuning / debugging using commands which
+are appropriate for the host environemnt. It's especially useful for posing
+system questions where the correct answer depends on OS distro, init system,
+installed package manager, and which tools happen to be in user's PATH.
 
-The agent ships those host facts to the model up front so command syntax
-matches reality — no more `apt` suggestions on a Mac.
+The agent collects and ships a range of host facts to the selected AI model at 
+startup so the returned command syntax is properly formatted for the host environment.
 
 ## Features
 
@@ -28,12 +29,12 @@ matches reality — no more `apt` suggestions on a Mac.
   the OpenAI tool-call message shape.
 - **Host-aware prompt**: the input prompt carries the active hostname
   (`you@m3mac>`, `you@raspberrypi>`) so you always know which machine you're
-  driving — no more running a Pi command on the Mac or vice versa.
+  you're currently working on.
 - **Extended thinking** (Anthropic / DeepSeek): optional reasoning pass, opt-in
   per session via `/thinking`. The scratchpad is surfaced inline; off by default
   because thinking tokens bill as output. See [Extended thinking](#extended-thinking).
 - **Runtime provider/model switching**: use `/provider` and `/model` to
-  inspect or change the active backend during a live REPL session.
+  inspect or change the active backend during a live REPL (Read-Eval-Print-Lool) session.
 - **Host-aware**: distro, shell, machine arch, package/init/container tool
   probes, disk context, and installed tools (`apt`/`brew`/`systemctl`/
   `docker`/etc.) are injected into the system prompt. Host facts can be
@@ -42,13 +43,13 @@ matches reality — no more `apt` suggestions on a Mac.
   processes by memory is injected alongside the static facts, so the model
   uses real unit/process names on the first turn instead of probing for them
   (no more guessing `openclaw` when the unit is `openclaw-gateway`).
-  Privacy-preserving — process names only, never arguments — and refreshable
-  via `/facts`. See [Runtime snapshot](#runtime-snapshot-services-and-processes).
+  Privacy is preserved as only process names are surfaced, never arguments. 
+  See [Runtime snapshot](#runtime-snapshot-services-and-processes).
 - **Approval-gated execution**: every proposed command is shown with its
   reason and CWD before it runs. Per command you can run it, edit it before
   running, or skip it (decline one step; the agent continues the turn). To
   abandon a multi-command workflow that has gone off the rails, `q` or Ctrl-C
-  stops the whole turn and returns you to the prompt — without ending the
+  stops the whole turn and returns you to the prompt, without ending the
   session. See [Interrupting a workflow](#interrupting-a-workflow).
 - **Local hard-deny list**: a short list of catastrophic patterns
   (`rm -rf /`, `mkfs`, fork bomb, raw `dd` to block devices) is blocked
@@ -59,13 +60,13 @@ matches reality — no more `apt` suggestions on a Mac.
   (TTY/`NO_COLOR`) and runtime toggle.
 - **Activity indicator**: a spinner with an elapsed-seconds counter during the
   model call and during command execution, so the REPL never looks hung on a
-  slow turn or a long-running command. Suppressed for operations under ~1.5s,
-  shown as a single static marker when output isn't a TTY, and disabled
-  entirely with `SYS_PROGRESS=off`.
+  slow turn or a long-running command. The indicator is suppressed for operations 
+  under ~1.5s, shown as a single static marker when output isn't a TTY, and is 
+  disabled entirely with `SYS_PROGRESS=off`.
 - **Persistent history**: line editing and history navigation via readline
   (gnureadline on macOS). Conversational prompts persist to
-  `~/.config/sys_agent/history` across sessions; meta-commands and
-  short-answer prompts are excluded so Up-arrow recall stays useful.
+  `~/.config/sys_agent/history` across sessions; meta-commands (e.g /thinking on) 
+  and short-answer prompts are excluded so Up-arrow recall stays useful.
   See [Tips & shortcuts](#tips--shortcuts) for keystrokes.
 - **Audit log**: append-only JSONL record of every command the model
   proposes and its disposition (`run`/`edit`/`skip`/`deny`/`abort`) plus exit
@@ -103,7 +104,7 @@ dependency block; subsequent runs are instant.
 
 > **macOS**: the inline block pulls in `gnureadline` automatically
 > (`sys_platform == 'darwin'`) to replace the system libedit-backed
-> readline with proper GNU readline — colored prompts render correctly
+> readline with proper GNU readline so colored prompts render correctly
 > and Up/Down history navigation redraws cleanly. Linux installs skip
 > this dependency.
 
