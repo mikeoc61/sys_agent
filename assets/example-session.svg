@@ -1,24 +1,28 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="792" height="459" viewBox="0 0 792 459" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
-<rect x="0" y="0" width="792" height="459" rx="8" fill="#1e1e1e"/>
-<path d="M0 8 Q0 0 8 0 H784 Q792 0 792 8 V28 H0 Z" fill="#2d2d2d"/>
-<circle cx="18" cy="14" r="6" fill="#ff5f56"/>
-<circle cx="38" cy="14" r="6" fill="#ffbd2e"/>
-<circle cx="58" cy="14" r="6" fill="#27c93f"/>
-<text x="396" y="18" fill="#7a7a7a" text-anchor="middle" font-size="12">sys_agent</text>
-<text x="18" y="44" xml:space="preserve"><tspan fill="#d4d4d4">$ sys_agent</tspan></text>
-<text x="18" y="65" xml:space="preserve"><tspan fill="#7a7a7a">[loaded 2 vars from ~/.config/sys_agent/.env]</tspan></text>
-<text x="18" y="86" xml:space="preserve"><tspan fill="#4ec9d4" font-weight="bold">sys_agent  provider=anthropic  model=claude-haiku-4-5-20251001  host=pi5 (Linux/aarch64)</tspan></text>
-<text x="18" y="107" xml:space="preserve"><tspan fill="#7a7a7a">meta: /help  /info  /reset  /auto on|off  /tokens on|off  /color on|off  /exit, /quit</tspan></text>
-<text x="18" y="149" xml:space="preserve"><tspan fill="#4ec9d4" font-weight="bold">you&gt;</tspan><tspan fill="#d4d4d4"> what&#x27;s eating disk on /var?</tspan></text>
-<text x="18" y="191" xml:space="preserve"><tspan fill="#7a7a7a">──────────────────────────────────────────────────────────</tspan></text>
-<text x="18" y="212" xml:space="preserve"><tspan fill="#e5c07b" font-weight="bold">COMMAND:</tspan><tspan fill="#d4d4d4">  sudo du -sh /var/* 2&gt;/dev/null | sort -rh | head -10</tspan></text>
-<text x="18" y="233" xml:space="preserve"><tspan fill="#d4d4d4">REASON:   List the largest top-level subdirs under /var</tspan></text>
-<text x="18" y="254" xml:space="preserve"><tspan fill="#7a7a7a">CWD:      /home/mikeoc</tspan></text>
-<text x="18" y="275" xml:space="preserve"><tspan fill="#7a7a7a">──────────────────────────────────────────────────────────</tspan></text>
-<text x="18" y="296" xml:space="preserve"><tspan fill="#d7ba7d" font-weight="bold">Run? [y]es / [n]o / [e]dit / [q]uit:</tspan><tspan fill="#d4d4d4"> y</tspan></text>
-<text x="18" y="317" xml:space="preserve"><tspan fill="#6ac779">[exit=0]</tspan></text>
-<text x="18" y="338" xml:space="preserve"><tspan fill="#d4d4d4">1.4G  /var/lib</tspan></text>
-<text x="18" y="359" xml:space="preserve"><tspan fill="#d4d4d4">820M  /var/log</tspan></text>
-<text x="18" y="380" xml:space="preserve"><tspan fill="#d4d4d4">...</tspan></text>
-<text x="18" y="422" xml:space="preserve"><tspan fill="#6ac779" font-weight="bold">agent&gt;</tspan><tspan fill="#d4d4d4"> /var/lib dominates at 1.4G. Want me to break that down next?</tspan></text>
+<svg xmlns="http://www.w3.org/2000/svg" width="855" height="607" viewBox="0 0 855 607" font-family="ui-monospace, 'SF Mono', 'Menlo', 'DejaVu Sans Mono', 'Cascadia Code', 'Consolas', monospace" font-size="14">
+  <rect x="0" y="0" width="855" height="607" rx="11" fill="#0d1117"/>
+  <rect x="0" y="0" width="855" height="38" fill="#161b22"/>
+  <rect x="0" y="37" width="855" height="1" fill="#21262d"/>
+  <circle cx="22" cy="19" r="6" fill="#ff5f57"/>
+  <circle cx="42" cy="19" r="6" fill="#febc2e"/>
+  <circle cx="62" cy="19" r="6" fill="#28c840"/>
+  <text x="427" y="23" fill="#6e7681" font-size="12.5" text-anchor="middle">pi@raspberrypi: ~/sys_agent</text>
+  <text x="22" y="62" xml:space="preserve"><tspan fill="#56d4dd" font-weight="600">sys_agent  provider=anthropic  model=claude-haiku-4-5-20251001  host=raspberrypi (Linux/aarch64)</tspan></text>
+  <text x="22" y="83" xml:space="preserve"><tspan fill="#6e7681">meta: /help /info /auto /thinking /effort /history /provider /model /facts  — /help for details</tspan></text>
+  <text x="22" y="125" xml:space="preserve"><tspan fill="#56d4dd" font-weight="600">you@raspberrypi&gt;</tspan><tspan fill="#c9d1d9"> why is bitcoind eating so much memory?</tspan></text>
+  <text x="22" y="167" xml:space="preserve"><tspan fill="#6e7681">  │ Checking live service state and RSS before trusting the startup</tspan></text>
+  <text x="22" y="188" xml:space="preserve"><tspan fill="#6e7681">  │ snapshot — a process hot at launch can be idle now.</tspan></text>
+  <text x="22" y="230" xml:space="preserve"><tspan fill="#6e7681">────────────────────────────────────────────────────────────────────────</tspan></text>
+  <text x="22" y="251" xml:space="preserve"><tspan fill="#ffd866" font-weight="600">COMMAND:</tspan><tspan fill="#c9d1d9">  systemctl status bitcoind --no-pager</tspan></text>
+  <text x="22" y="272" xml:space="preserve"><tspan fill="#c9d1d9">REASON:   Check service state, uptime, and resident memory</tspan></text>
+  <text x="22" y="293" xml:space="preserve"><tspan fill="#6e7681">CWD:      /home/pi</tspan></text>
+  <text x="22" y="314" xml:space="preserve"><tspan fill="#6e7681">────────────────────────────────────────────────────────────────────────</tspan></text>
+  <text x="22" y="335" xml:space="preserve"><tspan fill="#e3b341" font-weight="600">Run? [y]es / [n]o / [e]dit / [q]uit-workflow: </tspan><tspan fill="#c9d1d9">y</tspan></text>
+  <text x="22" y="356" xml:space="preserve"><tspan fill="#7ee787">[exit=0]</tspan></text>
+  <text x="22" y="377" xml:space="preserve"><tspan fill="#c9d1d9">● bitcoind.service - Bitcoin daemon</tspan></text>
+  <text x="22" y="398" xml:space="preserve"><tspan fill="#c9d1d9">     Active: active (running) since Mon 2026-06-01; 5 days ago</tspan></text>
+  <text x="22" y="419" xml:space="preserve"><tspan fill="#c9d1d9">     Memory: 1.4G   Tasks: 14   CPU: 2h 11min</tspan></text>
+  <text x="22" y="461" xml:space="preserve"><tspan fill="#7ee787" font-weight="600">agent&gt;</tspan><tspan fill="#c9d1d9"> bitcoind is healthy — 1.4 GB resident is normal for a fully synced</tspan></text>
+  <text x="22" y="482" xml:space="preserve"><tspan fill="#c9d1d9">        node with a large dbcache. No leak; this is expected steady state.</tspan></text>
+  <text x="22" y="524" xml:space="preserve"><tspan fill="#56d4dd" font-weight="600">you@raspberrypi&gt;</tspan><tspan fill="#c9d1d9"> now tail its debug log for recent warnings</tspan></text>
+  <text x="22" y="566" xml:space="preserve"><tspan fill="#6e7681">/ thinking… 2s</tspan></text>
 </svg>
