@@ -39,6 +39,12 @@ startup so the returned command syntax is properly formatted for the host enviro
   probes, disk context, and installed tools (`apt`/`brew`/`systemctl`/
   `docker`/etc.) are injected into the system prompt. Host facts can be
   displayed, refreshed, and expanded with `/facts`.
+- **USB-bridge SMART hints**: for USB-attached disks, startup resolves the
+  bridge's USB `vendor:product` and, when the bridge chip is recognized,
+  precomputes the `smartctl -d` pass-through token, so the model queries a
+  drive behind a USB enclosure (e.g. a Samsung T7) correctly on the first try
+  instead of probing `-d sat`/`scsi`/`nvme` by trial and error. See
+  [SMART over USB bridges](#smart-over-usb-bridges).
 - **Runtime context**: a startup snapshot of the running services and the top
   processes by memory is injected alongside the static facts, so the model
   uses real unit/process names on the first turn instead of probing for them
@@ -360,6 +366,55 @@ the `_DARWIN_SERVICE_SKIP_PREFIXES` tuple in `sys_agent.py`; extend it if a
 host's noise differs. Expect the service list to carry far more signal on a
 server — where it names your actual workload — than on a desktop, where it is
 mostly background updaters.
+
+### SMART over USB bridges
+
+The injected host facts include a mount-first disk topology under `disks`
+(mounts, sizes, fstype, and a `device` sub-record per physical disk with model,
+transport, and rotational flag). For USB-attached disks, two extra fields are
+resolved at startup so the model can read SMART/health without a probing round
+trip:
+
+- **`usb_ids`** — the USB bridge's `vendor:product` (e.g. `04e8:4001`),
+  resolved at runtime from `udevadm` (sysfs fallback when udevadm is absent).
+- **`smartctl_device_type`** — the `smartctl -d` pass-through token for that
+  bridge (e.g. `sntasmedia`), present only when the bridge is recognized.
+
+```json
+"disks": {
+  "mounts": [{
+    "mount": "/media/mikeoc/T72GB",
+    "device": {
+      "name": "/dev/sda",
+      "model": "PSSD T7",
+      "transport": "usb",
+      "rotational": false,
+      "usb_ids": { "vendor": "04e8", "product": "4001" },
+      "smartctl_device_type": "sntasmedia"
+    }
+  }]
+}
+```
+
+**Why this is needed.** A USB enclosure hides whether the drive behind it is
+SATA or NVMe, so a bare `smartctl -a /dev/sdX` often fails to auto-detect it and
+the correct `-d` token is bridge-chip-specific. With `smartctl_device_type`
+present the model goes straight to `smartctl -d sntasmedia -a /dev/sda`; when
+only `usb_ids` is present (an unrecognized bridge) the prompt steers it to try
+`-d sat`, then the NVMe pass-through types.
+
+**Minimal hard-coding.** The `vendor:product` pair is derived at runtime — only
+the small chip→token map (`_USB_BRIDGE_SMART_HINTS` in `sys_agent.py`) is
+hard-coded, because that mapping is not derivable from anything the kernel
+exposes. It mirrors the `KNOWN_BRIDGE_HINTS` table in the companion
+`disk_smart.py`; keep the two in sync when adding a bridge.
+
+**Interpreting NVMe counters.** The system prompt also tells the model that
+Unsafe Shutdowns, Warning/Critical Composite Temperature Time, and Error Log
+Entries are *cumulative lifetime totals* — to be read as a rate of change, not
+as alarming absolutes — and that an unsafe-shutdown count is low-signal on a
+USB-bridged drive (many bridges never forward the NVMe shutdown notification, so
+it climbs even on clean unmounts).
 
 ### Extended thinking
 

@@ -911,6 +911,92 @@ _DISK_SKIP_MOUNT_PREFIXES_DARWIN = (
 )
 
 
+# USB-bridge SMART pass-through hints: "vvvv:pppp" (lowercase hex USB
+# vendor:product) -> the smartctl `-d` device-type token needed to reach SMART
+# through that enclosure. A USB bridge hides whether the drive behind it speaks
+# ATA or NVMe, and the correct pass-through token is bridge-chip-specific and
+# NOT derivable from anything the kernel block layer exposes — so a small
+# lookup is irreducible. The vendor:product pair itself IS derived at runtime
+# (udev / sysfs); only this chip→token mapping is hard-coded. Mirrors
+# disk_smart.py's KNOWN_BRIDGE_HINTS; keep the two in sync when adding bridges.
+_USB_BRIDGE_SMART_HINTS = {
+    "04e8:4001": "sntasmedia",   # Samsung Portable SSD T7 (NVMe / ASMedia)
+    "174c:55aa": "sntasmedia",   # ASMedia ASM1153/1351 generic
+    "174c:1153": "sntasmedia",
+    "152d:0578": "sntjmicron",   # JMicron JMS578 and kin
+    "152d:0583": "sntjmicron",
+    "152d:9561": "sntjmicron",
+}
+
+
+def _usb_bridge_ids(basename: str) -> tuple[str, str] | None:
+    """Resolve a USB block device's bridge (vendor_id, product_id) as 4-hex
+    lowercase strings, or None when the device is not USB-attached or the IDs
+    can't be read. Prefers `udevadm` (authoritative; it walks the USB device
+    tree); falls back to ascending sysfs for idVendor/idProduct. Unprivileged,
+    Linux-only. Returns None for non-USB transports so callers can attach the
+    `usb_ids` key only when it actually means a USB bridge."""
+    if shutil.which("udevadm"):
+        try:
+            res = subprocess.run(
+                ["udevadm", "info", "--query=property", "-n", f"/dev/{basename}"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if res.returncode == 0:
+                props: dict[str, str] = {}
+                for line in res.stdout.splitlines():
+                    k, _, v = line.partition("=")
+                    if v:
+                        props[k] = v
+                if props.get("ID_BUS") == "usb":
+                    vid = props.get("ID_VENDOR_ID")
+                    pid = props.get("ID_MODEL_ID")
+                    if vid and pid:
+                        return vid.strip().lower(), pid.strip().lower()
+                return None             # resolved, and it is not USB
+        except (subprocess.SubprocessError, OSError):
+            pass
+    # sysfs fallback (no udevadm): climb from the block device toward the USB
+    # device node, which is where idVendor/idProduct live. Depth is shallow;
+    # the bound just prevents an unterminated walk.
+    try:
+        path = os.path.realpath(f"/sys/block/{basename}/device")
+    except OSError:
+        return None
+    for _ in range(8):
+        vid = _safe_read(os.path.join(path, "idVendor"), limit=16)
+        pid = _safe_read(os.path.join(path, "idProduct"), limit=16)
+        if vid and pid:
+            return vid.strip().lower(), pid.strip().lower()
+        parent = os.path.dirname(path)
+        if parent == path or not parent.startswith("/sys"):
+            break
+        path = parent
+    return None
+
+
+def _augment_usb_smart_hints(devices: dict[str, dict[str, Any]]) -> None:
+    """For USB-attached disks, attach `usb_ids` (the bridge vendor:product) and,
+    when the bridge is recognized, `smartctl_device_type` (the `-d` token that
+    reaches SMART through it). Mutates each device dict in place; no-op for
+    non-USB transports and off Linux. Probes only devices whose transport is
+    `usb` or unknown (the sysfs-fallback case), so native SATA/NVMe disks cost
+    nothing extra."""
+    if platform.system() != "Linux":
+        return
+    for name, d in devices.items():
+        if d.get("transport") not in ("usb", None):
+            continue
+        ids = _usb_bridge_ids(name)
+        if not ids:
+            continue
+        vid, pid = ids
+        d["usb_ids"] = {"vendor": vid, "product": pid}
+        hint = _USB_BRIDGE_SMART_HINTS.get(f"{vid}:{pid}")
+        if hint:
+            d["smartctl_device_type"] = hint
+
+
 def _basename_to_disk(name: str) -> str:
     """Map a partition name back to its parent disk basename.
     sda1 -> sda; nvme0n1p3 -> nvme0n1; mmcblk0p2 -> mmcblk0."""
@@ -949,6 +1035,7 @@ def _read_block_devices() -> dict[str, dict[str, Any]]:
         except (subprocess.SubprocessError, json.JSONDecodeError, ValueError, OSError):
             pass
     if devices:
+        _augment_usb_smart_hints(devices)
         return devices
     # /sys fallback (no lsblk, or it errored)
     try:
@@ -968,6 +1055,7 @@ def _read_block_devices() -> dict[str, dict[str, Any]]:
             }
     except OSError:
         pass
+    _augment_usb_smart_hints(devices)
     return devices
 
 
@@ -1082,6 +1170,26 @@ def _gather_disk_facts_darwin() -> dict[str, Any]:
     return out
 
 
+def _device_subrecord(basename: str, d: dict[str, Any]) -> dict[str, Any]:
+    """Shape a physical-device dict into the agent-facing sub-record. Single
+    source of truth shared by the mounted and unmounted paths, so the two
+    cannot drift. Attaches `usb_ids` and `smartctl_device_type` only when the
+    USB-bridge probe resolved them (see _augment_usb_smart_hints)."""
+    rec: dict[str, Any] = {
+        "name": f"/dev/{basename}",
+        "model": d.get("model"),
+        "transport": d.get("transport"),
+        "rotational": d.get("rotational"),
+        "size_gb": round(d["size_bytes"] / (1024 ** 3), 2)
+                    if d.get("size_bytes") else None,
+    }
+    if d.get("usb_ids"):
+        rec["usb_ids"] = d["usb_ids"]
+    if d.get("smartctl_device_type"):
+        rec["smartctl_device_type"] = d["smartctl_device_type"]
+    return rec
+
+
 def _gather_disk_facts(verbose: bool = False) -> dict[str, Any]:
     """Mount-first disk topology for the agent's host facts.
 
@@ -1134,28 +1242,13 @@ def _gather_disk_facts(verbose: bool = False) -> dict[str, Any]:
             "percent_used": pct,
         }
         if dev_base and dev_base in devices:
-            d = devices[dev_base]
-            entry["device"] = {
-                "name": f"/dev/{dev_base}",
-                "model": d.get("model"),
-                "transport": d.get("transport"),
-                "rotational": d.get("rotational"),
-                "size_gb": round(d["size_bytes"] / (1024 ** 3), 2)
-                            if d.get("size_bytes") else None,
-            }
+            entry["device"] = _device_subrecord(dev_base, devices[dev_base])
         out["mounts"].append(entry)
 
     for name, d in devices.items():
         if name in mounted_disks:
             continue
-        out["unmounted_devices"].append({
-            "name": f"/dev/{name}",
-            "model": d.get("model"),
-            "transport": d.get("transport"),
-            "rotational": d.get("rotational"),
-            "size_gb": round(d["size_bytes"] / (1024 ** 3), 2)
-                        if d.get("size_bytes") else None,
-        })
+        out["unmounted_devices"].append(_device_subrecord(name, d))
 
     if verbose:
         out["io_sample"] = _sample_disk_io(devices.keys())
@@ -2467,6 +2560,25 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           the task is genuinely finished, or when you need information only the
           user has (a decision, a value, a disambiguation) — never merely to
           ask permission to look.
+        - For disk SMART/health: a `device` whose `transport` is `usb` sits
+          behind a USB bridge, which masks whether the drive is SATA or NVMe,
+          so a bare `smartctl -a /dev/sdX` often fails to auto-detect it. When
+          the device record carries `smartctl_device_type`, pass it directly:
+          `smartctl -d <type> -a /dev/sdX`. If only `usb_ids` is present (an
+          unrecognized bridge), try `-d sat` first, then the NVMe pass-through
+          types (`-d sntasmedia`, `-d sntjmicron`). smartctl usually needs root.
+        - Interpreting NVMe SMART health: the primary signals are SMART overall
+          health, Critical Warning, Available Spare vs its threshold,
+          Percentage Used, and Media/Data Integrity Errors. Unsafe Shutdowns,
+          Warning/Critical Composite Temperature Time, and Error Information Log
+          Entries are CUMULATIVE lifetime totals — read them as a rate of
+          change across checks, not as alarming absolutes; a large number that
+          is no longer increasing is historical residue, not a current fault.
+          On a USB-bridged drive the unsafe-shutdown count is especially
+          low-signal: many bridges never forward the NVMe shutdown notification
+          even on a clean unmount, so it climbs under normal use. Flag a counter
+          only when it is actively rising or a threshold (spare, temperature,
+          percentage-used) is breached.
         - Never propose commands that wipe disks, format filesystems, or
           irrecoverably destroy data. If such a step is genuinely required,
           flag it in plain text and ask the user to run it manually.
