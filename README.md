@@ -51,6 +51,13 @@ startup so the returned command syntax is properly formatted for the host enviro
   (no more guessing `openclaw` when the unit is `openclaw-gateway`).
   Privacy is preserved as only process names are surfaced, never arguments. 
   See [Runtime snapshot](#runtime-snapshot-services-and-processes).
+- **Hardware identity**: a static `hardware` facts block — vendor, model
+  string, `platform_class` (`sbc`/`laptop`/`desktop`/`server`/`vm`/
+  `container`), total RAM — resolved from the device tree, DMI, or `sysctl`,
+  so the model knows it is on a Pi 5 vs a MacBook vs a VM and which telemetry
+  classes are plausible (PMIC rails, battery, IPMI). Paired with prompt rules
+  that forbid unverified "that can't be measured here" claims. See
+  [Hardware identity](#hardware-identity).
 - **Approval-gated execution**: every proposed command is shown with its
   reason and CWD before it runs. Per command you can run it, edit it before
   running, or skip it (decline one step; the agent continues the turn). To
@@ -366,6 +373,55 @@ the `_DARWIN_SERVICE_SKIP_PREFIXES` tuple in `sys_agent.py`; extend it if a
 host's noise differs. Expect the service list to carry far more signal on a
 server — where it names your actual workload — than on a desktop, where it is
 mostly background updaters.
+
+### Hardware identity
+
+Alongside the OS facts, startup resolves what the machine *is* — not just
+which OS it runs — and injects it as a `hardware` block:
+
+```json
+"hardware": {
+  "model": "Raspberry Pi 5 Model B Rev 1.0",
+  "platform_class": "sbc",
+  "memory_gb": 7.9
+}
+```
+
+| Field | Source (Linux) | Source (macOS) |
+|---|---|---|
+| `model` | `/proc/device-tree/model` (SBCs), else DMI `product_name` | `sysctl hw.model` |
+| `vendor` | DMI `sys_vendor` | `Apple` |
+| `platform_class` | see below | battery in `pmset -g batt` → `laptop`, else `desktop` |
+| `memory_gb` | `/proc/meminfo` MemTotal | `sysctl hw.memsize` |
+| `cpu_model` | — | `machdep.cpu.brand_string` |
+
+`platform_class` is one of `container | vm | sbc | laptop | desktop | server`,
+resolved in that precedence order (a Pi inside Docker reads as `container`):
+container detection (`/.dockerenv`, cgroup probe), then
+`systemd-detect-virt --vm` (DMI vendor/product needles as fallback), then
+device-tree presence, then the SMBIOS chassis-type code. Placeholder DMI junk
+("To Be Filled By O.E.M.") is filtered out rather than surfaced as identity.
+Fields are attached only when resolved; everything is static, unprivileged,
+and effectively free at startup. On macOS the laptop/desktop split keys on
+battery presence, not the model string — Apple Silicon identifiers
+(`Mac15,6`) no longer encode the form factor.
+
+**Why it matters.** The hardware identity tells the model which telemetry
+classes are even plausible before it proposes anything: PMIC rails and
+`vcgencmd` on a Raspberry Pi, battery/`pmset`/`upower` on a laptop, IPMI on
+a server, "you can't measure that" inside a VM. The system prompt pairs the
+block with two rules: a negative capability claim ("there is no live wattage
+reading on this host") must be verified with a one-line probe before being
+asserted, and on a Raspberry Pi the model is pointed directly at
+`vcgencmd get_throttled` and (Pi 5) `vcgencmd pmic_read_adc` for live
+undervoltage/throttle state and per-rail power draw. The startup tool probe
+now also detects `vcgencmd`, `sensors`, `upower`, `dmidecode`, and
+`ipmitool`, so tool presence corroborates the hardware identity.
+
+The default facts also enumerate `/sys/class/hwmon/*/name` on Linux as
+`hwmon_sensors` (e.g. `cpu_thermal`, `rpi_volt`, `pwmfan`, `nvme`) — derived
+from sysfs, not a curated map — so the sensor channels that exist on the
+host are listed in context rather than guessed.
 
 ### SMART over USB bridges
 

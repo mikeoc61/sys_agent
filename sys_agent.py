@@ -1301,6 +1301,205 @@ def _sample_disk_io(device_names) -> dict[str, dict[str, float]]:
 
 
 # -----------------------------------------------------------------------------
+# Hardware identity (static platform facts)
+# -----------------------------------------------------------------------------
+# Resolved once at startup and injected under facts["hardware"] so the model
+# knows WHAT it is running on, not just which OS. The runtime snapshot answers
+# "what is this host doing"; this answers "what is this host" — and steers
+# which telemetry classes are even plausible (PMIC rails on a Pi, battery on
+# a laptop, IPMI on a server, none of those in a VM). Everything here is
+# static for the life of the host, so unlike the runtime snapshot it carries
+# no staleness caveat. All sources are unprivileged; the only subprocesses
+# are systemd-detect-virt / sysctl / pmset where applicable.
+
+# SMBIOS chassis-type code -> coarse platform class (DMTF SMBIOS spec, System
+# Enclosure type 3). Deliberately coarse: the agent needs laptop-vs-server
+# priors, not the full 30-entry taxonomy. Unlisted codes resolve to no class.
+_DMI_CHASSIS_CLASS: dict[int, str] = {
+    3: "desktop", 4: "desktop", 5: "desktop", 6: "desktop", 7: "desktop",
+    13: "desktop", 24: "desktop", 34: "desktop", 35: "desktop",
+    8: "laptop", 9: "laptop", 10: "laptop", 11: "laptop", 14: "laptop",
+    30: "laptop", 31: "laptop", 32: "laptop",
+    17: "server", 23: "server", 25: "server", 28: "server", 29: "server",
+}
+
+# DMI fields on consumer boards are frequently placeholder garbage; treat
+# these (case-insensitive) as absent rather than surfacing them as identity.
+_DMI_JUNK_VALUES = frozenset((
+    "to be filled by o.e.m.", "system product name", "system manufacturer",
+    "system version", "default string", "none", "unknown", "not specified",
+    "not applicable", "oem",
+))
+
+# product_name substrings identifying a hypervisor, used only when
+# systemd-detect-virt is unavailable. Lowercase needles.
+_DMI_VM_NEEDLES = (
+    "kvm", "qemu", "vmware", "virtualbox", "virtual machine", "hvm domu",
+    "xen", "amazon ec2", "parallels", "bochs",
+)
+
+
+def _dmi_read(field: str) -> str:
+    """Read a /sys/class/dmi/id field, filtering vendor placeholder junk.
+    Returns '' when absent, unreadable, or junk. Unprivileged fields only
+    (sys_vendor/product_name/chassis_type are world-readable; the root-only
+    serial/UUID fields are never touched)."""
+    val = _safe_read(f"/sys/class/dmi/id/{field}", limit=256).strip()
+    return "" if val.lower() in _DMI_JUNK_VALUES else val
+
+
+def _container_detected() -> bool:
+    """Best-effort container detection. /.dockerenv is the cheap positive;
+    the /proc/1/cgroup grep covers containerd/k8s/lxc but is known to
+    false-negative on pure cgroup-v2 hosts — acceptable for a prior."""
+    if os.path.exists("/.dockerenv"):
+        return True
+    cgroup = _safe_read("/proc/1/cgroup", limit=4096).lower()
+    return any(n in cgroup for n in ("docker", "containerd", "kubepods", "lxc"))
+
+
+def _vm_detected_linux(dmi_text: str) -> bool:
+    """VM detection: systemd-detect-virt --vm when present (authoritative;
+    exit 0 means a VM was detected), else DMI needles against the combined
+    vendor+product text — QEMU puts "QEMU" in sys_vendor, VMware in
+    product_name, so neither field alone covers both."""
+    if shutil.which("systemd-detect-virt"):
+        try:
+            res = subprocess.run(
+                ["systemd-detect-virt", "--vm"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            return res.returncode == 0
+        except (subprocess.SubprocessError, OSError):
+            pass
+    t = dmi_text.lower()
+    return any(n in t for n in _DMI_VM_NEEDLES)
+
+
+def _memory_gb_linux() -> float | None:
+    """Total RAM from /proc/meminfo MemTotal, in GB (1 decimal)."""
+    for line in _safe_read("/proc/meminfo", limit=4096).splitlines():
+        if line.startswith("MemTotal:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                return round(int(parts[1]) * 1024 / (1024 ** 3), 1)
+    return None
+
+
+def _sysctl_value(name: str) -> str:
+    """`sysctl -n <name>` (macOS path); '' on any failure."""
+    if not shutil.which("sysctl"):
+        return ""
+    try:
+        res = subprocess.run(
+            ["sysctl", "-n", name],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def _mac_has_battery() -> bool:
+    """Laptop detection on macOS: an internal battery in `pmset -g batt`.
+    Model identifiers stopped encoding the form factor on Apple Silicon
+    ('Mac15,6' is an M3 MacBook Pro, 'Mac14,12' is a Mac Studio), so battery
+    presence is the robust laptop signal, not the model-string prefix."""
+    if not shutil.which("pmset"):
+        return False
+    try:
+        res = subprocess.run(
+            ["pmset", "-g", "batt"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return res.returncode == 0 and "InternalBattery" in res.stdout
+
+
+def _hwmon_sensors_linux() -> list[str]:
+    """Names of /sys/class/hwmon devices (e.g. cpu_thermal, rpi_volt, nvme).
+    Derived from sysfs, not curated — tells the model which sensor channels
+    exist on this host without maintaining a map. Default-tier: a handful of
+    short strings, and the strongest "this telemetry exists" signal — the
+    channel names sit in context even if prompt guidance changes."""
+    names: list[str] = []
+    try:
+        entries = sorted(os.listdir("/sys/class/hwmon"))
+    except OSError:
+        return names
+    for e in entries:
+        name = _safe_read(f"/sys/class/hwmon/{e}/name", limit=64)
+        if name:
+            names.append(name)
+    return names
+
+
+def _gather_hardware_facts() -> dict[str, Any]:
+    """Static hardware identity: vendor, model, platform_class, memory_gb
+    (plus cpu_model on macOS, where the model identifier alone is opaque).
+
+    Fields are attached only when resolved, so key-presence is meaningful.
+    `platform_class` is one of container|vm|sbc|laptop|desktop|server,
+    resolved in that precedence order (a Pi inside Docker is a container
+    first). Sources by platform:
+
+      Linux SBC   /proc/device-tree/model  (authoritative on Pi/BeagleBone)
+      Linux x86   /sys/class/dmi/id/{sys_vendor,product_name,chassis_type}
+      macOS       sysctl hw.model / machdep.cpu.brand_string / hw.memsize,
+                  pmset -g batt for the laptop/desktop split
+
+    NOTE: the Darwin path is fixture-reasoned, not yet Mac-verified (same
+    status the runtime snapshot shipped with). Validate with:
+        sysctl -n hw.model machdep.cpu.brand_string hw.memsize
+        pmset -g batt
+    """
+    hw: dict[str, Any] = {}
+    system = platform.system()
+    if system == "Linux":
+        # Device-tree model is NUL-terminated in sysfs; strip it.
+        dt_model = _safe_read(
+            "/proc/device-tree/model", limit=256).rstrip("\x00").strip()
+        dmi_vendor = _dmi_read("sys_vendor")
+        dmi_product = _dmi_read("product_name")
+        if dt_model:
+            hw["model"] = dt_model
+        elif dmi_product:
+            hw["model"] = dmi_product
+        if dmi_vendor:
+            hw["vendor"] = dmi_vendor
+        mem = _memory_gb_linux()
+        if mem:
+            hw["memory_gb"] = mem
+        if _container_detected():
+            hw["platform_class"] = "container"
+        elif _vm_detected_linux(f"{dmi_vendor} {dmi_product}"):
+            hw["platform_class"] = "vm"
+        elif dt_model:
+            hw["platform_class"] = "sbc"
+        else:
+            chassis = _safe_read("/sys/class/dmi/id/chassis_type", limit=8)
+            cls = (_DMI_CHASSIS_CLASS.get(int(chassis))
+                   if chassis.isdigit() else None)
+            if cls:
+                hw["platform_class"] = cls
+    elif system == "Darwin":
+        model = _sysctl_value("hw.model")
+        if model:
+            hw["vendor"] = "Apple"
+            hw["model"] = model
+            hw["platform_class"] = ("laptop" if _mac_has_battery()
+                                    else "desktop")
+        cpu = _sysctl_value("machdep.cpu.brand_string")
+        if cpu:
+            hw["cpu_model"] = cpu
+        memsize = _sysctl_value("hw.memsize")
+        if memsize.isdigit():
+            hw["memory_gb"] = round(int(memsize) / (1024 ** 3), 1)
+    return hw
+
+
+# -----------------------------------------------------------------------------
 # Runtime snapshot (running services + top processes by memory)
 # -----------------------------------------------------------------------------
 # Gathered once at startup and injected into the system prompt so the model
@@ -1597,6 +1796,8 @@ def gather_host_facts() -> dict[str, Any]:
         "python3", "pip", "pip3", "uv", "poetry", "pipx",
         # disk / filesystem inspection
         "lsblk", "findmnt", "df", "du", "blkid", "smartctl",
+        # hardware / power / sensor telemetry
+        "vcgencmd", "sensors", "upower", "dmidecode", "ipmitool",
     ]
     facts["available_tools"] = _which_many(candidates)
 
@@ -1609,6 +1810,19 @@ def gather_host_facts() -> dict[str, Any]:
     facts["init_tools"] = _which_many(["systemctl", "service", "launchctl", "rc-service"])
     facts["container_tools"] = _which_many(["docker", "podman", "kubectl"])
     facts["virtual_env"] = os.environ.get("VIRTUAL_ENV", "")
+
+    # Static hardware identity — what the host IS (Pi 5 / MacBook / VM /
+    # rack server), steering which telemetry questions are even answerable.
+    hardware = _gather_hardware_facts()
+    if hardware:
+        facts["hardware"] = hardware
+
+    # Sensor-channel inventory (Linux): derived hwmon names, not a curated
+    # map — e.g. cpu_thermal, rpi_volt, pwmfan, nvme.
+    if platform.system() == "Linux":
+        hwmon = _hwmon_sensors_linux()
+        if hwmon:
+            facts["hwmon_sensors"] = hwmon
 
     try:
         usage = shutil.disk_usage(os.getcwd())
@@ -1641,8 +1855,7 @@ def gather_verbose_host_facts() -> dict[str, Any]:
     facts["cpu_count"] = os.cpu_count()
     facts["path"] = os.environ.get("PATH", "")
 
-    cgroup = _safe_read("/proc/1/cgroup", limit=4096).lower()
-    facts["container_detected"] = any(needle in cgroup for needle in ("docker", "containerd", "kubepods"))
+    facts["container_detected"] = _container_detected()
 
     network_tools = _which_many(["ip", "ifconfig", "netstat", "route"])
     facts["network_tools"] = network_tools
@@ -2579,6 +2792,20 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           even on a clean unmount, so it climbs under normal use. Flag a counter
           only when it is actively rising or a threshold (spare, temperature,
           percentage-used) is breached.
+        - Never assert that a measurement, sensor, or capability is absent on
+          this host without checking first. Negative claims require the same
+          verification as positive ones: before saying "there is no way to
+          read X here", run the one-line probe that would reveal it (a sysfs
+          read, a tool query, a --help). Use the `hardware` facts (model,
+          platform_class) to judge which telemetry classes are plausible:
+          battery state on a laptop, PMIC/firmware sensors on an SBC, IPMI on
+          a server, little to none inside a VM or container.
+        - Raspberry Pi hosts expose firmware telemetry via `vcgencmd`:
+          `vcgencmd get_throttled` decodes undervoltage/throttling state, and
+          on a Pi 5 `vcgencmd pmic_read_adc` reads per-rail PMIC current and
+          voltage — a usable live power-draw measurement. When the hardware
+          model says Raspberry Pi and `vcgencmd` is in `available_tools`,
+          prefer measuring with it over inferring power/thermal state.
         - Never propose commands that wipe disks, format filesystems, or
           irrecoverably destroy data. If such a step is genuinely required,
           flag it in plain text and ask the user to run it manually.
