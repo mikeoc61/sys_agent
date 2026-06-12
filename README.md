@@ -198,6 +198,7 @@ SYS_DEEPSEEK_MODEL=deepseek-v4-pro
 | `SYS_COLOR` | `on` / `off` / `auto` | `auto` |
 | `NO_COLOR` | If set, disables color regardless of `SYS_COLOR=auto` | — |
 | `SYS_PROGRESS` | Activity spinner during model calls / command execution: `on`/`off` | `on` |
+| `SYS_DISCLAIMER` | Startup notice that model-proposed commands can be wrong: `on`/`off` | `on` |
 
 ### Files
 
@@ -566,6 +567,11 @@ Three layers, weakest to strongest:
 3. **Command timeout** (120s wall-clock per command, configurable via
    `SYS_COMMAND_TIMEOUT`). Prevents runaway model loops from hanging the REPL
    on a single command.
+
+A dimmed startup notice restates the premise of layer 1: model-proposed
+commands can be confidently wrong (hallucinated flags, paths, unit names;
+stale syntax), and the approval prompt is where you catch that. Suppress it
+with `SYS_DISCLAIMER=off`.
 
 The deny list is intentionally short and pattern-matched. It is **not** a
 substitute for paying attention to the approval prompt. Sandbox the agent

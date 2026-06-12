@@ -271,6 +271,19 @@ def _thinking_mode(model: str) -> str:
 # Default SDK value is 2; bump for resilience on flaky networks / busy API.
 API_MAX_RETRIES = 5
 
+# Startup disclaimer — one-time, dimmed reminder that model output is fallible
+# and the approval prompt is the review point. Generalized across providers:
+# the failure mode here is not just wrong prose but wrong COMMANDS
+# (hallucinated flags, paths, unit names; stale syntax for newer tool
+# versions). Suppress with SYS_DISCLAIMER=off once internalized.
+SHOW_DISCLAIMER = os.environ.get("SYS_DISCLAIMER", "on").strip().lower() != "off"
+DISCLAIMER = (
+    "model-proposed commands can be confidently wrong — LLMs hallucinate "
+    "flags, paths, and facts, and may lag current software versions. The "
+    "approval prompt is your review point: read each command before running "
+    "(/auto on disables it)."
+)
+
 # Meta-command reference — single source of truth for /help and the startup
 # banner. (command, description). Keep in sync with the handlers in run_repl.
 META_COMMANDS: tuple[tuple[str, str], ...] = (
@@ -2894,6 +2907,9 @@ def run_repl(provider: Provider) -> None:
     ))
     print(dim("meta: " + "  ".join(cmd for cmd, _ in META_COMMANDS)
               + "   — /help for details"))
+    if SHOW_DISCLAIMER:
+        print()
+        print(warn("note:") + " " + dim(DISCLAIMER))
     print()
 
     while True:
