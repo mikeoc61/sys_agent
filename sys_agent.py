@@ -2822,6 +2822,9 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
         - Never propose commands that wipe disks, format filesystems, or
           irrecoverably destroy data. If such a step is genuinely required,
           flag it in plain text and ask the user to run it manually.
+        - If a missing software package might help an investigation outcome,
+          always state the suggestion and rationale, and await user approval,
+          before incorporating a package install into a suggested command. 
     """).strip()
 
 
