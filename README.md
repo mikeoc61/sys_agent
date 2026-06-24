@@ -738,8 +738,8 @@ jq 'select(.action=="deny")' ~/.config/sys_agent/audit.log
                                  ▼
                   ┌─────────────────────────────────────────────┐
                   │            Provider abstraction             │
-                  │ OpenAIProvider | AnthropicProvider |         │
-                  │ DeepSeekProvider (OpenAI-compatible)         │
+                  │ OpenAIProvider | AnthropicProvider |        │
+                  │ DeepSeekProvider (OpenAI-compatible)        │
                   └──────────────┬──────────────────────────────┘
                                  │  HTTPS + tool calling
                                  ▼
