@@ -1,6 +1,6 @@
 """Offline round-trip verification for the /consult render layer + fork-from-
 question trim. No network, no API keys — exercises render/normalize/trim only,
-never .chat(). Run: python3 test_consult_render.py
+never .chat(). Run: python3 -m py_compile sys_agent.py && python3 test_consult_render.py
 """
 import json, sys
 import sys_agent as S
