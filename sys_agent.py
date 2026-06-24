@@ -1605,23 +1605,34 @@ def _top_processes_by_rss_linux(limit: int) -> list[dict[str, Any]]:
     return out
 
 
-def _running_services_linux(limit: int) -> list[str]:
+def _running_services_linux(limit: int, user: bool = False) -> list[str]:
     """Running systemd service units via `systemctl`, when present.
+
+    `user=False` queries the system manager (`systemctl list-units`); `user=True`
+    queries the per-user manager (`systemctl --user`), which is where services a
+    user runs for themselves live — e.g. a `bitcoind.service` started with
+    `systemctl --user`, invisible to the system-scope list. The user query needs
+    a reachable user D-Bus session (present when sys_agent runs in the invoking
+    user's login session; absent under sudo, cron, or a user without linger),
+    and exits non-zero when it is not — handled as [] like the no-bus case below.
 
     Returns [] on non-systemd hosts (OpenRC, runit, sysvinit, ...): enumerating
     every init system is out of scope, and on those hosts `top_processes` still
     carries the naming signal through the process basename. Also returns []
-    when systemd is installed but unreachable (no bus — e.g. inside a
-    container), since list-units exits non-zero there. Script-stable flags
-    only, matching the guidance the prompt gives the model.
+    when systemd is installed but the relevant bus is unreachable (e.g. inside a
+    container, or no user bus), since list-units exits non-zero there. Script-
+    stable flags only, matching the guidance the prompt gives the model.
     """
     if not shutil.which("systemctl"):
         return []
+    argv = ["systemctl"]
+    if user:
+        argv.append("--user")
+    argv += ["list-units", "--type=service", "--state=running",
+             "--no-legend", "--plain", "--no-pager"]
     try:
         res = subprocess.run(
-            ["systemctl", "list-units", "--type=service", "--state=running",
-             "--no-legend", "--plain", "--no-pager"],
-            capture_output=True, text=True, timeout=5, check=False,
+            argv, capture_output=True, text=True, timeout=5, check=False,
         )
     except (subprocess.SubprocessError, OSError):
         return []
@@ -1761,6 +1772,8 @@ def _gather_runtime_facts() -> dict[str, Any]:
     if system == "Linux":
         return {
             "running_services": _running_services_linux(RUNTIME_MAX_SERVICES),
+            "running_services_user": _running_services_linux(
+                RUNTIME_MAX_SERVICES, user=True),
             "top_processes": _top_processes_by_rss_linux(RUNTIME_TOP_PROCESSES),
         }
     if system == "Darwin":
@@ -1859,6 +1872,8 @@ def gather_host_facts() -> dict[str, Any]:
     runtime = _gather_runtime_facts()
     if runtime.get("running_services"):
         facts["running_services"] = runtime["running_services"]
+    if runtime.get("running_services_user"):
+        facts["running_services_user"] = runtime["running_services_user"]
     if runtime.get("top_processes"):
         facts["top_processes"] = runtime["top_processes"]
 
@@ -2933,6 +2948,21 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           what is running now) must be answered from a live command this turn
           (`free -h`, `df -h`, `uptime`, `ps`/`top`), not from the snapshot.
           `/facts refresh` re-probes if they look stale.
+        - Service scope and logs (systemd hosts). Units are split by manager:
+          `running_services` are SYSTEM units (`systemctl status <unit>`,
+          `systemctl restart <unit>`, logs via `journalctl -u <unit>`);
+          `running_services_user` are PER-USER units started with
+          `systemctl --user` (`systemctl --user status <unit>`, logs via
+          `journalctl --user -u <unit>`) — these take NO sudo, and sudo'ing
+          them queries the wrong manager and fails. Match the scope to the list
+          the unit appears in. On a systemd host `journalctl` is the log source
+          for a service: prefer `journalctl -u <unit> -n 100 --no-pager`
+          (narrow with `--since`, `-p err`, `-b`) over searching `/var/log` for
+          a unit's output. If a named service is in NEITHER list, confirm with
+          `systemctl status <unit>` then `systemctl --user status <unit>`
+          before assuming a log-file path — `running_services_user` is empty
+          when the user D-Bus session was unreachable at probe time (sudo,
+          cron, no linger), which does not mean the unit is absent.
         - The approval prompt is the permission gate, not you. Do NOT ask the
           user whether to run an inspection/read-only command ("Would you like
           me to check…?") — propose it directly with run_command and let them

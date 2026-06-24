@@ -402,7 +402,7 @@ system prompt.
 Alongside the static host facts, startup probes capture a point-in-time
 snapshot of what the machine is actually running, so the model uses real
 service and process names on the first turn instead of burning a round trip to
-discover them. Two keys are injected into the facts when non-empty:
+discover them. Three keys are injected into the facts when non-empty:
 
 - **`running_services`** — the active services. On Linux, the running `systemd`
   service units (`systemctl list-units --type=service --state=running`); empty
@@ -411,6 +411,18 @@ discover them. Two keys are injected into the facts when non-empty:
   system agents and per-GUI-app jobs filtered out (see the platform note),
   leaving the user-relevant daemons (Homebrew, vendor helpers, custom
   LaunchAgents/Daemons).
+- **`running_services_user`** (Linux/systemd) — the running **per-user** units
+  from `systemctl --user`, the manager where a user's own services live (e.g. a
+  `bitcoind.service` you start with `systemctl --user`, invisible to the
+  system-scope list above). Present only when non-empty, which requires a
+  reachable user D-Bus session: present when sys_agent runs in the invoking
+  user's login session (keep it alive headless with
+  `loginctl enable-linger <user>`), absent under sudo, cron, or a user without
+  linger. The system prompt tells the model to match scope to the list a unit
+  appears in — `systemctl --user status <unit>` and `journalctl --user -u
+  <unit>` for these (no sudo), `systemctl status` / `journalctl -u` for the
+  system list — and that `journalctl` is the log source for a service rather
+  than hunting `/var/log`.
 - **`top_processes`** — the top processes by resident memory (RSS), 10 by
   default (`SYS_TOP_PROCESSES`). Processes sharing a name are aggregated into a
   single entry with summed RSS and an instance `count`, so a worker pool reads
