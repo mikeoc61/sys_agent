@@ -87,6 +87,12 @@ startup so the returned command syntax is properly formatted for the host enviro
   server role needs — distinct from readline history, which stores only your
   prompts. On by default; command output bodies are excluded unless opted in.
   See [Audit log](#audit-log).
+- **Multi-provider consult**: `/consult` asks the *other* configured providers
+  how they would open the current (or just-aborted) question and shows each
+  one's first move beside the active provider's — a read-only second opinion
+  that executes nothing and never touches the approval gate. `--fresh` consults
+  the question alone on a context switch. See
+  [Multi-provider consult](#multi-provider-consult).
 - **Zero install footprint with uv**: PEP 723 inline-script dependencies;
   `uv` handles the environment transparently.
 
@@ -288,6 +294,8 @@ start with a clean slate: `> ~/.config/sys_agent/history`.
 | `/audit on\|off` | Toggle the command audit log at runtime |
 | `/history` | Review recent command history from the audit log, paged (last 50) |
 | `/history N \| all` | Show the last N entries, or the full log |
+| `/consult` | Second opinion: ask the other configured providers how they'd open the current question (executes nothing) |
+| `/consult --fresh` | Same, but consult the question alone — no prior conversation history |
 | `/provider` | Show current provider/model and available providers |
 | `/provider openai\|anthropic\|deepseek` | Switch provider and reset conversation/token counters |
 | `/model` | Show current model/context-window metadata |
@@ -318,6 +326,60 @@ call). Host facts and REPL toggles are preserved.
 
 Changing the model keeps the same provider and session state. Unknown context
 windows are allowed; token display falls back to absolute token counts.
+
+### Multi-provider consult
+
+`/consult` asks the *other* configured providers how they would approach the
+current question and shows their opening move beside the active provider's — a
+second opinion at a decision point. It is **read-only: nothing it returns is
+executed**, and it never touches the approval gate. The point is not to vote or
+to auto-pick a winner; it is to surface agreement or disagreement so you decide.
+
+```text
+/consult
+/consult --fresh
+```
+
+Requires at least one *other* provider key configured — with a single key there
+is nothing to consult.
+
+**What you see.** Each consulted provider works the question independently from
+the same context the active provider had, and — because consult executes
+nothing — you see only its *opening turn*: the first command (or several) it
+would propose, or a direct answer. That opening is compared against the active
+provider's own first move, shown as the `reference`. An opening turn may bundle
+several commands; in the REPL those are still approved and run one at a time, so
+the count reflects how many approvals that opening would cost you, not
+concurrency.
+
+**Convergence / divergence.** When the consulted providers propose the same
+command(s) it is flagged as convergence; when they don't, as divergence. The
+comparison is deliberately *literal* — it never claims two differently-worded
+commands are equivalent, since overstating sameness is the failure mode to
+avoid. Read divergence as a prompt to compare approaches, weighted by stakes:
+on an interchangeable read-only probe it is low-signal; on a non-obvious
+diagnosis — where one provider refreshes state before reading and another does
+not, say — it is exactly the second opinion worth having before you commit.
+
+**Second opinion before running anything.** Abort a turn with `q` (or Ctrl-C)
+*before* approving its first command, then `/consult`: the aborted question —
+not the previous turn — is what gets consulted. This is the cleanest use of the
+feature: see how every provider would open, with zero side effects, then decide
+what to actually run.
+
+**`--fresh`.** By default consult carries the prior conversation as context
+(apples-to-apples with what the active provider saw). On a context switch — a
+new, self-contained question where the accumulated session is just noise —
+`/consult --fresh` consults the question alone (question + host facts, no prior
+turns), which is also cheaper. It applies on every path: aborting only drops the
+one aborted turn, not the earlier session, so the abort and skip paths carry the
+same history without it.
+
+Consult queries the providers concurrently and reports its token cost
+*separately* from the session counters, which stay tied to the active
+conversation's context-window accounting. The active provider, model, thinking,
+and effort all carry into the consult call, so it reflects what you would
+actually run.
 
 ### Refreshable host facts
 

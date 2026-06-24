@@ -78,7 +78,8 @@ import time
 import itertools
 import atexit
 import datetime
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -297,6 +298,7 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/color on|off",   "Toggle ANSI color output"),
     ("/audit [on|off]", "Show or toggle the command audit log"),
     ("/history [N|all]", "Review recent command history from the audit log (paged)"),
+    ("/consult [--fresh]", "Second opinion from the other providers (executes nothing); --fresh drops prior history"),
     ("/provider [name]", "Show or switch provider: openai|anthropic|deepseek"),
     ("/model [name]",    "Switch model for the active provider; no arg lists choices"),
     ("/facts",           "Print current host facts"),
@@ -2219,6 +2221,13 @@ class Provider:
     ) -> None:
         raise NotImplementedError
 
+    def render_assistant(self, text: str, tool_calls: list["ToolCall"]) -> dict:
+        # Rebuild an assistant message in this provider's wire format from
+        # neutral parts. Used by render() to replay a cross-provider transcript
+        # for /consult. Distinct from append_assistant (which stores a native
+        # ChatTurn this provider just produced).
+        raise NotImplementedError
+
 
 class OpenAIProvider(Provider):
     def __init__(self, model: str) -> None:
@@ -2275,6 +2284,20 @@ class OpenAIProvider(Provider):
                 "tool_call_id": tc_id,
                 "content": content,
             })
+
+    def render_assistant(self, text: str, tool_calls: list["ToolCall"]) -> dict:
+        # Rebuild an assistant message in OpenAI wire shape from neutral parts
+        # (see normalize/render). Mirrors what chat() stored as raw_message, so
+        # a transcript normalized from any provider replays here verbatim.
+        msg: dict[str, Any] = {"role": "assistant", "content": text or None}
+        if tool_calls:
+            msg["tool_calls"] = [{
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.name,
+                             "arguments": json.dumps(tc.arguments)},
+            } for tc in tool_calls]
+        return msg
 
 
 class DeepSeekProvider(OpenAIProvider):
@@ -2365,6 +2388,16 @@ class DeepSeekProvider(OpenAIProvider):
             ),
             thinking_text=reasoning,
         )
+
+    def render_assistant(self, text: str, tool_calls: list["ToolCall"]) -> dict:
+        # Same wire shape as OpenAI, plus the reasoning_content presence the
+        # DeepSeek replay contract requires on every assistant message once a
+        # thinking turn has tool-called. We have no scratchpad for a turn
+        # authored by another provider, so send "" — DeepSeek ignores an empty
+        # value but rejects a MISSING key with 400. (See class docstring.)
+        msg = super().render_assistant(text, tool_calls)
+        msg["reasoning_content"] = ""
+        return msg
 
 
 class AnthropicProvider(Provider):
@@ -2484,10 +2517,131 @@ class AnthropicProvider(Provider):
         ]
         messages.append({"role": "user", "content": blocks})
 
+    def render_assistant(self, text: str, tool_calls: list["ToolCall"]) -> dict:
+        # Anthropic assistant content is a block list. Thinking blocks are NOT
+        # reconstructed here — a cross-provider transcript carries none, and the
+        # signature-bearing block needed for native thinking-replay cannot be
+        # forged. Consult is a fresh read, so this is correct. An assistant turn
+        # with neither text nor tool_use is invalid (empty content 400s), so a
+        # single-space text block stands in for that degenerate case.
+        content: list[dict] = []
+        if text:
+            content.append({"type": "text", "text": text})
+        for tc in tool_calls:
+            content.append({"type": "tool_use", "id": tc.id,
+                            "name": tc.name, "input": tc.arguments})
+        return {"role": "assistant",
+                "content": content or [{"type": "text", "text": " "}]}
+
 
 # -----------------------------------------------------------------------------
-# Provider selection
+# Canonical transcript (provider-neutral) — basis for cross-provider consult
 # -----------------------------------------------------------------------------
+#
+# The live `messages` list is always in the ACTIVE provider's wire format and
+# remains the single source of truth for execution. To ask a DIFFERENT provider
+# for a second opinion (/consult) we cannot hand it that format directly:
+# OpenAI/DeepSeek emit one `role:tool` message per call while Anthropic batches
+# tool_result blocks into one user message, and the assistant-turn shapes differ
+# too. So we read the active history into a neutral event list (normalize) and
+# replay it into the target's format (render). No second copy is stored; the
+# canonical form is derived on demand, which is why it cannot drift from
+# `messages`. Thinking scratchpads are intentionally dropped — a consult is a
+# fresh read, and Anthropic's signature-bearing thinking blocks cannot be forged
+# for a turn another model authored.
+
+
+@dataclass
+class CanonicalEvent:
+    kind: str                                   # user | assistant | tool_results
+    text: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    results: list[tuple[str, str]] = field(default_factory=list)
+
+
+def normalize(provider_name: str, messages: list[dict]) -> list[CanonicalEvent]:
+    """Read the active provider's `messages` into provider-neutral events.
+
+    Consecutive OpenAI/DeepSeek `role:tool` messages are coalesced into one
+    tool_results event so the canonical form matches Anthropic's batching — the
+    neutral shape is symmetric regardless of which provider produced it."""
+    events: list[CanonicalEvent] = []
+    if provider_name in ("openai", "deepseek"):
+        for m in messages:
+            role = m.get("role")
+            if role == "system":
+                continue
+            if role == "user":
+                events.append(CanonicalEvent("user", text=m.get("content") or ""))
+            elif role == "assistant":
+                calls: list[ToolCall] = []
+                for tc in (m.get("tool_calls") or []):
+                    fn = tc.get("function", {})
+                    try:
+                        args = json.loads(fn.get("arguments") or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                    calls.append(ToolCall(id=tc.get("id", ""),
+                                          name=fn.get("name", ""), arguments=args))
+                events.append(CanonicalEvent("assistant",
+                                             text=m.get("content") or "",
+                                             tool_calls=calls))
+            elif role == "tool":
+                pair = (m.get("tool_call_id", ""), m.get("content") or "")
+                if events and events[-1].kind == "tool_results":
+                    events[-1].results.append(pair)
+                else:
+                    events.append(CanonicalEvent("tool_results", results=[pair]))
+        return events
+
+    # Anthropic: assistant content is a block list; tool_results arrive as a
+    # user message whose content is a list of tool_result blocks.
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+        if role == "user":
+            if isinstance(content, str):
+                events.append(CanonicalEvent("user", text=content))
+            elif isinstance(content, list):
+                results = [(b.get("tool_use_id", ""), b.get("content") or "")
+                           for b in content if b.get("type") == "tool_result"]
+                if results:
+                    events.append(CanonicalEvent("tool_results", results=results))
+                else:
+                    text = "".join(b.get("text", "") for b in content
+                                   if b.get("type") == "text")
+                    events.append(CanonicalEvent("user", text=text))
+        elif role == "assistant":
+            text_parts: list[str] = []
+            calls = []
+            for b in (content or []):
+                if b.get("type") == "text":
+                    text_parts.append(b.get("text", ""))
+                elif b.get("type") == "tool_use":
+                    calls.append(ToolCall(id=b.get("id", ""), name=b.get("name", ""),
+                                          arguments=dict(b.get("input") or {})))
+            events.append(CanonicalEvent("assistant",
+                                         text="\n".join(text_parts), tool_calls=calls))
+    return events
+
+
+def render(target: Provider, events: list[CanonicalEvent], system: str) -> list[dict]:
+    """Replay neutral events into `target`'s wire format. Reuses the provider's
+    own initial_messages / render_assistant / append_tool_results so format
+    quirks (system-prompt placement, tool_result batching, reasoning_content
+    presence) stay owned by the provider, not duplicated here."""
+    out = target.initial_messages(system)
+    for ev in events:
+        if ev.kind == "user":
+            out.append({"role": "user", "content": ev.text})
+        elif ev.kind == "assistant":
+            out.append(target.render_assistant(ev.text, ev.tool_calls))
+        elif ev.kind == "tool_results":
+            target.append_tool_results(out, ev.results)
+    return out
+
+
+
 
 
 def available_provider_names() -> list[str]:
@@ -2828,6 +2982,138 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
     """).strip()
 
 
+def _norm_cmd(cmd: str) -> str:
+    """Whitespace-collapsed command string for cheap exact-match comparison.
+    Deliberately NOT semantic: `systemctl status x` and `systemctl status
+    x.service` stay distinct. We only ever claim agreement on literal equality,
+    never equivalence — overstating sameness is the failure mode to avoid."""
+    return " ".join(cmd.split())
+
+
+def _turn_commands(turn: ChatTurn) -> list[tuple[str, str]]:
+    """(command, explanation) pairs a ChatTurn proposed via run_command."""
+    out: list[tuple[str, str]] = []
+    for tc in turn.tool_calls:
+        if tc.name != TOOL_NAME:
+            continue
+        cmd = (tc.arguments.get("command") or "").strip()
+        why = (tc.arguments.get("explanation") or "").strip()
+        if cmd:
+            out.append((cmd, why))
+    return out
+
+
+def _first_move_commands(events: list["CanonicalEvent"]) -> list[tuple[str, str]]:
+    """run_command (command, explanation) pairs from the FIRST assistant turn in
+    `events` that proposed any — the comparable 'first move'. Shared by both
+    /consult paths (normal: tail after the last user msg; aborted: the rolled-
+    back turn's captured events)."""
+    out: list[tuple[str, str]] = []
+    for ev in events:
+        if ev.kind == "assistant" and ev.tool_calls:
+            for tc in ev.tool_calls:
+                if tc.name == TOOL_NAME:
+                    cmd = (tc.arguments.get("command") or "").strip()
+                    why = (tc.arguments.get("explanation") or "").strip()
+                    if cmd:
+                        out.append((cmd, why))
+            break
+    return out
+
+
+def _cmd_count_suffix(n: int) -> str:
+    """Dim ' — N command(s)' tag making the broad-batch vs narrow-iterative
+    opening explicit. A consult 'first move' is one TURN, which may bundle
+    several commands (the API's 'parallel tool calls'). The label avoids the
+    word 'parallel' on purpose: in the REPL these are approved AND executed
+    one at a time, sequentially — N here means N separate approval prompts you
+    would face, not concurrency."""
+    if n <= 0:
+        return ""
+    if n == 1:
+        return dim(" — 1 command")
+    return dim(f" — {n} commands in its opening turn")
+
+
+def print_consult(
+    active: Provider,
+    reference: list[tuple[str, str]],
+    results: list[tuple[str, str, Any]],
+    ref_aborted: bool = False,
+    fresh: bool = False,
+) -> None:
+    """Render a side-by-side second opinion. `reference` is the active
+    provider's most recent proposal (what you'd otherwise run); `results` is a
+    list of (provider_name, model, ChatTurn | error_str) from the consulted
+    providers. `ref_aborted` marks a reference from a turn you aborted before
+    running; `fresh` marks that consulted providers saw only the question, no
+    prior history. Executes nothing — this is a read-only decision aid."""
+    print()
+    print(banner("── consult ─────────────────────────────────────────────────"))
+    ref_norm = {_norm_cmd(c) for c, _ in reference}
+    if reference:
+        moment = ("first move on the aborted question (not run)"
+                  if ref_aborted else "first move on this question")
+        print(dim(f"reference — {active.name}/{active.model} {moment}")
+              + _cmd_count_suffix(len(reference)) + dim(":"))
+        for c, why in reference:
+            print(f"  {cmd_label(c)}")
+            if why:
+                print(f"  {dim('— ' + why)}")
+    else:
+        if ref_aborted:
+            print(dim(f"reference — {active.name}/{active.model} was aborted "
+                      "before it proposed a command."))
+        else:
+            print(dim(f"reference — {active.name}/{active.model} answered "
+                      "directly (no command run)."))
+    below = ("below: how each other provider would START the same question "
+             "(read-only — its opening turn; multi-command turns are approved "
+             "and run one command at a time).")
+    if fresh:
+        below += " [--fresh: consulted on the question alone, no prior history]"
+    print(dim(below))
+
+    proposed_norms: list[set[str]] = []
+    for name, model, turn in results:
+        print(dim("─" * 60))
+        if isinstance(turn, str):                       # error path
+            print(f"{agent_tag(name)} {dim('(' + model + ')')}")
+            print(fail(f"  [error] {turn}"))
+            continue
+        cmds = _turn_commands(turn)
+        proposed_norms.append({_norm_cmd(c) for c, _ in cmds})
+        print(f"{agent_tag(name)} {dim('(' + model + ')')}"
+              + _cmd_count_suffix(len(cmds)))
+        if cmds:
+            for c, why in cmds:
+                tag = ok("  [matches reference]") if _norm_cmd(c) in ref_norm else ""
+                print(f"  {cmd_label(c)}{tag}")
+                if why:
+                    print(f"  {dim('— ' + why)}")
+        if turn.text.strip():
+            body = turn.text.strip()
+            if len(body) > 600:
+                body = body[:600] + dim(" …[truncated]")
+            print(textwrap.indent(body, "  "))
+        if not cmds and not turn.text.strip():
+            print(dim("  (no command, no text)"))
+
+    # Convergence note — literal-equality only, across consulted providers.
+    nonempty = [s for s in proposed_norms if s]
+    if len(nonempty) >= 2:
+        common = set.intersection(*nonempty)
+        if common and all(s == nonempty[0] for s in nonempty):
+            print(dim("─" * 60))
+            print(ok("convergence: consulted providers proposed identical command(s)."))
+        elif not common:
+            print(dim("─" * 60))
+            print(warn("divergence: the providers would start differently — "
+                       "compare approaches before trusting one."))
+    print(banner("────────────────────────────────────────────────────────────"))
+    print(dim("consult is read-only; nothing above was executed."))
+
+
 def run_repl(provider: Provider) -> None:
     global _color_enabled, _audit_path
     facts_verbose = False
@@ -2842,6 +3128,13 @@ def run_repl(provider: Provider) -> None:
     session_out = 0                      # cumulative output tokens this session
     last_usage = Usage()                 # token usage from most recent call
     ctx_window = CONTEXT_WINDOWS.get(provider.model)   # may be None
+    # Normalized events of the most recently ABORTED turn, or None. An abort
+    # (q / Ctrl-C) rolls its user prompt out of `messages`, so /consult would
+    # otherwise fall back to the prior surviving turn. Captured here (already
+    # provider-neutral, so it survives a /provider switch) it lets /consult
+    # re-pose the aborted question — the "second opinion before running
+    # anything" path. Cleared on the next normally-completed turn.
+    aborted_turn_events: list[CanonicalEvent] | None = None
 
     def fmt_tokens(u: Usage) -> str:
         ctx = u.context_tokens
@@ -3176,6 +3469,103 @@ def run_repl(provider: Provider) -> None:
             else:
                 page_text(text)
             continue
+        if user_in.startswith("/consult"):
+            targets = [n for n in available_provider_names() if n != provider.name]
+            if not targets:
+                print(dim("[no other providers configured — set another API key "
+                          "to enable consult]"))
+                continue
+
+            # --fresh: consult the question ALONE (question + host facts), with
+            # NO prior conversational turns. Use it on a context switch — a new,
+            # self-contained question where the accumulated session is dead
+            # weight you'd otherwise pay for on every consulted provider. Applies
+            # uniformly: rollback (q) discards only the aborted turn, not the
+            # earlier session, so the abort path carries the same history as the
+            # skip (n) path and benefits identically.
+            args = user_in.split()[1:]
+            fresh = any(a in ("--fresh", "fresh", "-f") for a in args)
+
+            # Two sources for the question to consult on:
+            #  (a) an ABORTED turn — its prompt was rolled out of `messages`, so
+            #      re-pose it. This is the "second opinion before running
+            #      anything" path.
+            #  (b) normal — the last user message still in `messages`.
+            aborted_q: str | None = None
+            if aborted_turn_events is not None:
+                au = next((e for e in aborted_turn_events if e.kind == "user"),
+                          None)
+                aborted_q = au.text.strip() if au else None
+
+            if aborted_q:
+                question = aborted_q
+                prior = normalize(provider.name, messages)
+                reference = _first_move_commands(aborted_turn_events)
+                ref_aborted = True
+            else:
+                if not any(
+                    (m.get("role") == "user" and isinstance(m.get("content"), str))
+                    for m in messages
+                ):
+                    print(dim("[no conversation yet — ask something first, then "
+                              "/consult for a second opinion]"))
+                    continue
+                events = normalize(provider.name, messages)
+                # Re-pose the LAST user question so each provider works it
+                # INDEPENDENTLY from the same prior context, rather than
+                # continuing past the active provider's already-complete answer
+                # (which leaves nothing to respond to — empty/redundant turn).
+                # Read-only means we see each provider's FIRST move only.
+                last_user = max(
+                    i for i, ev in enumerate(events) if ev.kind == "user"
+                )
+                question = events[last_user].text
+                prior = events[:last_user]
+                reference = _first_move_commands(events[last_user + 1:])
+                ref_aborted = False
+
+            # Default keeps prior context (apples-to-apples with what the active
+            # provider saw); --fresh drops it to the bare question.
+            q_event = CanonicalEvent("user", text=question)
+            trimmed = [q_event] if fresh else prior + [q_event]
+
+            def consult_one(name: str) -> tuple[str, str, Any]:
+                p = make_provider(name)
+                rendered = render(p, trimmed, system)
+                turn = p.chat(rendered, system,
+                              thinking=thinking_enabled, effort=effort)
+                return name, p.model, turn
+
+            consult_results: list[tuple[str, str, Any]] = []
+            with Activity(f"consulting {len(targets)} provider(s)"):
+                with ThreadPoolExecutor(max_workers=len(targets)) as ex:
+                    futs = {ex.submit(consult_one, n): n for n in targets}
+                    for fut in as_completed(futs):
+                        nm = futs[fut]
+                        try:
+                            consult_results.append(fut.result())
+                        except Exception as e:          # noqa: BLE001
+                            consult_results.append(
+                                (nm, DEFAULT_MODELS.get(nm, "?"),
+                                 explain_api_error(e)))
+            # Stable display order matching available_provider_names().
+            order = {n: i for i, n in enumerate(available_provider_names())}
+            consult_results.sort(key=lambda r: order.get(r[0], 99))
+
+            print_consult(provider, reference, consult_results,
+                          ref_aborted, fresh)
+
+            # Consult spend is reported separately and NOT folded into the
+            # session counters, which stay coupled to the active conversation's
+            # context-% accounting.
+            c_in = sum(t.usage.input_tokens for _, _, t in consult_results
+                       if not isinstance(t, str))
+            c_out = sum(t.usage.output_tokens for _, _, t in consult_results
+                        if not isinstance(t, str))
+            if c_in or c_out:
+                print(dim(f"[consult cost (separate from session): "
+                          f"in={c_in} out={c_out}]"))
+            continue
 
         # Snapshot history length so a mid-turn abort (Ctrl-C / 'q') can roll
         # back to exactly this point — discarding the user msg, the assistant
@@ -3207,6 +3597,8 @@ def run_repl(provider: Provider) -> None:
                 # the conversation is left exactly as before this turn, valid
                 # for every provider. Does not end the session.
                 print(fail("\n[interrupted — stopping workflow]"))
+                aborted_turn_events = normalize(provider.name,
+                                                messages[turn_start:])
                 del messages[turn_start:]
                 break
             except Exception as e:          # noqa: BLE001
@@ -3236,6 +3628,10 @@ def run_repl(provider: Provider) -> None:
                 if turn.text:
                     # Prefix colored, body plain (per preference)
                     print(f"\n{agent_tag('agent>')} {turn.text}\n")
+                # A turn completed cleanly; any earlier aborted question is now
+                # stale — its successor (this turn) lives in `messages`, so
+                # /consult reads it from there.
+                aborted_turn_events = None
                 break
 
             results: list[tuple[str, str]] = []
@@ -3314,6 +3710,8 @@ def run_repl(provider: Provider) -> None:
                 # valid on every provider. NOTE: commands already executed are
                 # NOT undone — rollback only forgets them in-context; their
                 # host side effects (and audit records) stand.
+                aborted_turn_events = normalize(provider.name,
+                                                messages[turn_start:])
                 del messages[turn_start:]
                 print(fail("[workflow stopped — back to prompt]"))
                 break
