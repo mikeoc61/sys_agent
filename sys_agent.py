@@ -8,7 +8,7 @@
 # ]
 # ///
 """
-sys_agent.py — Minimal multi-provider shell agent (OpenAI / Anthropic).
+sys_agent.py — Minimal multi-provider shell agent (OpenAI / Anthropic /Deepseek).
 
 Gathers host facts at startup, ships them to the selected model so command
 syntax matches the actual environment, then executes model-proposed commands
@@ -912,7 +912,14 @@ _DISK_SKIP_MOUNT_PREFIXES = (
 )
 
 # macOS-specific filtering. APFS exposes many synthetic firmlinks and
-# system snapshots; agent context wants user-visible volumes only.
+# system snapshots; agent context wants user-visible volumes only. The
+# /Volumes/.timemachine prefix is the automount root for Time Machine
+# destination snapshots: backing up to an attached volume mounts EVERY retained
+# snapshot there (`com.apple.TimeMachine.<ts>.backup@/dev/diskNsM`), which on a
+# host with regular backups is dozens of df entries that all report the
+# destination volume's identical totals and would otherwise bury the real
+# volumes. The destination volumes themselves (e.g. /Volumes/Backups of ...)
+# are NOT skipped — only the per-snapshot automounts under .timemachine.
 _DISK_SKIP_FSTYPES_DARWIN = {"devfs", "autofs", "lifs", "nullfs"}
 _DISK_SKIP_MOUNT_PREFIXES_DARWIN = (
     "/System/Volumes/VM",
@@ -923,6 +930,7 @@ _DISK_SKIP_MOUNT_PREFIXES_DARWIN = (
     "/System/Volumes/Hardware",
     "/System/Volumes/Recovery",
     "/private/var/vm",
+    "/Volumes/.timemachine",
 )
 
 
@@ -1353,6 +1361,23 @@ _DMI_VM_NEEDLES = (
     "xen", "amazon ec2", "parallels", "bochs",
 )
 
+# Cloud-provider classification from the same world-readable DMI fields VM
+# detection uses (sys_vendor/product_name). Lowercase needle -> provider label.
+# This is a CLASSIFICATION, not identity: it says "an EC2 instance", never which
+# instance or whose account. IMDS-derived fields (region, instance-id,
+# account-id, IAM role) are deliberately NOT gathered at startup — the model
+# queries the metadata service on demand for those.
+_DMI_CLOUD_NEEDLES = (
+    ("amazon ec2", "aws"),
+    ("google compute engine", "gcp"),
+    ("oraclecloud", "oci"),
+    ("digitalocean", "digitalocean"),
+)
+# Azure leaves no vendor/product needle — it sets sys_vendor to the generic
+# "Microsoft Corporation" (shared with on-prem Hyper-V), so the discriminator is
+# its fixed chassis_asset_tag. World-readable, no IMDS call.
+_DMI_AZURE_ASSET_TAG = "7783-7084-3265-9085-8269-3286-77"
+
 
 def _dmi_read(field: str) -> str:
     """Read a /sys/class/dmi/id field, filtering vendor placeholder junk.
@@ -1391,10 +1416,52 @@ def _vm_detected_linux(dmi_text: str) -> bool:
     return any(n in t for n in _DMI_VM_NEEDLES)
 
 
+def _cloud_provider_linux(dmi_text: str) -> str:
+    """Cloud platform from DMI, or '' if not a recognized cloud.
+
+    A classification (aws|gcp|azure|oci|digitalocean), not identity: it reveals
+    the platform, never the instance. Sources are world-readable DMI fields VM
+    detection also reads. Vendor/product needles are checked first (catches
+    Nitro EC2, where sys_vendor is "Amazon EC2", plus GCP/OCI/DigitalOcean).
+    Two fallbacks follow for hosts those needles miss:
+      - Xen-generation EC2 (t2/m4/...) reports sys_vendor "Xen" /
+        product_name "HVM domU" — no "amazon" in either — but stamps the BIOS
+        (bios_version e.g. "4.11.amazon", bios_vendor occasionally "Amazon").
+      - Azure sets the generic "Microsoft Corporation" vendor (shared with
+        on-prem Hyper-V), disambiguated by its fixed chassis_asset_tag.
+    Both fallback fields are world-readable and non-identifying. No IMDS call —
+    instance metadata (region, instance-id, IAM role) stays a live, on-demand
+    query, never a startup prior. /sys/hypervisor/uuid would also identify
+    Xen-EC2 but is a UUID-class file, so it is deliberately not read."""
+    t = dmi_text.lower()
+    for needle, label in _DMI_CLOUD_NEEDLES:
+        if needle in t:
+            return label
+    bios = f"{_dmi_read('bios_vendor')} {_dmi_read('bios_version')}".lower()
+    if "amazon" in bios:
+        return "aws"
+    if _dmi_read("chassis_asset_tag").startswith(_DMI_AZURE_ASSET_TAG):
+        return "azure"
+    return ""
+
+
 def _memory_gb_linux() -> float | None:
     """Total RAM from /proc/meminfo MemTotal, in GB (1 decimal)."""
     for line in _safe_read("/proc/meminfo", limit=4096).splitlines():
         if line.startswith("MemTotal:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                return round(int(parts[1]) * 1024 / (1024 ** 3), 1)
+    return None
+
+
+def _swap_gb_linux() -> float | None:
+    """Configured swap from /proc/meminfo SwapTotal, GB (1 decimal). None when
+    the field is absent; 0.0 is preserved (swap configured off) because it is a
+    meaningful signal — on a low-RAM host, no swap means memory pressure ends in
+    OOM-kills rather than swapping."""
+    for line in _safe_read("/proc/meminfo", limit=4096).splitlines():
+        if line.startswith("SwapTotal:"):
             parts = line.split()
             if len(parts) >= 2 and parts[1].isdigit():
                 return round(int(parts[1]) * 1024 / (1024 ** 3), 1)
@@ -1451,8 +1518,11 @@ def _hwmon_sensors_linux() -> list[str]:
 
 
 def _gather_hardware_facts() -> dict[str, Any]:
-    """Static hardware identity: vendor, model, platform_class, memory_gb
-    (plus cpu_model on macOS, where the model identifier alone is opaque).
+    """Static hardware identity: vendor, model, platform_class, memory_gb,
+    swap_gb, and cloud (plus cpu_model on macOS, where the model identifier
+    alone is opaque). `cloud` is the DMI-derived platform label
+    (aws|gcp|azure|oci|...) when the host is a recognized cloud instance,
+    absent otherwise.
 
     Fields are attached only when resolved, so key-presence is meaningful.
     `platform_class` is one of container|vm|sbc|laptop|desktop|server,
@@ -1486,6 +1556,12 @@ def _gather_hardware_facts() -> dict[str, Any]:
         mem = _memory_gb_linux()
         if mem:
             hw["memory_gb"] = mem
+        swap = _swap_gb_linux()
+        if swap is not None:
+            hw["swap_gb"] = swap
+        cloud = _cloud_provider_linux(f"{dmi_vendor} {dmi_product}")
+        if cloud:
+            hw["cloud"] = cloud
         if _container_detected():
             hw["platform_class"] = "container"
         elif _vm_detected_linux(f"{dmi_vendor} {dmi_product}"):
@@ -1649,6 +1725,40 @@ def _running_services_linux(limit: int, user: bool = False) -> list[str]:
     return units
 
 
+def _failed_services_linux(limit: int) -> list[str]:
+    """Failed systemd SYSTEM units via `systemctl list-units --state=failed`.
+
+    Empty on a healthy host, on non-systemd hosts, and when the system bus is
+    unreachable — the same conditions under which the running-unit probe returns
+    []. High-signal for turn-one triage: a unit named here is a failure the
+    model would otherwise spend a discovery pass finding. SYSTEM scope only;
+    user-scope failures are rarer and carry the same bus-availability caveat as
+    `running_services_user`, so they are left to an explicit
+    `systemctl --user --failed` when a user unit is in question. Script-stable
+    flags only, matching the running-unit probe.
+    """
+    if not shutil.which("systemctl"):
+        return []
+    argv = ["systemctl", "list-units", "--type=service", "--state=failed",
+            "--no-legend", "--plain", "--no-pager"]
+    try:
+        res = subprocess.run(
+            argv, capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if res.returncode != 0:
+        return []
+    units: list[str] = []
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if parts and parts[0].endswith(".service"):
+            units.append(parts[0])
+            if len(units) >= limit:
+                break
+    return units
+
+
 def _top_processes_by_rss_darwin(limit: int) -> list[dict[str, Any]]:
     """Top processes by aggregate RSS on macOS, via BSD `ps`.
 
@@ -1774,11 +1884,57 @@ def _gather_runtime_facts() -> dict[str, Any]:
             "running_services": _running_services_linux(RUNTIME_MAX_SERVICES),
             "running_services_user": _running_services_linux(
                 RUNTIME_MAX_SERVICES, user=True),
+            "failed_services": _failed_services_linux(RUNTIME_MAX_SERVICES),
             "top_processes": _top_processes_by_rss_linux(RUNTIME_TOP_PROCESSES),
         }
     if system == "Darwin":
         return _gather_runtime_facts_darwin()
     return {}
+
+
+def _boot_epoch() -> float | None:
+    """Epoch seconds of last boot, or None. Linux: now - /proc/uptime[0].
+    macOS: the 'sec' field of `sysctl -n kern.boottime`. Unprivileged on both."""
+    system = platform.system()
+    if system == "Linux":
+        data = _safe_read("/proc/uptime", limit=64).split()
+        if data:
+            try:
+                return time.time() - float(data[0])
+            except ValueError:
+                return None
+        return None
+    if system == "Darwin":
+        m = re.search(r"sec\s*=\s*(\d+)", _sysctl_value("kern.boottime"))
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def _gather_time_facts() -> dict[str, Any]:
+    """Stable temporal orientation: timezone + last-boot time + uptime_hours.
+    Unprivileged and cross-platform (boot time from /proc/uptime on Linux,
+    kern.boottime on macOS). Keys attached only when resolved. Lets the model
+    interpret log timestamps and gauge reboot recency on turn one without a
+    probe; current wall-clock is still a live `date`/`uptime` away."""
+    out: dict[str, Any] = {}
+    now = time.localtime()
+    tzname = now.tm_zone or (
+        time.tzname[1] if now.tm_isdst > 0 else time.tzname[0])
+    off = now.tm_gmtoff
+    if tzname:
+        if off is not None:
+            sign = "+" if off >= 0 else "-"
+            hh, mm = divmod(abs(off) // 60, 60)
+            out["timezone"] = f"{tzname} (UTC{sign}{hh:02d}:{mm:02d})"
+        else:
+            out["timezone"] = tzname
+    boot = _boot_epoch()
+    if boot is not None:
+        out["boot_time"] = datetime.datetime.fromtimestamp(
+            boot).isoformat(timespec="seconds")
+        out["uptime_hours"] = round((time.time() - boot) / 3600, 1)
+    return out
 
 
 def gather_host_facts() -> dict[str, Any]:
@@ -1839,6 +1995,11 @@ def gather_host_facts() -> dict[str, Any]:
     facts["container_tools"] = _which_many(["docker", "podman", "kubectl"])
     facts["virtual_env"] = os.environ.get("VIRTUAL_ENV", "")
 
+    # Stable temporal orientation: timezone, last boot, uptime. Only resolved
+    # keys are attached. Lets the model read log timestamps and gauge reboot
+    # recency on turn one; live wall-clock is still a `date`/`uptime` away.
+    facts.update(_gather_time_facts())
+
     # Static hardware identity — what the host IS (Pi 5 / MacBook / VM /
     # rack server), steering which telemetry questions are even answerable.
     hardware = _gather_hardware_facts()
@@ -1874,6 +2035,8 @@ def gather_host_facts() -> dict[str, Any]:
         facts["running_services"] = runtime["running_services"]
     if runtime.get("running_services_user"):
         facts["running_services_user"] = runtime["running_services_user"]
+    if runtime.get("failed_services"):
+        facts["failed_services"] = runtime["failed_services"]
     if runtime.get("top_processes"):
         facts["top_processes"] = runtime["top_processes"]
 
@@ -2939,15 +3102,45 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           the next step. If the next step is another command, issue it as a
           run_command call in the same turn rather than describing it or
           asking whether to proceed.
-        - `running_services` and `top_processes` (when present) are a snapshot
-          taken at startup, not live state: a process hot at launch may be
-          idle now, and the service list is from startup. Use them to get real
-          unit/process names right the first time (avoid guessing) and for
-          orientation. They are NOT a substitute for measurement: any question
-          about current state (memory/disk/CPU pressure, load, free space,
-          what is running now) must be answered from a live command this turn
-          (`free -h`, `df -h`, `uptime`, `ps`/`top`), not from the snapshot.
-          `/facts refresh` re-probes if they look stale.
+        - `running_services`, `failed_services`, and `top_processes` (when
+          present) are a snapshot taken at startup, not live state: a process
+          hot at launch may be idle now, and the service lists are from startup.
+          Use them to get real unit/process names right the first time (avoid
+          guessing) and for orientation. They are NOT a substitute for
+          measurement: any question about current state (memory/disk/CPU
+          pressure, load, free space, what is running now) must be answered from
+          a live command this turn (`free -h`, `df -h`, `uptime`, `ps`/`top`),
+          not from the snapshot. `/facts refresh` re-probes if they look stale.
+        - `failed_services` (when present) are SYSTEM units in a failed state at
+          probe time — high-signal for triage. Confirm a unit is still failed
+          and read the cause with `systemctl status <unit>` and
+          `journalctl -u <unit> -n 100 --no-pager` before acting, since a unit
+          may have been restarted since startup. An empty/absent list is not a
+          guarantee of health (user-scope failures are not probed; check
+          `systemctl --user --failed` when a user unit is suspect).
+        - `timezone`, `boot_time`, and `uptime_hours` are stable orientation
+          facts captured at startup: use them to interpret log timestamps and
+          gauge reboot recency without a probe. For current wall-clock or live
+          uptime, still run `date` / `uptime`.
+        - `hardware.swap_gb` is configured swap; `0` means none. On a low-RAM
+          host, zero swap means memory pressure ends in OOM-kills rather than
+          swapping — weigh that when diagnosing killed or restarting processes.
+        - `hardware.cloud` (when present, e.g. aws|gcp|azure|oci) classifies the
+          cloud platform from DMI — a platform fact, not identity. Use it to
+          pick strategy: cloud VMs have network-attached storage (a full root
+          disk is a volume resize via the provider, not local `parted` on
+          physical media) and provider-level firewalling (security groups /
+          NACLs) layered on top of host `iptables`/`ufw`, so a connectivity or
+          capacity question may have its real answer at the provider, not on the
+          host. Instance metadata (region, AZ, instance-type, instance-id, IAM
+          role) is deliberately NOT pre-loaded: query the metadata service on
+          demand only when a task needs it — AWS IMDS at 169.254.169.254 (IMDSv2
+          requires a token first: PUT /latest/api/token with
+          `X-aws-ec2-metadata-token-ttl-seconds`, then pass it back in
+          `X-aws-ec2-metadata-token`), GCP at metadata.google.internal with
+          header `Metadata-Flavor: Google`. Treat instance-id, account-id, and
+          IAM role as sensitive: fetch only when the task requires it, and do
+          not volunteer them.
         - Service scope and logs (systemd hosts). Units are split by manager:
           `running_services` are SYSTEM units (`systemctl status <unit>`,
           `systemctl restart <unit>`, logs via `journalctl -u <unit>`);

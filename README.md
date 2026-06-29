@@ -53,9 +53,12 @@ startup so the returned command syntax is properly formatted for the host enviro
   See [Runtime snapshot](#runtime-snapshot-services-and-processes).
 - **Hardware identity**: a static `hardware` facts block — vendor, model
   string, `platform_class` (`sbc`/`laptop`/`desktop`/`server`/`vm`/
-  `container`), total RAM — resolved from the device tree, DMI, or `sysctl`,
-  so the model knows it is on a Pi 5 vs a MacBook vs a VM and which telemetry
-  classes are plausible (PMIC rails, battery, IPMI). Paired with prompt rules
+  `container`), total RAM and swap, plus a `cloud` label
+  (`aws`/`gcp`/`azure`/`oci`/…) when DMI identifies a cloud instance —
+  resolved from the device tree, DMI, or `sysctl`, so the model knows it is on
+  a Pi 5 vs a MacBook vs an EC2 VM and which telemetry classes and command
+  strategies are plausible (PMIC rails, battery, IPMI, provider metadata).
+  Paired with prompt rules
   that forbid unverified "that can't be measured here" claims. See
   [Hardware identity](#hardware-identity).
 - **Approval-gated execution**: every proposed command is shown with its
@@ -402,7 +405,7 @@ system prompt.
 Alongside the static host facts, startup probes capture a point-in-time
 snapshot of what the machine is actually running, so the model uses real
 service and process names on the first turn instead of burning a round trip to
-discover them. Three keys are injected into the facts when non-empty:
+discover them. Four keys are injected into the facts when non-empty:
 
 - **`running_services`** — the active services. On Linux, the running `systemd`
   service units (`systemctl list-units --type=service --state=running`); empty
@@ -423,6 +426,17 @@ discover them. Three keys are injected into the facts when non-empty:
   <unit>` for these (no sudo), `systemctl status` / `journalctl -u` for the
   system list — and that `journalctl` is the log source for a service rather
   than hunting `/var/log`.
+- **`failed_services`** (Linux/systemd) — SYSTEM service units in a **failed**
+  state at probe time (`systemctl list-units --type=service --state=failed`),
+  empty on a healthy host and under the same conditions that empty
+  `running_services` (no systemd, unreachable bus). High-signal for turn-one
+  triage: a unit named here is a failure the model would otherwise spend a
+  discovery pass finding. The system prompt has it confirm the unit is still
+  failed and read the cause (`systemctl status <unit>`, `journalctl -u <unit>`)
+  before acting, since a unit may have been restarted since startup. SYSTEM
+  scope only — user-scope failures carry the same bus-availability caveat as
+  `running_services_user` and are left to an explicit `systemctl --user
+  --failed`.
 - **`top_processes`** — the top processes by resident memory (RSS), 10 by
   default (`SYS_TOP_PROCESSES`). Processes sharing a name are aggregated into a
   single entry with summed RSS and an instance `count`, so a worker pool reads
@@ -458,7 +472,21 @@ which OS it runs — and injects it as a `hardware` block:
 "hardware": {
   "model": "Raspberry Pi 5 Model B Rev 1.0",
   "platform_class": "sbc",
-  "memory_gb": 7.9
+  "memory_gb": 7.9,
+  "swap_gb": 0.2
+}
+```
+
+On a recognized cloud instance the block also carries a `cloud` label:
+
+```json
+"hardware": {
+  "model": "t3.micro",
+  "vendor": "Amazon EC2",
+  "platform_class": "vm",
+  "memory_gb": 0.9,
+  "swap_gb": 0.0,
+  "cloud": "aws"
 }
 ```
 
@@ -468,6 +496,8 @@ which OS it runs — and injects it as a `hardware` block:
 | `vendor` | DMI `sys_vendor` | `Apple` |
 | `platform_class` | see below | battery in `pmset -g batt` → `laptop`, else `desktop` |
 | `memory_gb` | `/proc/meminfo` MemTotal | `sysctl hw.memsize` |
+| `swap_gb` | `/proc/meminfo` SwapTotal (`0` = none) | — |
+| `cloud` | DMI vendor/product needle, else `bios_version`/`bios_vendor` (Xen-gen EC2), else Azure `chassis_asset_tag` | — |
 | `cpu_model` | — | `machdep.cpu.brand_string` |
 
 `platform_class` is one of `container | vm | sbc | laptop | desktop | server`,
@@ -498,13 +528,48 @@ The default facts also enumerate `/sys/class/hwmon/*/name` on Linux as
 from sysfs, not a curated map — so the sensor channels that exist on the
 host are listed in context rather than guessed.
 
+**Cloud classification.** When DMI identifies a recognized cloud platform, the
+hardware block carries a `cloud` label (`aws | gcp | azure | oci |
+digitalocean`). It is a *classification*, not identity — it says "an EC2
+instance," never which instance or whose account — derived from the same
+world-readable DMI fields VM detection already reads (vendor/product needles,
+with Azure's fixed `chassis_asset_tag` as its discriminator, since Azure shares
+the generic "Microsoft Corporation" vendor with on-prem Hyper-V). Nitro-
+generation EC2 is caught by its `sys_vendor` of "Amazon EC2"; Xen-generation
+instances (t2/m4/…) report `sys_vendor` "Xen" / `product_name` "HVM domU" with
+no "amazon" string, so they fall back to the BIOS, which stamps
+`bios_version` "4.11.amazon" (or `bios_vendor` "Amazon"). The world-readable
+`/sys/hypervisor/uuid` would also identify Xen-EC2 but is a UUID-class file, so
+it is deliberately left unread. No metadata service is contacted at startup. It steers command strategy: on a cloud VM,
+storage is network-attached (a full root disk is a volume resize via the
+provider, not local `parted`) and connectivity is governed by provider-level
+security groups / NACLs on top of host `iptables`/`ufw`, so a capacity or
+reachability question may have its real answer at the provider. Instance
+metadata (region, AZ, instance-type, instance-id, IAM role) is deliberately
+**not** pre-loaded; the system prompt has the model query IMDS
+(`169.254.169.254`, IMDSv2 token flow) or GCP's `metadata.google.internal`
+on demand only when a task needs it, and treat instance-id, account-id, and
+IAM role as sensitive.
+
+**Temporal orientation.** The default facts include `timezone`,
+`boot_time` (ISO-8601 local), and `uptime_hours`, resolved from `/proc/uptime`
+on Linux and `kern.boottime` on macOS. These are stable startup facts — the
+model uses them to interpret log timestamps and gauge reboot recency without a
+probe, while current wall-clock and live uptime are still a `date`/`uptime`
+away. `swap_gb` rounds out the memory picture: a value of `0` means no swap is
+configured, so on a low-RAM host memory pressure ends in OOM-kills rather than
+swapping — context the model weighs when diagnosing killed processes.
+
 ### SMART over USB bridges
 
 The injected host facts include a mount-first disk topology under `disks`
 (mounts, sizes, fstype, and a `device` sub-record per physical disk with model,
-transport, and rotational flag). For USB-attached disks, two extra fields are
-resolved at startup so the model can read SMART/health without a probing round
-trip:
+transport, and rotational flag). On macOS, Time Machine snapshot automounts
+under `/Volumes/.timemachine/` are filtered out — a host with regular local
+backups mounts dozens of them, all reporting the destination volume's identical
+totals — while the backup destination volumes themselves are kept. For
+USB-attached disks, two extra fields are resolved at startup so the model can
+read SMART/health without a probing round trip:
 
 - **`usb_ids`** — the USB bridge's `vendor:product` (e.g. `04e8:4001`),
   resolved at runtime from `udevadm` (sysfs fallback when udevadm is absent).
