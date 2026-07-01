@@ -112,9 +112,18 @@ from typing import Any
 # SYS_OPENAI_MODEL=gpt-4o-mini (or use /model) if cost dominates for you.
 DEFAULT_OPENAI_MODEL = os.environ.get("SYS_OPENAI_MODEL", "gpt-5.4-mini")
 
-# Anthropic options (verified May 2026):
+# Anthropic options (verified Jul 2026):
 #   claude-haiku-4-5-20251001  — fast/cheap, solid tool use, supports thinking
-#   claude-sonnet-4-6          — better reasoning, mid-tier price
+#   claude-sonnet-5            — current mid-tier, drop-in replacement for
+#                                Sonnet 4.6 at the same per-token price; new
+#                                tokenizer produces ~30% more tokens for the
+#                                same text (see CONTEXT_WINDOWS note below)
+#   claude-sonnet-4-6          — deprecated in this project (not by Anthropic
+#                                — it remains Active upstream, tentative
+#                                retirement not before Feb 17, 2027). Left out
+#                                of PROVIDER_MODELS below; still usable via
+#                                /model claude-sonnet-4-6 through the
+#                                prefix-fallback path (warns, then switches).
 #   claude-opus-4-7            — prior flagship, premium ($5/$25 per 1M tok)
 #   claude-opus-4-8            — current flagship, premium ($5/$25), adaptive
 #                                thinking; opt-in via /thinking, not the default
@@ -143,16 +152,22 @@ DEFAULT_MODELS: dict[str, str] = {
 # SDK pointed here (see DeepSeekProvider), so no extra dependency is needed.
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
-# Known context windows (May 2026). Used for the context-% display; unknown
-# models fall back to printing absolute token counts.
+# Known context windows (Jul 2026). Used for the context-% display; unknown
+# models fall back to printing absolute token counts. Window sizes are in
+# tokens, not text volume — Sonnet 5's tokenizer produces ~30% more tokens
+# for the same input text than Sonnet 4.6's, so the 1M-token window covers
+# less text even though the number is identical.
 CONTEXT_WINDOWS: dict[str, int] = {
     # OpenAI
     "gpt-4.1-nano":  1_000_000,
     "gpt-4o-mini":     128_000,
     "gpt-5.4-mini":    400_000,
-    # Anthropic — Opus 4.6/4.7/4.8 and Sonnet 4.6 ship the full 1M window at
-    # standard pricing; Haiku 4.5 remains 200K.
+    # Anthropic — Opus 4.6/4.7/4.8 and Sonnet 4.6/5 ship the full 1M window at
+    # standard pricing; Haiku 4.5 remains 200K. Sonnet 4.6 entry kept even
+    # though it's dropped from PROVIDER_MODELS below, so /model still shows
+    # correct context-% if someone switches to it manually.
     "claude-haiku-4-5-20251001": 200_000,
+    "claude-sonnet-5":         1_000_000,
     "claude-sonnet-4-6":       1_000_000,
     "claude-opus-4-7":         1_000_000,
     "claude-opus-4-8":         1_000_000,
@@ -174,7 +189,7 @@ PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
     ),
     "anthropic": (
         "claude-haiku-4-5-20251001",
-        "claude-sonnet-4-6",
+        "claude-sonnet-5",
         "claude-opus-4-7",
         "claude-opus-4-8",
     ),
@@ -265,6 +280,18 @@ def _thinking_mode(model: str) -> str:
     if "haiku-4-5" in model:
         return "enabled"
     return "adaptive"
+
+# Models where adaptive thinking runs by default when no `thinking` field is
+# sent at all — a Sonnet-5-specific behavior change (Sonnet 4.6, Opus 4.6/
+# 4.7/4.8 all still run without thinking absent the field). Omitting the
+# field on these models would silently defeat ANTHROPIC_THINKING_DEFAULT=off
+# and its whole rationale (thinking tokens are output-billed and unwanted for
+# routine commands), so chat() sends an explicit thinking:{"type":"disabled"}
+# for these models when the session has thinking turned off.
+_ADAPTIVE_DEFAULT_ON_MODELS = frozenset({"claude-sonnet-5"})
+
+def _thinking_default_on(model: str) -> bool:
+    return model in _ADAPTIVE_DEFAULT_ON_MODELS
 
 # SDK-level retry count. Both the openai and anthropic SDKs implement
 # exponential backoff with jitter and honor Retry-After headers; they retry
@@ -2638,6 +2665,11 @@ class AnthropicProvider(Provider):
                 kwargs["extra_headers"] = {
                     "anthropic-beta": ANTHROPIC_INTERLEAVED_BETA
                 }
+        elif _thinking_default_on(self.model):
+            # Sonnet 5 runs adaptive thinking by default when no `thinking`
+            # field is present. Say so explicitly to honor /thinking off and
+            # the off-by-default cost rationale above.
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         if thinking:
             # A thinking turn raises max_tokens high enough that the SDK's
             # non-streaming guard refuses the request (it estimates worst-case

@@ -180,7 +180,7 @@ DEEPSEEK_API_KEY=sk-...
 # Optional overrides
 SYS_PROVIDER=anthropic
 SYS_OPENAI_MODEL=gpt-4o-mini
-SYS_ANTHROPIC_MODEL=claude-sonnet-4-6
+SYS_ANTHROPIC_MODEL=claude-sonnet-5
 SYS_DEEPSEEK_MODEL=deepseek-v4-pro
 ```
 
@@ -318,7 +318,7 @@ Provider and model selection are no longer startup-only. During a session:
 /provider deepseek
 /model
 /model gpt-5.4-mini
-/model claude-sonnet-4-6
+/model claude-sonnet-5
 /model deepseek-v4-pro
 ```
 
