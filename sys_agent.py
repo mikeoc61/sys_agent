@@ -2003,6 +2003,10 @@ def gather_host_facts() -> dict[str, Any]:
         "curl", "wget", "git", "jq", "rsync", "tmux", "screen", "tree",
         # containers / VMs
         "docker", "podman", "kubectl",
+        # cloud / infra automation
+        "aws", "gcloud", "az", "terraform", "ansible",
+        # remote access / crypto
+        "ssh", "scp", "openssl",
         # python ecosystem
         "python3", "pip", "pip3", "uv", "poetry", "pipx",
         # disk / filesystem inspection
