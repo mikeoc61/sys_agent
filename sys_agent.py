@@ -1938,6 +1938,70 @@ def _boot_epoch() -> float | None:
     return None
 
 
+def _gather_network_interfaces() -> dict[str, str]:
+    """Stable interface inventory: name -> kind (wifi|ethernet|thunderbolt|
+    bridge|bluetooth|other). Names and roles are stable per host; IPs, MACs,
+    SSIDs, and link state are deliberately excluded (volatile and/or
+    identifying) — live network state is a command away. Linux keeps only
+    device-backed interfaces (a `device` entry under /sys/class/net/<if>),
+    which naturally drops lo/veth/docker/bridge noise; wireless is detected
+    by the `wireless` subdir. Darwin parses `networksetup
+    -listallhardwareports` (stock, unprivileged) and classifies from the
+    Hardware Port label — "Thunderbolt Ethernet" is a NIC, so the ethernet
+    test precedes the thunderbolt test. Returns {} on any failure."""
+    system = platform.system()
+    out: dict[str, str] = {}
+    if system == "Linux":
+        base = "/sys/class/net"
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            return {}
+        for name in names:
+            path = os.path.join(base, name)
+            if not os.path.exists(os.path.join(path, "device")):
+                continue
+            wireless = os.path.isdir(os.path.join(path, "wireless"))
+            out[name] = "wifi" if wireless else "ethernet"
+        return out
+    if system == "Darwin":
+        if not shutil.which("networksetup"):
+            return {}
+        try:
+            res = subprocess.run(
+                ["networksetup", "-listallhardwareports"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        if res.returncode != 0:
+            return {}
+        port = ""
+        for line in res.stdout.splitlines():
+            if line.startswith("Hardware Port:"):
+                port = line.partition(":")[2].strip()
+            elif line.startswith("Device:") and port:
+                dev = line.partition(":")[2].strip()
+                label = port.lower()
+                if "wi-fi" in label or "airport" in label:
+                    kind = "wifi"
+                elif "bluetooth" in label:
+                    kind = "bluetooth"
+                elif "bridge" in label:
+                    kind = "bridge"
+                elif "ethernet" in label:
+                    kind = "ethernet"
+                elif "thunderbolt" in label:
+                    kind = "thunderbolt"
+                else:
+                    kind = "other"
+                if dev:
+                    out[dev] = kind
+                port = ""
+        return out
+    return {}
+
+
 def _gather_time_facts() -> dict[str, Any]:
     """Stable temporal orientation: timezone + last-boot time + uptime_hours.
     Unprivileged and cross-platform (boot time from /proc/uptime on Linux,
@@ -2025,6 +2089,12 @@ def gather_host_facts() -> dict[str, Any]:
     facts["init_tools"] = _which_many(["systemctl", "service", "launchctl", "rc-service"])
     facts["container_tools"] = _which_many(["docker", "podman", "kubectl"])
     facts["virtual_env"] = os.environ.get("VIRTUAL_ENV", "")
+
+    # Stable interface inventory (name -> kind). Answers "which interface is
+    # Wi-Fi?" on turn one; IPs/MACs/link-state deliberately excluded.
+    interfaces = _gather_network_interfaces()
+    if interfaces:
+        facts["network_interfaces"] = interfaces
 
     # Stable temporal orientation: timezone, last boot, uptime. Only resolved
     # keys are attached. Lets the model read log timestamps and gauge reboot
@@ -3232,6 +3302,24 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           voltage — a usable live power-draw measurement. When the hardware
           model says Raspberry Pi and `vcgencmd` is in `available_tools`,
           prefer measuring with it over inferring power/thermal state.
+        - `network_interfaces` (when present) maps interface name to kind
+          (wifi/ethernet/...). Names and roles are stable; use them to pick
+          the right interface on turn one instead of probing. IPs, MACs, and
+          link state are deliberately NOT included — read live state with
+          `ip addr` / `ifconfig <if>` when a task needs it.
+        - On Darwin, Wi-Fi identifiers (SSID, BSSID, NetworkID) are
+          location-privacy redacted for CLI tools without a location
+          entitlement: `system_profiler`, `wdutil info`, and
+          `ipconfig getsummary <if>` all print `<redacted>`. Do NOT iterate
+          through tools expecting one to escape redaction — none do. If a
+          task needs to know WHICH network the host is on, state the
+          limitation and ask the user. The redaction covers ONLY those
+          identifiers: `ipconfig getsummary <if>` is otherwise the one-shot
+          L3 diagnostic on Darwin — IPv4/IPv6 addresses, router, DHCP
+          server and lease times, subnet, DNS, link status, and Wi-Fi
+          security mode (e.g. WPA3_SAE) in a single unprivileged read.
+          Prefer it over chaining `route -n get default` / `netstat -rn` /
+          `ifconfig` probes.
         - Never propose commands that wipe disks, format filesystems, or
           irrecoverably destroy data. If such a step is genuinely required,
           flag it in plain text and ask the user to run it manually.

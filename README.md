@@ -58,6 +58,12 @@ startup so the returned command syntax is properly formatted for the host enviro
   resolved from the device tree, DMI, or `sysctl`, so the model knows it is on
   a Pi 5 vs a MacBook vs an EC2 VM and which telemetry classes and command
   strategies are plausible (PMIC rails, battery, IPMI, provider metadata).
+- **Network interface inventory**: a `network_interfaces` map of interface
+  name to kind (`wifi`/`ethernet`/`thunderbolt`/`bridge`/…), from
+  `/sys/class/net` on Linux and `networksetup -listallhardwareports` on
+  macOS, so the model picks the right interface on turn one. IPs, MACs,
+  SSIDs, and link state are deliberately excluded — stable identity in the
+  facts, live state via commands.
   Paired with prompt rules
   that forbid unverified "that can't be measured here" claims. See
   [Hardware identity](#hardware-identity).
@@ -559,6 +565,25 @@ probe, while current wall-clock and live uptime are still a `date`/`uptime`
 away. `swap_gb` rounds out the memory picture: a value of `0` means no swap is
 configured, so on a low-RAM host memory pressure ends in OOM-kills rather than
 swapping — context the model weighs when diagnosing killed processes.
+
+**Network interfaces.** `network_interfaces` maps interface name to kind
+(`wifi`/`ethernet`/`thunderbolt`/`bridge`/`bluetooth`). On Linux only
+device-backed interfaces are listed (anything with a `device` entry under
+`/sys/class/net/<if>`), which naturally drops loopback, veth, docker, and
+bridge noise; wireless is detected via the `wireless` sysfs subdir. On macOS
+the map is parsed from `networksetup -listallhardwareports`. Names and roles
+are stable per host; IPs, MAC addresses, SSIDs, and link state are
+deliberately excluded (volatile and/or identifying) — live network state is
+read with `ip addr` / `ifconfig` when a task needs it. A companion system
+prompt rule tells the model that on modern macOS the Wi-Fi identifiers
+(SSID, BSSID, NetworkID) are location-privacy redacted for every CLI path
+(`system_profiler`, `wdutil info`, `ipconfig getsummary`), so it states the
+limitation and asks the user instead of burning turns iterating tools that
+all print `<redacted>` — and that the redaction covers only those
+identifiers: `ipconfig getsummary <if>` remains the one-shot unprivileged
+L3 diagnostic (addresses, router, DHCP lease, DNS, link status, Wi-Fi
+security mode), preferred over chaining `route`/`netstat`/`ifconfig`
+probes.
 
 ### SMART over USB bridges
 
