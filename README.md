@@ -198,7 +198,7 @@ SYS_DEEPSEEK_MODEL=deepseek-v4-pro
 | `ANTHROPIC_API_KEY` | Anthropic auth (one of the three required) | — |
 | `DEEPSEEK_API_KEY` | DeepSeek auth (one of the three required) | — |
 | `SYS_PROVIDER` | Skip provider prompt: `openai`, `anthropic`, or `deepseek` | (prompt) |
-| `SYS_OPENAI_MODEL` | OpenAI model string (default favors reliable tool use; set `gpt-4o-mini` for lower cost) | `gpt-5.4-mini` |
+| `SYS_OPENAI_MODEL` | OpenAI model string (default favors reliable tool use; set `gpt-4o-mini` for lower cost, `gpt-5.6-luna`/`gpt-5.6-terra` for the newest family — see note under Extended thinking) | `gpt-5.4-mini` |
 | `SYS_ANTHROPIC_MODEL` | Anthropic model string | `claude-haiku-4-5-20251001` |
 | `SYS_DEEPSEEK_MODEL` | DeepSeek model string | `deepseek-v4-flash` |
 | `SYS_THINKING` | Startup state for extended thinking: `on` / `off` (Anthropic / DeepSeek) | `off` |
@@ -677,6 +677,14 @@ automatically:
   assistant message or the next request 400s. sys_agent handles this internally
   by preserving `reasoning_content` on each assistant turn, so multi-turn tool
   use just works.
+- **OpenAI (GPT-5.6 Sol / Terra / Luna)**: no thinking path in this agent.
+  GPT-5.6 models apply a server-side default reasoning effort, and OpenAI's
+  Chat Completions endpoint rejects function tools combined with any effort
+  other than `none` (400 `invalid_request_error`). sys_agent therefore forces
+  `reasoning_effort="none"` for these models automatically — they run as
+  non-reasoning models here, and `/thinking` / `/effort` have no effect on
+  them. Tools + reasoning on GPT-5.6 requires OpenAI's Responses API, which
+  this Chat Completions-based agent does not use.
 
 Behavior, all paths:
 

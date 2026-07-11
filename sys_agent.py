@@ -23,7 +23,7 @@ Env:      OPENAI_API_KEY            (one of these is required)
           ANTHROPIC_API_KEY
           DEEPSEEK_API_KEY
           SYS_PROVIDER               (skip prompt: openai|anthropic|deepseek)
-          SYS_OPENAI_MODEL           (default gpt-4o-mini)
+          SYS_OPENAI_MODEL           (default gpt-5.4-mini)
           SYS_ANTHROPIC_MODEL        (default claude-haiku-4-5-20251001)
           SYS_DEEPSEEK_MODEL         (default deepseek-v4-flash)
           SYS_ENV_FILE               (path to env file; overrides search)
@@ -107,6 +107,16 @@ from typing import Any
 #                   like me to check…?") instead of emitting the run_command
 #                   call, stalling multi-step investigations.
 #   gpt-5.4-mini  — $0.75/$4.50, newer reasoning, best tool use of the tier.
+#   gpt-5.6-luna  — $1/$6, cheapest of the GPT-5.6 family (Sol/Terra/Luna
+#                   tiers, GA 2026-07-09; no -mini tier this generation).
+#   gpt-5.6-terra — $2.50/$15, mid tier, GPT-5.5-class performance.
+# GPT-5.6 caveat: these models apply a server-side default reasoning effort,
+# and /v1/chat/completions rejects function tools combined with any effort
+# other than "none" (400 invalid_request_error). This agent therefore forces
+# reasoning_effort="none" for them (see _OPENAI_EFFORT_NONE_PREFIXES); they
+# run as non-reasoning models here. Tools + reasoning on GPT-5.6 requires the
+# Responses API, which this single-file Chat Completions provider does not
+# use — revisit only if no-reasoning tool quality proves insufficient.
 # Default is gpt-5.4-mini: for an agent that proposes and executes commands,
 # reliable tool-calling outweighs gpt-4o-mini's lower token price. Set
 # SYS_OPENAI_MODEL=gpt-4o-mini (or use /model) if cost dominates for you.
@@ -162,6 +172,12 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-4.1-nano":  1_000_000,
     "gpt-4o-mini":     128_000,
     "gpt-5.4-mini":    400_000,
+    # GPT-5.6 — Sol/Terra/Luna all ship 1.05M context / 128K max output.
+    # Sol listed here but not in PROVIDER_MODELS ($5/$30 is the wrong tier
+    # for this tool); reachable via the prefix-fallback path if wanted.
+    "gpt-5.6-luna":  1_050_000,
+    "gpt-5.6-terra": 1_050_000,
+    "gpt-5.6-sol":   1_050_000,
     # Anthropic — Opus 4.6/4.7/4.8 and Sonnet 4.6/5 ship the full 1M window at
     # standard pricing; Haiku 4.5 remains 200K. Sonnet 4.6 entry kept even
     # though it's dropped from PROVIDER_MODELS below, so /model still shows
@@ -186,6 +202,8 @@ PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
         "gpt-4o-mini",
         "gpt-4.1-nano",
         "gpt-5.4-mini",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
     ),
     "anthropic": (
         "claude-haiku-4-5-20251001",
@@ -207,6 +225,14 @@ PROVIDER_MODEL_PREFIXES: dict[str, tuple[str, ...]] = {
     "anthropic": ("claude-",),
     "deepseek": ("deepseek-",),
 }
+
+# OpenAI model-name prefixes that must be sent reasoning_effort="none" on
+# /v1/chat/completions. GPT-5.6 applies a server-side default reasoning
+# effort, and Chat Completions rejects function tools unless effort is
+# explicitly "none" (the tools+reasoning combination is Responses-API-only
+# for these models). Sent via extra_body so the pinned openai SDK need not
+# recognize the parameter — same defensive pattern as the DeepSeek path.
+_OPENAI_EFFORT_NONE_PREFIXES: tuple[str, ...] = ("gpt-5.6",)
 
 # =============================================================================
 # RUNTIME TUNING
@@ -2529,12 +2555,21 @@ class OpenAIProvider(Provider):
         # `thinking`/`effort` are Anthropic-only; ignored here so the call site
         # can pass them uniformly. OpenAI reasoning models use a different
         # mechanism.
-        resp = self.client.chat.completions.create(
+        kwargs: dict[str, Any] = dict(
             model=self.model,
             messages=messages,
             tools=OPENAI_TOOLS,
             tool_choice="auto",
         )
+        # GPT-5.6 on Chat Completions: server-side default reasoning effort
+        # is incompatible with function tools; force it off or every turn
+        # 400s. Guarded on provider name because DeepSeekProvider inherits
+        # this class and manages reasoning_effort itself.
+        if self.name == "openai" and self.model.startswith(
+            _OPENAI_EFFORT_NONE_PREFIXES
+        ):
+            kwargs["extra_body"] = {"reasoning_effort": "none"}
+        resp = self.client.chat.completions.create(**kwargs)
         msg = resp.choices[0].message
         calls: list[ToolCall] = []
         for tc in (msg.tool_calls or []):
