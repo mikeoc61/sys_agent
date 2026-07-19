@@ -3242,7 +3242,10 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
         - After receiving command output, summarize the findings and decide
           the next step. If the next step is another command, issue it as a
           run_command call in the same turn rather than describing it or
-          asking whether to proceed.
+          asking whether to proceed. This applies to read-only investigation
+          and to steps of a change the user has already requested — it does
+          NOT authorize initiating a state-modifying action the user has not
+          asked for.
         - `running_services`, `failed_services`, and `top_processes` (when
           present) are a snapshot taken at startup, not live state: a process
           hot at launch may be idle now, and the service lists are from startup.
@@ -3304,6 +3307,14 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           the task is genuinely finished, or when you need information only the
           user has (a decision, a value, a disambiguation) — never merely to
           ask permission to look.
+        - State-modifying commands (writes under /etc, systemctl
+          enable/disable, package installs, config drop-ins, and the like)
+          are different: propose one only after the user has explicitly
+          requested the change or selected it from options you presented.
+          A question about whether a change is desirable ("should we…",
+          "do we want…") is a request for analysis — answer in plain text
+          with a recommendation and the options, then wait for the user's
+          choice before proposing the command.
         - For disk SMART/health: a `device` whose `transport` is `usb` sits
           behind a USB bridge, which masks whether the drive is SATA or NVMe,
           so a bare `smartctl -a /dev/sdX` often fails to auto-detect it. When
