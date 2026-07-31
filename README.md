@@ -58,12 +58,6 @@ startup so the returned command syntax is properly formatted for the host enviro
   resolved from the device tree, DMI, or `sysctl`, so the model knows it is on
   a Pi 5 vs a MacBook vs an EC2 VM and which telemetry classes and command
   strategies are plausible (PMIC rails, battery, IPMI, provider metadata).
-- **Network interface inventory**: a `network_interfaces` map of interface
-  name to kind (`wifi`/`ethernet`/`thunderbolt`/`bridge`/…), from
-  `/sys/class/net` on Linux and `networksetup -listallhardwareports` on
-  macOS, so the model picks the right interface on turn one. IPs, MACs,
-  SSIDs, and link state are deliberately excluded — stable identity in the
-  facts, live state via commands.
   Paired with prompt rules
   that forbid unverified "that can't be measured here" claims. See
   [Hardware identity](#hardware-identity).
@@ -186,7 +180,7 @@ DEEPSEEK_API_KEY=sk-...
 # Optional overrides
 SYS_PROVIDER=anthropic
 SYS_OPENAI_MODEL=gpt-4o-mini
-SYS_ANTHROPIC_MODEL=claude-sonnet-5
+SYS_ANTHROPIC_MODEL=claude-sonnet-4-6
 SYS_DEEPSEEK_MODEL=deepseek-v4-pro
 ```
 
@@ -198,7 +192,7 @@ SYS_DEEPSEEK_MODEL=deepseek-v4-pro
 | `ANTHROPIC_API_KEY` | Anthropic auth (one of the three required) | — |
 | `DEEPSEEK_API_KEY` | DeepSeek auth (one of the three required) | — |
 | `SYS_PROVIDER` | Skip provider prompt: `openai`, `anthropic`, or `deepseek` | (prompt) |
-| `SYS_OPENAI_MODEL` | OpenAI model string (default favors reliable tool use; set `gpt-4o-mini` for lower cost, `gpt-5.6-luna`/`gpt-5.6-terra` for the newest family — see note under Extended thinking) | `gpt-5.4-mini` |
+| `SYS_OPENAI_MODEL` | OpenAI model string (default favors reliable tool use; set `gpt-4o-mini` for lower cost) | `gpt-5.4-mini` |
 | `SYS_ANTHROPIC_MODEL` | Anthropic model string | `claude-haiku-4-5-20251001` |
 | `SYS_DEEPSEEK_MODEL` | DeepSeek model string | `deepseek-v4-flash` |
 | `SYS_THINKING` | Startup state for extended thinking: `on` / `off` (Anthropic / DeepSeek) | `off` |
@@ -324,7 +318,7 @@ Provider and model selection are no longer startup-only. During a session:
 /provider deepseek
 /model
 /model gpt-5.4-mini
-/model claude-sonnet-5
+/model claude-sonnet-4-6
 /model deepseek-v4-pro
 ```
 
@@ -566,25 +560,6 @@ away. `swap_gb` rounds out the memory picture: a value of `0` means no swap is
 configured, so on a low-RAM host memory pressure ends in OOM-kills rather than
 swapping — context the model weighs when diagnosing killed processes.
 
-**Network interfaces.** `network_interfaces` maps interface name to kind
-(`wifi`/`ethernet`/`thunderbolt`/`bridge`/`bluetooth`). On Linux only
-device-backed interfaces are listed (anything with a `device` entry under
-`/sys/class/net/<if>`), which naturally drops loopback, veth, docker, and
-bridge noise; wireless is detected via the `wireless` sysfs subdir. On macOS
-the map is parsed from `networksetup -listallhardwareports`. Names and roles
-are stable per host; IPs, MAC addresses, SSIDs, and link state are
-deliberately excluded (volatile and/or identifying) — live network state is
-read with `ip addr` / `ifconfig` when a task needs it. A companion system
-prompt rule tells the model that on modern macOS the Wi-Fi identifiers
-(SSID, BSSID, NetworkID) are location-privacy redacted for every CLI path
-(`system_profiler`, `wdutil info`, `ipconfig getsummary`), so it states the
-limitation and asks the user instead of burning turns iterating tools that
-all print `<redacted>` — and that the redaction covers only those
-identifiers: `ipconfig getsummary <if>` remains the one-shot unprivileged
-L3 diagnostic (addresses, router, DHCP lease, DNS, link status, Wi-Fi
-security mode), preferred over chaining `route`/`netstat`/`ifconfig`
-probes.
-
 ### SMART over USB bridges
 
 The injected host facts include a mount-first disk topology under `disks`
@@ -644,7 +619,7 @@ It is **off by default**: thinking tokens are billed as output (expensive on
 Opus), and routine commands don't need it.
 
 ```text
-/model claude-opus-4-8
+/model claude-opus-5
 /thinking on
 /effort xhigh        # optional; default is high
 ```
@@ -661,11 +636,17 @@ SYS_THINKING=on SYS_THINKING_EFFORT=xhigh sys_agent
 The thinking API differs by model/provider, and sys_agent picks the right one
 automatically:
 
-- **Anthropic adaptive** (Opus 4.8 / 4.7, Sonnet 4.6, Opus 4.6): the model
-  decides per turn whether and how much to think. Depth is controlled by
+- **Anthropic adaptive** (Opus 5 / 4.8 / 4.7, Sonnet 5 / 4.6, Opus 4.6): the
+  model decides per turn whether and how much to think. Depth is controlled by
   **effort** (`/effort`), not a token budget. Interleaved thinking is automatic.
   Manual budgets are rejected with a 400 on Opus 4.7/4.8 — sys_agent never sends
-  them for these models.
+  them for these models. **Sonnet 5 and Opus 5 think by default** even when no
+  thinking field is sent, so with `/thinking off` sys_agent sends an explicit
+  `disabled` to keep the off-by-default cost rationale intact. On Opus 5 that
+  `disabled` is sent without an effort field (the API rejects `disabled` at
+  effort `xhigh`/`max`); with thinking disabled Opus 5 may occasionally phrase a
+  proposed command as text rather than a tool call, so use `/thinking on` if you
+  hit that.
 - **Anthropic legacy** (Haiku 4.5 and older): use a fixed `budget_tokens` budget
   (`SYS_THINKING_BUDGET`) plus the interleaved-thinking beta header so reasoning
   can span tool calls. Effort does not apply here.
@@ -677,14 +658,6 @@ automatically:
   assistant message or the next request 400s. sys_agent handles this internally
   by preserving `reasoning_content` on each assistant turn, so multi-turn tool
   use just works.
-- **OpenAI (GPT-5.6 Sol / Terra / Luna)**: no thinking path in this agent.
-  GPT-5.6 models apply a server-side default reasoning effort, and OpenAI's
-  Chat Completions endpoint rejects function tools combined with any effort
-  other than `none` (400 `invalid_request_error`). sys_agent therefore forces
-  `reasoning_effort="none"` for these models automatically — they run as
-  non-reasoning models here, and `/thinking` / `/effort` have no effect on
-  them. Tools + reasoning on GPT-5.6 requires OpenAI's Responses API, which
-  this Chat Completions-based agent does not use.
 
 Behavior, all paths:
 

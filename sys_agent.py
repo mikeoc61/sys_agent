@@ -100,16 +100,19 @@ from typing import Any
 
 # Default model per provider, overridable via env. Defaults favor dependable
 # tool calling at a sensible price tier; switch at runtime with /model.
-# OpenAI options (verified May 2026):
+# OpenAI options (verified Jul 2026):
 #   gpt-4.1-nano  — $0.10/$0.40 per 1M tok, weakest tool use of the three
 #   gpt-4o-mini   — $0.15/$0.60, generous free-tier RPM, but the chattiest
 #                   tier: under tool_choice=auto it tends to ASK ("Would you
 #                   like me to check…?") instead of emitting the run_command
 #                   call, stalling multi-step investigations.
 #   gpt-5.4-mini  — $0.75/$4.50, newer reasoning, best tool use of the tier.
-#   gpt-5.6-luna  — $1/$6, cheapest of the GPT-5.6 family (Sol/Terra/Luna
-#                   tiers, GA 2026-07-09; no -mini tier this generation).
-#   gpt-5.6-terra — $2.50/$15, mid tier, GPT-5.5-class performance.
+#   gpt-5.6-luna  — $0.20/$1.20, cheapest of the GPT-5.6 family (Sol/Terra/Luna
+#                   tiers, GA 2026-07-09; no -mini tier this generation). Cut
+#                   from $1/$6 on 2026-07-30 — now undercuts gpt-5.4-mini on
+#                   both input and output, though it runs non-reasoning here.
+#   gpt-5.6-terra — $2/$12, mid tier, GPT-5.5-class performance (cut from
+#                   $2.50/$15 on 2026-07-30). gpt-5.6-sol ($5/$30) unchanged.
 # GPT-5.6 caveat: these models apply a server-side default reasoning effort,
 # and /v1/chat/completions rejects function tools combined with any effort
 # other than "none" (400 invalid_request_error). This agent therefore forces
@@ -117,9 +120,14 @@ from typing import Any
 # run as non-reasoning models here. Tools + reasoning on GPT-5.6 requires the
 # Responses API, which this single-file Chat Completions provider does not
 # use — revisit only if no-reasoning tool quality proves insufficient.
-# Default is gpt-5.4-mini: for an agent that proposes and executes commands,
-# reliable tool-calling outweighs gpt-4o-mini's lower token price. Set
-# SYS_OPENAI_MODEL=gpt-4o-mini (or use /model) if cost dominates for you.
+# Default stays gpt-5.4-mini: for an agent that proposes and executes commands,
+# reliable tool-calling is the deciding factor, not token price. The remaining
+# case against gpt-5.6-luna is quality, not cost — after the 2026-07-30 cut Luna
+# is cheaper than gpt-5.4-mini, but it runs reasoning_effort="none" here (see
+# below) and its interpretation quality lags the -mini tier on this workload.
+# For a cost floor, gpt-4o-mini ($0.15/$0.60) is still marginally cheapest;
+# gpt-5.6-luna is the better-quality-per-dollar pick now. Switch via /model or
+# SYS_OPENAI_MODEL.
 DEFAULT_OPENAI_MODEL = os.environ.get("SYS_OPENAI_MODEL", "gpt-5.4-mini")
 
 # Anthropic options (verified Jul 2026):
@@ -127,26 +135,53 @@ DEFAULT_OPENAI_MODEL = os.environ.get("SYS_OPENAI_MODEL", "gpt-5.4-mini")
 #   claude-sonnet-5            — current mid-tier, drop-in replacement for
 #                                Sonnet 4.6 at the same per-token price; new
 #                                tokenizer produces ~30% more tokens for the
-#                                same text (see CONTEXT_WINDOWS note below)
+#                                same text (see CONTEXT_WINDOWS note below).
+#                                Adaptive thinking runs by DEFAULT absent the
+#                                thinking field (see _ADAPTIVE_DEFAULT_ON_MODELS)
 #   claude-sonnet-4-6          — deprecated in this project (not by Anthropic
 #                                — it remains Active upstream, tentative
 #                                retirement not before Feb 17, 2027). Left out
 #                                of PROVIDER_MODELS below; still usable via
 #                                /model claude-sonnet-4-6 through the
 #                                prefix-fallback path (warns, then switches).
-#   claude-opus-4-7            — prior flagship, premium ($5/$25 per 1M tok)
-#   claude-opus-4-8            — current flagship, premium ($5/$25), adaptive
-#                                thinking; opt-in via /thinking, not the default
+#   claude-opus-4-7            — two-gen-old flagship, premium ($5/$25). Dropped
+#                                from PROVIDER_MODELS (Opus 5 supersedes it at
+#                                the same price); reachable via prefix fallback.
+#   claude-opus-4-8            — prior flagship, premium ($5/$25), adaptive
+#                                thinking off by default (opt-in via /thinking)
+#   claude-opus-5              — current flagship, premium ($5/$25), step-change
+#                                over 4.8, "near-Fable-5 at half the price".
+#                                THINKING ON BY DEFAULT: like Sonnet 5 it thinks
+#                                absent the field, so it is in
+#                                _ADAPTIVE_DEFAULT_ON_MODELS to honor /thinking
+#                                off. Opus-5 also 400s on thinking=disabled at
+#                                effort xhigh|max — not hit here: the disabled
+#                                path sends no effort, so the server default
+#                                (high) applies. Caveat: with thinking disabled
+#                                Opus 5 can occasionally emit a proposed command
+#                                as text instead of a run_command tool_use;
+#                                /thinking on avoids this if it bites.
+#   claude-fable-5             — Mythos-tier, Anthropic's most capable public
+#                                model ($10/$50), adaptive thinking ALWAYS ON
+#                                (cannot be disabled — so NOT in the frozenset;
+#                                the disabled path would 400/no-op). Wrong tier
+#                                for this tool (cf. gpt-5.6-sol): left out of
+#                                PROVIDER_MODELS, CONTEXT_WINDOWS entry only,
+#                                reachable via /model claude-fable-5 fallback.
 DEFAULT_ANTHROPIC_MODEL = os.environ.get(
     "SYS_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"
 )
 
-# DeepSeek options (verified Jun 2026, regular post-promo rates):
+# DeepSeek options (verified Jul 2026):
 #   deepseek-v4-flash  — $0.14/$0.28 per 1M tok, 284B/13B MoE, fast/cheap tier,
 #                        thinking + non-thinking, tool calling. Default.
-#   deepseek-v4-pro    — $1.74/$3.48 per 1M tok, 1.6T/49B MoE, flagship reasoning
-#                        (launch promo $0.435/$0.87 expired 2026-05-31).
-# OpenAI-compatible endpoint (see DeepSeekProvider); reasoning grades high|max.
+#   deepseek-v4-pro    — $0.435/$0.87 per 1M tok, 1.6T/49B MoE, flagship
+#                        reasoning. (This is the current standing rate on the
+#                        official V4 price table, not a promo — the earlier
+#                        $1.74/$3.48 "post-promo" figure did not take effect.)
+# Legacy deepseek-chat / deepseek-reasoner aliases were retired 2026-07-24; this
+# project already pins v4-* names, so no change. OpenAI-compatible endpoint (see
+# DeepSeekProvider); reasoning grades high|max.
 DEFAULT_DEEPSEEK_MODEL = os.environ.get("SYS_DEEPSEEK_MODEL", "deepseek-v4-flash")
 
 # Per-provider startup default, indexed by provider name. Used by
@@ -178,15 +213,17 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-5.6-luna":  1_050_000,
     "gpt-5.6-terra": 1_050_000,
     "gpt-5.6-sol":   1_050_000,
-    # Anthropic — Opus 4.6/4.7/4.8 and Sonnet 4.6/5 ship the full 1M window at
-    # standard pricing; Haiku 4.5 remains 200K. Sonnet 4.6 entry kept even
-    # though it's dropped from PROVIDER_MODELS below, so /model still shows
-    # correct context-% if someone switches to it manually.
+    # Anthropic — Opus 4.6/4.7/4.8/5, Sonnet 4.6/5, and Fable 5 all ship the
+    # full 1M window at standard pricing; Haiku 4.5 remains 200K. Entries kept
+    # for models dropped from PROVIDER_MODELS below (sonnet-4-6, opus-4-7,
+    # fable-5) so /model still shows correct context-% on a manual switch.
     "claude-haiku-4-5-20251001": 200_000,
     "claude-sonnet-5":         1_000_000,
     "claude-sonnet-4-6":       1_000_000,
     "claude-opus-4-7":         1_000_000,
     "claude-opus-4-8":         1_000_000,
+    "claude-opus-5":           1_000_000,
+    "claude-fable-5":          1_000_000,
     # DeepSeek — V4 Flash and Pro both ship the native 1M window.
     "deepseek-v4-flash":       1_000_000,
     "deepseek-v4-pro":         1_000_000,
@@ -208,8 +245,8 @@ PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
     "anthropic": (
         "claude-haiku-4-5-20251001",
         "claude-sonnet-5",
-        "claude-opus-4-7",
         "claude-opus-4-8",
+        "claude-opus-5",
     ),
     "deepseek": (
         "deepseek-v4-flash",
@@ -308,13 +345,15 @@ def _thinking_mode(model: str) -> str:
     return "adaptive"
 
 # Models where adaptive thinking runs by default when no `thinking` field is
-# sent at all — a Sonnet-5-specific behavior change (Sonnet 4.6, Opus 4.6/
-# 4.7/4.8 all still run without thinking absent the field). Omitting the
-# field on these models would silently defeat ANTHROPIC_THINKING_DEFAULT=off
+# sent at all. Started with Sonnet 5; Opus 5 has the same behavior (Sonnet 4.6
+# and Opus 4.6/4.7/4.8 still run without thinking absent the field). Omitting
+# the field on these models would silently defeat ANTHROPIC_THINKING_DEFAULT=off
 # and its whole rationale (thinking tokens are output-billed and unwanted for
 # routine commands), so chat() sends an explicit thinking:{"type":"disabled"}
-# for these models when the session has thinking turned off.
-_ADAPTIVE_DEFAULT_ON_MODELS = frozenset({"claude-sonnet-5"})
+# for these models when the session has thinking turned off. That disabled form
+# is rejected on Opus 5 at effort xhigh|max, but the disabled branch in chat()
+# sends no effort field, so the server default (high) applies and it is accepted.
+_ADAPTIVE_DEFAULT_ON_MODELS = frozenset({"claude-sonnet-5", "claude-opus-5"})
 
 def _thinking_default_on(model: str) -> bool:
     return model in _ADAPTIVE_DEFAULT_ON_MODELS
