@@ -27,9 +27,13 @@ startup so the returned command syntax is properly formatted for the host enviro
   Multiple keys present → interactive prompt over those available. One key →
   auto-pick. DeepSeek runs over its OpenAI-compatible endpoint, so it shares
   the OpenAI tool-call message shape.
-- **Host-aware prompt**: the input prompt carries the active hostname
-  (`you@m3mac>`, `you@raspberrypi>`) so you always know which machine you're
-  you're currently working on.
+- **Model- and host-aware prompt**: the input prompt leads with the active
+  model (dimmed, bracketed) and carries the hostname
+  (`[claude-opus-5] you@m3mac>`, `[gpt-5.4-mini] you@raspberrypi>`) so you
+  always know which model is answering and which machine you're working on —
+  and so the prompt is unmistakably sys_agent, not a plain shell. The label
+  updates when you `/model`-switch; a trailing date pin is dropped
+  (`claude-haiku-4-5-20251001` shows as `claude-haiku-4-5`).
 - **Extended thinking** (Anthropic / DeepSeek): optional reasoning pass, opt-in
   per session via `/thinking`. The scratchpad is surfaced inline; off by default
   because thinking tokens bill as output. See [Extended thinking](#extended-thinking).
@@ -225,13 +229,14 @@ retained — meta-commands (`/info`, `/exit`, etc.) and short-answer prompts
 ## Usage
 
 Once running, type natural-language requests. The prompt shows the active
-hostname, so it is always clear which machine will execute the command:
+model and hostname, so it is always clear which model is answering and which
+machine will execute the command:
 
 ```
-you@m3mac>       show me which services are using the most RAM
-you@raspberrypi> check why bitcoind is restarting
-you@raspberrypi> what's the current load average and what process is dominating?
-you@m3mac>       upgrade nginx to the latest stable version
+[claude-opus-5]   you@m3mac>       show me which services are using the most RAM
+[claude-haiku-4-5] you@raspberrypi> check why bitcoind is restarting
+[deepseek-v4-flash] you@raspberrypi> what's the load average and top process?
+[gpt-5.4-mini]    you@m3mac>       upgrade nginx to the latest stable version
 ```
 
 For mutating actions, the approval prompt is your safety net. Per command:

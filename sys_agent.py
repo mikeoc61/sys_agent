@@ -497,6 +497,14 @@ def user_tag(t: str) -> str:   return _wrap(t, _ANSI.BOLD, _ANSI.CYAN)
 def agent_tag(t: str) -> str:  return _wrap(t, _ANSI.BOLD, _ANSI.GREEN)
 
 
+def short_model(model: str) -> str:
+    """Compact model label for the REPL prompt: strip a trailing -YYYYMMDD pin
+    (claude-haiku-4-5-20251001 -> claude-haiku-4-5). Current dateless IDs pass
+    through unchanged. The startup banner keeps the full pinned ID; this only
+    keeps the per-line prompt tight."""
+    return re.sub(r"-\d{8}$", "", model)
+
+
 def rl_prompt(text: str) -> str:
     """
     Wrap a colored prompt for safe use with input() on GNU readline.
@@ -3642,7 +3650,18 @@ def run_repl(provider: Provider) -> None:
 
     while True:
         try:
-            user_in = colored_input(user_tag(f"you@{facts['node']}>") + " ").strip()
+            # Prompt carries the active model (dim, bracketed) ahead of the
+            # bold-cyan you@host tag: it makes the current model visible at a
+            # glance, reflects a mid-session /model switch on the next turn
+            # (provider.model is read fresh here), and visually distinguishes
+            # the sys_agent prompt from a plain shell. Composed from colored
+            # segments and passed whole to colored_input(), which handles the
+            # \001/\002 width markers (GNU readline) or prefix-print (libedit).
+            prompt = (
+                dim(f"[{short_model(provider.model)}] ")
+                + user_tag(f"you@{facts['node']}>") + " "
+            )
+            user_in = colored_input(prompt).strip()
         except EOFError:            
             print()
             return
