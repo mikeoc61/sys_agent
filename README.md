@@ -105,7 +105,11 @@ startup so the returned command syntax is properly formatted for the host enviro
 
 ## Requirements
 
-- Python ≥ 3.10
+- Python 3.10–3.13 recommended. Newer interpreters work only if binary
+  wheels exist for `pydantic-core` (pulled in by both SDKs); on a
+  just-released Python, pip may fall back to a Rust source build that
+  fails against PyO3's supported-version ceiling. `uv run --python 3.13`
+  sidesteps this.
 - One of: `uv` (recommended) **or** pip + venv
 - An OpenAI, Anthropic, and/or DeepSeek API key
 - macOS/Linux for the full experience. On Windows, the stdlib lacks
@@ -128,6 +132,11 @@ sys_agent
 First invocation builds a cached environment from the script's inline
 dependency block; subsequent runs are instant.
 
+> To pin the interpreter independently of the system Python:
+> `uv run --python 3.13 sys_agent.py`. uv fetches and caches a managed
+> CPython; nothing on the host changes. Useful on distributions that
+> ship a Python newer than the Rust extension wheels have caught up to.
+
 > **macOS**: the inline block pulls in `gnureadline` automatically
 > (`sys_platform == 'darwin'`) to replace the system libedit-backed
 > readline with proper GNU readline so colored prompts render correctly
@@ -141,12 +150,22 @@ git clone https://github.com/mikeoc61/sys_agent.git
 cd sys_agent
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -U pip
 pip install -r requirements.txt
-./sys_agent.py
+python3 sys_agent.py
 ```
 
 `requirements.txt` carries the same `gnureadline` macOS-only marker as
 the inline block.
+
+> Invoke with `python3 sys_agent.py`, not `./sys_agent.py` — the shebang
+> is `#!/usr/bin/env -S uv run --script`, which routes execution through
+> uv and bypasses the venv you just activated.
+>
+> `pip install -U pip` is not optional on a freshly released Python. A
+> stale pip doesn't recognize the new interpreter's wheel tag, falls back
+> to building `pydantic-core` from source, and fails against PyO3's
+> supported-version ceiling.
 
 ## Configuration
 
