@@ -1,9 +1,9 @@
 # sys_agent
 
-A minimal command-line agent that connects an arbitrary text prompt to a remote
-LLM (OpenAI, Anthropic, or DeepSeek), gathers host facts so generated commands
-match the local environment, and executes those commands only after explicit
-user approval. Single Python file. No frameworks.
+A command-line agent for system administration. You ask in plain language; a
+remote LLM (OpenAI, Anthropic, or DeepSeek) proposes shell commands informed by
+real facts about your host; nothing runs until you approve it. Single Python
+file. No frameworks.
 
 <!-- BEGIN EXAMPLE -->
 ![sys_agent example session](assets/example-session.svg)
@@ -12,97 +12,66 @@ user approval. Single Python file. No frameworks.
 ## Why
 
 Off-the-shelf agentic CLIs (aider, claude-code, etc.) optimize for code
-authoring. This agent optimizes for a different loop: ad-hoc system
-administration, infrastructure tuning / debugging using commands which
-are appropriate for the host environemnt. It's especially useful for posing
-system questions where the correct answer depends on OS distro, init system,
-installed package manager, and which tools happen to be in user's PATH.
+authoring. sys_agent optimizes for a different loop: ad-hoc system
+administration, infrastructure tuning, and debugging — the class of question
+whose correct answer depends on the OS distro, init system, package manager,
+and whichever tools happen to be on the invoking user's PATH.
 
-The agent collects and ships a range of host facts to the selected AI model at 
-startup so the returned command syntax is properly formatted for the host environment.
+To close that gap it probes the host at startup and ships those facts with
+every turn, so the commands that come back are already in the syntax that
+machine takes.
 
 ## Features
 
-- **Multi-provider**: OpenAI, Anthropic, or DeepSeek, selected at startup.
-  Multiple keys present → interactive prompt over those available. One key →
-  auto-pick. DeepSeek runs over its OpenAI-compatible endpoint, so it shares
-  the OpenAI tool-call message shape.
-- **Model- and host-aware prompt**: the input prompt leads with the active
-  model (dimmed, bracketed) and carries the hostname
-  (`[claude-opus-5] you@m3mac>`, `[gpt-5.4-mini] you@raspberrypi>`) so you
-  always know which model is answering and which machine you're working on —
-  and so the prompt is unmistakably sys_agent, not a plain shell. The label
-  updates when you `/model`-switch; a trailing date pin is dropped
-  (`claude-haiku-4-5-20251001` shows as `claude-haiku-4-5`).
-- **Extended thinking** (Anthropic / DeepSeek): optional reasoning pass, opt-in
-  per session via `/thinking`. The scratchpad is surfaced inline; off by default
-  because thinking tokens bill as output. See [Extended thinking](#extended-thinking).
-- **Runtime provider/model switching**: use `/provider` and `/model` to
-  inspect or change the active backend during a live REPL (Read-Eval-Print-Lool) session.
-- **Host-aware**: distro, shell, machine arch, package/init/container tool
-  probes, disk context, and installed tools (`apt`/`brew`/`systemctl`/
-  `docker`/etc.) are injected into the system prompt. Host facts can be
-  displayed, refreshed, and expanded with `/facts`.
-- **USB-bridge SMART hints**: for USB-attached disks, startup resolves the
-  bridge's USB `vendor:product` and, when the bridge chip is recognized,
-  precomputes the `smartctl -d` pass-through token, so the model queries a
-  drive behind a USB enclosure (e.g. a Samsung T7) correctly on the first try
-  instead of probing `-d sat`/`scsi`/`nvme` by trial and error. See
-  [SMART over USB bridges](#smart-over-usb-bridges).
-- **Runtime context**: a startup snapshot of the running services and the top
-  processes by memory is injected alongside the static facts, so the model
-  uses real unit/process names on the first turn instead of probing for them
-  (no more guessing `openclaw` when the unit is `openclaw-gateway`).
-  Privacy is preserved as only process names are surfaced, never arguments. 
+- **Approval-gated execution** — every proposed command is shown with its
+  reason and CWD before anything is spawned. Per command: run, edit in place,
+  skip, or stop the whole workflow. See [Safety model](#safety-model).
+- **Local hard-deny list** — a short set of irrecoverable patterns (`rm -rf /`,
+  `mkfs`, fork bomb, raw `dd` to a block device) is blocked client-side,
+  whatever the model proposes and whatever you approve. `/auto on` cannot
+  bypass it.
+- **Multi-provider** — OpenAI, Anthropic, or DeepSeek, picked at startup from
+  the keys you have. Switch mid-session with
+  [`/provider` and `/model`](#runtime-providermodel-switching).
+- **Host-aware** — distro, shell, arch, package/init/container tooling, disk
+  topology, and PATH tool probes ship with every turn, so command syntax fits
+  the machine. Inspect or re-probe with [`/facts`](#refreshable-host-facts).
+- **Hardware identity** — vendor, model, `platform_class`
+  (`sbc`/`laptop`/`desktop`/`server`/`vm`/`container`), RAM, swap, and a cloud
+  label when DMI identifies one, so the model knows a Pi 5 from an EC2 instance
+  before it proposes telemetry that host cannot produce.
+  See [Hardware identity](#hardware-identity).
+- **Runtime snapshot** — running services (system and user scope), failed
+  units, and top processes by RSS, captured at startup so the model uses real
+  unit names on the first turn instead of probing for them. Process names only,
+  never arguments.
   See [Runtime snapshot](#runtime-snapshot-services-and-processes).
-- **Hardware identity**: a static `hardware` facts block — vendor, model
-  string, `platform_class` (`sbc`/`laptop`/`desktop`/`server`/`vm`/
-  `container`), total RAM and swap, plus a `cloud` label
-  (`aws`/`gcp`/`azure`/`oci`/…) when DMI identifies a cloud instance —
-  resolved from the device tree, DMI, or `sysctl`, so the model knows it is on
-  a Pi 5 vs a MacBook vs an EC2 VM and which telemetry classes and command
-  strategies are plausible (PMIC rails, battery, IPMI, provider metadata).
-  Paired with prompt rules
-  that forbid unverified "that can't be measured here" claims. See
-  [Hardware identity](#hardware-identity).
-- **Approval-gated execution**: every proposed command is shown with its
-  reason and CWD before it runs. Per command you can run it, edit it before
-  running, or skip it (decline one step; the agent continues the turn). To
-  abandon a multi-command workflow that has gone off the rails, `q` or Ctrl-C
-  stops the whole turn and returns you to the prompt, without ending the
-  session. See [Interrupting a workflow](#interrupting-a-workflow).
-- **Local hard-deny list**: a short list of catastrophic patterns
-  (`rm -rf /`, `mkfs`, fork bomb, raw `dd` to block devices) is blocked
-  client-side regardless of model output or user approval.
-- **Token usage display**: optional per-turn input/output token counts plus
-  running session totals and percentage of context window consumed.
-- **Color output**: semantic ANSI coloring with auto-detection
-  (TTY/`NO_COLOR`) and runtime toggle.
-- **Activity indicator**: a spinner with an elapsed-seconds counter during the
-  model call and during command execution, so the REPL never looks hung on a
-  slow turn or a long-running command. The indicator is suppressed for operations 
-  under ~1.5s, shown as a single static marker when output isn't a TTY, and is 
-  disabled entirely with `SYS_PROGRESS=off`.
-- **Persistent history**: line editing and history navigation via readline
-  (gnureadline on macOS). Conversational prompts persist to
-  `~/.config/sys_agent/history` across sessions; meta-commands (e.g /thinking on) 
-  and short-answer prompts are excluded so Up-arrow recall stays useful.
-  See [Tips & shortcuts](#tips--shortcuts) for keystrokes.
-- **Audit log**: append-only JSONL record of every command the model
-  proposes and its disposition (`run`/`edit`/`skip`/`deny`/`abort`) plus exit
-  code, written to `~/.config/sys_agent/audit.log`. The forensic trail a 24/7
-  server role needs — distinct from readline history, which stores only your
-  prompts. On by default; command output bodies are excluded unless opted in.
-  See [Audit log](#audit-log).
-- **Multi-provider consult**: `/consult` asks the *other* configured providers
-  how they would open the current (or just-aborted) question and shows each
-  one's first move beside the active provider's — a read-only second opinion
-  that executes nothing and never touches the approval gate. `--fresh` consults
-  the question alone on a context switch. See
-  [Multi-provider consult](#multi-provider-consult).
-- **Zero install footprint with uv**: PEP 723 inline-script dependencies;
-  `uv` handles the environment transparently.
-
+- **USB-bridge SMART hints** — startup resolves a USB enclosure's bridge chip
+  and precomputes the `smartctl -d` pass-through token, so a drive behind an
+  enclosure reads correctly on the first try rather than by trial and error.
+  See [SMART over USB bridges](#smart-over-usb-bridges).
+- **Extended thinking** (Anthropic / DeepSeek) — an opt-in reasoning pass via
+  [`/thinking`](#extended-thinking), surfaced inline. Off by default: thinking
+  tokens bill as output.
+- **Multi-provider consult** — [`/consult`](#multi-provider-consult) asks the
+  *other* configured providers how they would open the current question and
+  shows each first move beside the active provider's. Read-only; it executes
+  nothing and never touches the approval gate.
+- **Audit log** — an append-only JSONL record of every command proposed and its
+  disposition (`run`/`edit`/`skip`/`deny`/`abort`) plus exit code. On by
+  default, output bodies excluded; review it in place with
+  [`/history`](#reviewing-history).
+- **Model- and host-aware prompt** — `[claude-opus-5] you@m3mac>` keeps it
+  clear which model is answering, which machine will run the command, and that
+  this is not a plain shell.
+- **Persistent history** — readline line editing with recall across sessions.
+  Meta-commands and `y`/`n` answers are filtered out, so Up-arrow surfaces only
+  real prompts. See [Tips & shortcuts](#tips--shortcuts).
+- **Legible at runtime** — per-turn and session token usage, semantic ANSI
+  color (TTY- and `NO_COLOR`-aware), and an elapsed-seconds spinner so a slow
+  turn never looks hung. Each toggles at runtime or from the environment.
+- **Zero install footprint with uv** — PEP 723 inline dependencies; `uv` builds
+  and caches the environment on first run.
 ## Requirements
 
 - Python 3.10–3.13 recommended. Newer interpreters work only if binary
@@ -564,16 +533,17 @@ instances (t2/m4/…) report `sys_vendor` "Xen" / `product_name` "HVM domU" with
 no "amazon" string, so they fall back to the BIOS, which stamps
 `bios_version` "4.11.amazon" (or `bios_vendor` "Amazon"). The world-readable
 `/sys/hypervisor/uuid` would also identify Xen-EC2 but is a UUID-class file, so
-it is deliberately left unread. No metadata service is contacted at startup. It steers command strategy: on a cloud VM,
-storage is network-attached (a full root disk is a volume resize via the
-provider, not local `parted`) and connectivity is governed by provider-level
-security groups / NACLs on top of host `iptables`/`ufw`, so a capacity or
-reachability question may have its real answer at the provider. Instance
-metadata (region, AZ, instance-type, instance-id, IAM role) is deliberately
-**not** pre-loaded; the system prompt has the model query IMDS
-(`169.254.169.254`, IMDSv2 token flow) or GCP's `metadata.google.internal`
-on demand only when a task needs it, and treat instance-id, account-id, and
-IAM role as sensitive.
+it is deliberately left unread. No metadata service is contacted at startup.
+
+The label steers command strategy: on a cloud VM, storage is network-attached
+(a full root disk is a volume resize via the provider, not local `parted`) and
+connectivity is governed by provider-level security groups / NACLs on top of
+host `iptables`/`ufw`, so a capacity or reachability question may have its real
+answer at the provider. Instance metadata (region, AZ, instance-type,
+instance-id, IAM role) is deliberately **not** pre-loaded; the system prompt
+has the model query IMDS (`169.254.169.254`, IMDSv2 token flow) or GCP's
+`metadata.google.internal` on demand only when a task needs it, and treat
+instance-id, account-id, and IAM role as sensitive.
 
 **Temporal orientation.** The default facts include `timezone`,
 `boot_time` (ISO-8601 local), and `uptime_hours`, resolved from `/proc/uptime`
@@ -729,7 +699,7 @@ Three layers, weakest to strongest:
 1. **Approval prompt** (default-on, per-command). Every `run_command` shows
    the exact shell string, the model's stated reason, and the CWD before any
    subprocess is spawned. Default answer is `y` so casual `Enter` runs it —
-   read the line. Read the line. Per command: `y` run, `n` skip (the agent
+   read the line. Per command: `y` run, `n` skip (the agent
    continues), `e` edit, `q` stop the whole workflow. Ctrl-C stops the
    workflow from anywhere in the turn — killing a running command's process
    group first — and returns to the prompt; it never ends the session.
@@ -784,10 +754,12 @@ start, so its disposition is not `abort`.
 Output **bodies are not logged by default** — stdout/stderr can carry secrets.
 Enable with `SYS_AUDIT_BODY=on` only if you accept that.
 
+Disable the log, send it elsewhere, or opt into output bodies:
+
 ```sh
-SYS_AUDIT_LOG=off sys_agent              # disable entirely
-SYS_AUDIT_LOG=/var/log/sys_agent.jsonl   # custom path
-SYS_AUDIT_BODY=on sys_agent              # include command output (capped)
+SYS_AUDIT_LOG=off sys_agent
+SYS_AUDIT_LOG=/var/log/sys_agent.jsonl sys_agent
+SYS_AUDIT_BODY=on sys_agent
 ```
 
 At runtime: `/audit` shows status; `/audit on|off` toggles. Disposition follows
