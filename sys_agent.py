@@ -25,7 +25,7 @@ Env:      OPENAI_API_KEY            (one of these is required)
           SYS_PROVIDER               (skip prompt: openai|anthropic|deepseek)
           SYS_OPENAI_MODEL           (default gpt-5.4-mini)
           SYS_ANTHROPIC_MODEL        (default claude-haiku-4-5-20251001)
-          SYS_DEEPSEEK_MODEL         (default deepseek-v4-flash)
+          SYS_DEEPSEEK_MODEL         (default deepseek-flash)
           SYS_ENV_FILE               (path to env file; overrides search)
           SYS_COLOR                  (on|off|auto, default auto)
           NO_COLOR                  (if set, disables color regardless)
@@ -172,17 +172,27 @@ DEFAULT_ANTHROPIC_MODEL = os.environ.get(
     "SYS_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"
 )
 
-# DeepSeek options (verified Jul 2026):
-#   deepseek-v4-flash  — $0.14/$0.28 per 1M tok, 284B/13B MoE, fast/cheap tier,
-#                        thinking + non-thinking, tool calling. Default.
-#   deepseek-v4-pro    — $0.435/$0.87 per 1M tok, 1.6T/49B MoE, flagship
-#                        reasoning. (This is the current standing rate on the
-#                        official V4 price table, not a promo — the earlier
-#                        $1.74/$3.48 "post-promo" figure did not take effect.)
-# Legacy deepseek-chat / deepseek-reasoner aliases were retired 2026-07-24; this
-# project already pins v4-* names, so no change. OpenAI-compatible endpoint (see
-# DeepSeekProvider); reasoning grades high|max.
-DEFAULT_DEEPSEEK_MODEL = os.environ.get("SYS_DEEPSEEK_MODEL", "deepseek-v4-flash")
+# DeepSeek options (verified Sep 2026):
+#   deepseek-flash     — DeepSeek-V4.1-Flash (released 2026-09-10), new causal
+#                        encoder-decoder arch, 8B/16B active (input/output).
+#                        1M context, 384K max output, thinking + non-thinking,
+#                        tool calling, native vision (unused here). Per 1M tok,
+#                        off-peak/peak: in $0.15/$0.30 (cache hit $0.003/$0.006),
+#                        out $0.60/$1.20. Peak = 01-04 & 06-10 UTC Mon-Fri.
+#                        Unversioned alias: tracks DeepSeek's current Flash.
+#                        Default.
+#   deepseek-v4-pro    — Being retired: from 2026-09-14 04:00 UTC routed to
+#                        V4.1-Flash at Flash rates until V4.1-Pro ships. Dropped
+#                        from PROVIDER_MODELS (the picker would offer a name that
+#                        serves Flash); CONTEXT_WINDOWS entry kept.
+#   deepseek-v4-flash  — Retired; server-routed to V4.1-Flash (probe: response
+#                        `model` reports deepseek-flash). Window entry kept for
+#                        existing SYS_DEEPSEEK_MODEL pins.
+# Thinking is ON by default server-side (probe 2026-09-10: no thinking field ->
+# reasoning_content + reasoning_tokens returned), so DeepSeekProvider sends an
+# explicit disabled when /thinking is off. Effort grades low|high|max.
+# OpenAI-compatible endpoint (see DeepSeekProvider).
+DEFAULT_DEEPSEEK_MODEL = os.environ.get("SYS_DEEPSEEK_MODEL", "deepseek-flash")
 
 # Per-provider startup default, indexed by provider name. Used by
 # select_provider's interactive picker so it never instantiates an SDK client
@@ -224,7 +234,10 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "claude-opus-4-8":         1_000_000,
     "claude-opus-5":           1_000_000,
     "claude-fable-5":          1_000_000,
-    # DeepSeek — V4 Flash and Pro both ship the native 1M window.
+    # DeepSeek — V4.1 Flash ships the native 1M window. v4-* entries kept for
+    # existing pins; both names are server-routed to V4.1 Flash (v4-pro from
+    # 2026-09-14).
+    "deepseek-flash":          1_000_000,
     "deepseek-v4-flash":       1_000_000,
     "deepseek-v4-pro":         1_000_000,
 }
@@ -249,8 +262,7 @@ PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
         "claude-opus-5",
     ),
     "deepseek": (
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
+        "deepseek-flash",
     ),
 }
 
@@ -385,7 +397,7 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/reset",          "Clear conversation history and token counters"),
     ("/auto on|off",    "Skip the per-command approval prompt (deny list still applies)"),
     ("/thinking on|off", "Toggle extended thinking — Anthropic/DeepSeek (next turn)"),
-    ("/effort [level]", "Thinking depth low|medium|high|xhigh|max — Anthropic adaptive models (all 5), DeepSeek (high|max); needs /thinking on"),
+    ("/effort [level]", "Thinking depth low|medium|high|xhigh|max — Anthropic adaptive models (all 5), DeepSeek (low|high|max); needs /thinking on"),
     ("/tokens on|off",  "Toggle the per-turn token-usage line"),
     ("/color on|off",   "Toggle ANSI color output"),
     ("/audit [on|off]", "Show or toggle the command audit log"),
@@ -2549,7 +2561,7 @@ class ChatTurn:
     tool_calls: list[ToolCall]
     raw_message: Any           # provider-native dict, appended to history
     usage: Usage
-    thinking_text: str = ""    # extended-thinking scratchpad (Anthropic only)
+    thinking_text: str = ""    # extended-thinking scratchpad (Anthropic/DeepSeek)
 
 
 class Provider:
@@ -2662,7 +2674,8 @@ class OpenAIProvider(Provider):
 
 
 class DeepSeekProvider(OpenAIProvider):
-    """DeepSeek V4 (Flash/Pro) via the OpenAI-compatible ChatCompletions API.
+    """DeepSeek V4.x (deepseek-flash; v4-* names server-routed) via the
+    OpenAI-compatible ChatCompletions API.
 
     Wire-compatible with OpenAIProvider — identical tool-call / tool-result
     message shape — so it inherits initial_messages() and append_tool_results()
@@ -2673,6 +2686,8 @@ class DeepSeekProvider(OpenAIProvider):
       2. chat() honors extended thinking, which OpenAI's path ignores. DeepSeek
          exposes it via reasoning_effort + thinking={"type":"enabled"} and
          returns the scratchpad in a `reasoning_content` field beside `content`.
+         Thinking is ON by default server-side, so the off path must send
+         thinking={"type":"disabled"} explicitly — omitting the field thinks.
 
     THINKING-MODE REPLAY CONTRACT (the subtle part): once a thinking-enabled
     turn makes a tool call, DeepSeek REQUIRES `reasoning_content` to be present
@@ -2686,12 +2701,18 @@ class DeepSeekProvider(OpenAIProvider):
     Anthropic path must echo back thinking blocks with their signatures.
     """
 
-    # Effort levels the sys_agent scale (low|medium|high|xhigh|max) maps onto.
-    # DeepSeek V4 grades reasoning as high|max only; per its docs xhigh/max ->
-    # max, and low/medium/high collapse to high.
+    # sys_agent scale (low|medium|high|xhigh|max) -> DeepSeek grades
+    # (low|high|max). Levels without a native grade round UP: medium -> high
+    # (matches DeepSeek's server mapping), xhigh -> max (DeepSeek's own table
+    # maps xhigh -> high; rounding up keeps /effort xhigh distinct from high).
+    _EFFORT_MAP: dict[str, str] = {
+        "low": "low", "medium": "high", "high": "high",
+        "xhigh": "max", "max": "max",
+    }
+
     @staticmethod
     def _map_effort(effort: str) -> str:
-        return "max" if effort in ("xhigh", "max") else "high"
+        return DeepSeekProvider._EFFORT_MAP.get(effort, "high")
 
     def __init__(self, model: str) -> None:
         try:
@@ -2717,14 +2738,18 @@ class DeepSeekProvider(OpenAIProvider):
             tools=OPENAI_TOOLS,
             tool_choice="auto",
         )
+        # Sent via extra_body (merged into the request JSON) rather than as
+        # typed kwargs, so neither field depends on the pinned openai SDK
+        # recognizing it — same defensive rationale as the Anthropic path.
+        # The disabled branch is load-bearing: thinking is the server default,
+        # so omitting the field would think (and bill) with /thinking off.
         if thinking:
-            # Sent via extra_body (merged into the request JSON) rather than as
-            # typed kwargs, so neither field depends on the pinned openai SDK
-            # recognizing it — same defensive rationale as the Anthropic path.
             kwargs["extra_body"] = {
                 "thinking": {"type": "enabled"},
                 "reasoning_effort": self._map_effort(effort),
             }
+        else:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         resp = self.client.chat.completions.create(**kwargs)
         msg = resp.choices[0].message
         calls: list[ToolCall] = []
@@ -3188,9 +3213,9 @@ def effective_effort(provider: Provider, effort: str) -> tuple[str, str]:
     """Map a requested effort level to the grade the active provider will
     actually run, plus a short note when the request was clamped.
 
-    DeepSeek's thinking mode exposes only two grades, so the five levels are
-    clamped: low/medium/high -> 'high' (its floor), xhigh/max -> 'max' (its
-    ceiling). Anthropic adaptive models honor all five verbatim. The stored
+    DeepSeek's thinking mode exposes three grades (low|high|max); medium and
+    xhigh round up to the next grade (see DeepSeekProvider._EFFORT_MAP).
+    Anthropic adaptive models honor all five verbatim. The stored
     session effort keeps the user's requested level (so switching to a
     finer-grained provider still honors it); this mapping is display-only.
 
@@ -3198,7 +3223,7 @@ def effective_effort(provider: Provider, effort: str) -> tuple[str, str]:
     if provider.name == "deepseek":
         mapped = DeepSeekProvider._map_effort(effort)
         if mapped != effort:
-            return mapped, "DeepSeek floor" if mapped == "high" else "DeepSeek ceiling"
+            return mapped, "rounded up to DeepSeek grade"
         return mapped, ""
     return effort, ""
 
@@ -3209,7 +3234,7 @@ def effort_display(provider: Provider, effort: str, thinking_on: bool) -> tuple[
     cannot drift. `note` is the parenthetical text (no parens), "" when there
     is nothing to flag:
       - provider ignores effort entirely  -> "no effect on this provider/model"
-      - DeepSeek clamped the grade         -> "DeepSeek floor" / "DeepSeek ceiling"
+      - DeepSeek rounded the grade         -> "rounded up to DeepSeek grade"
       - effort honored but thinking is off -> append "needs /thinking on"
     """
     if not effort_applies(provider):
@@ -3223,10 +3248,10 @@ def effort_display(provider: Provider, effort: str, thinking_on: bool) -> tuple[
 
 def _effort_usage_levels(provider: Provider) -> tuple[str, ...]:
     """Distinct effort grades worth offering for the active provider, in
-    order. DeepSeek collapses the five inputs to two effective grades, so a
+    order. DeepSeek collapses the five inputs to three effective grades, so a
     flat low|medium|high|xhigh|max hint overstates the choices; this returns
-    ("high", "max") there and all five elsewhere. All five remain *accepted*
-    inputs everywhere (DeepSeek clamps); this only shapes the usage hint."""
+    ("low", "high", "max") there and all five elsewhere. All five remain
+    *accepted* inputs everywhere (DeepSeek rounds); this only shapes the hint."""
     seen: list[str] = []
     for lvl in _VALID_EFFORTS:
         grade, _ = effective_effort(provider, lvl)

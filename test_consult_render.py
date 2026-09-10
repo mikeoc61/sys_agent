@@ -11,7 +11,7 @@ def _mk(cls, name, model):
     return p
 
 OAI = _mk(S.OpenAIProvider, "openai", "gpt-5.4-mini")
-DS  = _mk(S.DeepSeekProvider, "deepseek", "deepseek-v4-flash")
+DS  = _mk(S.DeepSeekProvider, "deepseek", "deepseek-flash")
 ANT = _mk(S.AnthropicProvider, "anthropic", "claude-haiku-4-5-20251001")
 PROVIDERS = {"openai": OAI, "deepseek": DS, "anthropic": ANT}
 SYS = "SYSTEM PROMPT TEXT"
@@ -160,6 +160,45 @@ parse_ok = all(
 )
 print(f"[fresh] --fresh trims history, default retains it, flag parses: {'OK' if (ok_fresh and parse_ok) else 'FAIL'}")
 if not (ok_fresh and parse_ok): fails.append("fresh")
+
+# 8) DeepSeek thinking wire format. Server default is thinking ON, so the off
+#    path must send an explicit disabled; on path sends the mapped grade.
+from types import SimpleNamespace as _NS
+class _Msg:
+    content, tool_calls, reasoning_content = "ok", None, ""
+    def model_dump(self, exclude_none=True): return {"role": "assistant", "content": "ok"}
+class _Client:
+    def __init__(self): self.kw, self.chat, self.completions = None, self, self
+    def create(self, **kw):
+        self.kw = kw
+        return _NS(choices=[_NS(message=_Msg())], usage=_NS(prompt_tokens=1, completion_tokens=1))
+DS.client = _Client()
+DS.chat([], SYS, thinking=False)
+ok_off = DS.client.kw.get("extra_body") == {"thinking": {"type": "disabled"}}
+exp = {"low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max"}
+ok_on = True
+for lvl, grade in exp.items():
+    DS.chat([], SYS, thinking=True, effort=lvl)
+    if DS.client.kw.get("extra_body") != {"thinking": {"type": "enabled"}, "reasoning_effort": grade}:
+        ok_on = False
+ok_lv = S._effort_usage_levels(DS) == ("low", "high", "max")
+ok_note = (S.effective_effort(DS, "low") == ("low", "")
+           and S.effective_effort(DS, "medium")[1] != ""
+           and S.effective_effort(DS, "max") == ("max", ""))
+ok_ds = ok_off and ok_on and ok_lv and ok_note
+print(f"[deepseek] thinking off->disabled, effort low|high|max mapping: {'OK' if ok_ds else 'FAIL'}")
+if not ok_ds: fails.append("ds-thinking")
+
+# 9) model-table consistency: every listed model has a context window, and
+#    every built-in provider default is a listed model (skipped per provider
+#    when SYS_<PROVIDER>_MODEL overrides it in the environment).
+import os
+missing = [m for ms in S.PROVIDER_MODELS.values() for m in ms if m not in S.CONTEXT_WINDOWS]
+unlisted = [f"{p}:{m}" for p, m in S.DEFAULT_MODELS.items()
+            if not os.environ.get(f"SYS_{p.upper()}_MODEL") and m not in S.PROVIDER_MODELS[p]]
+ok_tab = not missing and not unlisted
+print(f"[models] PROVIDER_MODELS/CONTEXT_WINDOWS/DEFAULT_MODELS consistency: {'OK' if ok_tab else f'FAIL {missing} {unlisted}'}")
+if not ok_tab: fails.append("model-tables")
 
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")

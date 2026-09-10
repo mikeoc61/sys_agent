@@ -204,7 +204,7 @@ DEEPSEEK_API_KEY=sk-...
 SYS_PROVIDER=anthropic
 SYS_OPENAI_MODEL=gpt-4o-mini
 SYS_ANTHROPIC_MODEL=claude-sonnet-4-6
-SYS_DEEPSEEK_MODEL=deepseek-v4-pro
+SYS_DEEPSEEK_MODEL=deepseek-flash
 ```
 
 ### All environment variables
@@ -217,9 +217,9 @@ SYS_DEEPSEEK_MODEL=deepseek-v4-pro
 | `SYS_PROVIDER` | Skip provider prompt: `openai`, `anthropic`, or `deepseek` | (prompt) |
 | `SYS_OPENAI_MODEL` | OpenAI model string (default favors reliable tool use; set `gpt-4o-mini` for lower cost) | `gpt-5.4-mini` |
 | `SYS_ANTHROPIC_MODEL` | Anthropic model string | `claude-haiku-4-5-20251001` |
-| `SYS_DEEPSEEK_MODEL` | DeepSeek model string | `deepseek-v4-flash` |
+| `SYS_DEEPSEEK_MODEL` | DeepSeek model string | `deepseek-flash` |
 | `SYS_THINKING` | Startup state for extended thinking: `on` / `off` (Anthropic / DeepSeek) | `off` |
-| `SYS_THINKING_EFFORT` | Thinking depth: `low`/`medium`/`high`/`xhigh`/`max` (DeepSeek collapses to `high`/`max`) | `high` |
+| `SYS_THINKING_EFFORT` | Thinking depth: `low`/`medium`/`high`/`xhigh`/`max` (DeepSeek rounds up to `low`/`high`/`max`) | `high` |
 | `SYS_THINKING_MAX_TOKENS` | Output-token cap on thinking turns (Anthropic only) | `32000` |
 | `SYS_THINKING_BUDGET` | Thinking budget for legacy Anthropic models only (Haiku 4.5) | `4000` |
 | `SYS_COMMAND_TIMEOUT` | Per-command wall-clock timeout, seconds | `120` |
@@ -254,7 +254,7 @@ machine will execute the command:
 ```
 [claude-opus-5]   you@m3mac>       show me which services are using the most RAM
 [claude-haiku-4-5] you@raspberrypi> check why bitcoind is restarting
-[deepseek-v4-flash] you@raspberrypi> what's the load average and top process?
+[deepseek-flash]   you@raspberrypi> what's the load average and top process?
 [gpt-5.4-mini]    you@m3mac>       upgrade nginx to the latest stable version
 ```
 
@@ -313,7 +313,7 @@ start with a clean slate: `> ~/.config/sys_agent/history`.
 | `/info` | Print provider/model, session token usage, host facts |
 | `/auto on\|off` | Skip approval prompt (hard-deny list still applies) |
 | `/thinking on\|off` | Toggle extended thinking — Anthropic / DeepSeek (takes effect next turn) |
-| `/effort [level]` | Thinking depth — Anthropic adaptive (all 5), DeepSeek (`high`/`max`); shows the effective grade; needs `/thinking on` |
+| `/effort [level]` | Thinking depth — Anthropic adaptive (all 5), DeepSeek (`low`/`high`/`max`); shows the effective grade; needs `/thinking on` |
 | `/tokens on\|off` | Toggle per-turn token-usage line |
 | `/tokens` | Print current snapshot without changing toggle |
 | `/color on\|off` | Toggle ANSI color output |
@@ -343,7 +343,7 @@ Provider and model selection are no longer startup-only. During a session:
 /model
 /model gpt-5.4-mini
 /model claude-sonnet-4-6
-/model deepseek-v4-pro
+/model deepseek-flash
 ```
 
 Switching providers resets the active conversation and token counters because
@@ -648,8 +648,7 @@ Opus), and routine commands don't need it.
 /effort xhigh        # optional; default is high
 ```
 
-DeepSeek works the same way — `/thinking on` with `deepseek-v4-flash` or
-`deepseek-v4-pro`; both tiers support thinking.
+DeepSeek works the same way — `/thinking on` with `deepseek-flash`.
 
 Or from the environment:
 
@@ -674,9 +673,15 @@ automatically:
 - **Anthropic legacy** (Haiku 4.5 and older): use a fixed `budget_tokens` budget
   (`SYS_THINKING_BUDGET`) plus the interleaved-thinking beta header so reasoning
   can span tool calls. Effort does not apply here.
-- **DeepSeek** (V4 Flash / Pro): thinking is enabled per turn via the request
-  body; depth maps from **effort** to DeepSeek's two grades — `xhigh`/`max` →
-  `max`, everything else → `high`. No token budget or max-tokens raise applies.
+- **DeepSeek** (`deepseek-flash` = V4.1 Flash): thinking is set per turn via the
+  request body. **DeepSeek thinks by default** when no thinking field is sent,
+  so with `/thinking off` sys_agent sends an explicit `disabled` (same rationale
+  as Sonnet 5 / Opus 5). Depth maps from **effort** to DeepSeek's three grades:
+  `low` → `low`, `medium`/`high` → `high`, `xhigh`/`max` → `max` (levels without
+  a native grade round up; DeepSeek's own server table maps `xhigh` → `high`).
+  No token budget or max-tokens raise applies. The legacy `deepseek-v4-flash`
+  and `deepseek-v4-pro` names are accepted but server-routed to V4.1 Flash
+  (`v4-pro` from 2026-09-14, until V4.1 Pro ships).
   DeepSeek imposes a strict replay contract: once a thinking turn makes a tool
   call, the reasoning scratchpad must be echoed back on every subsequent
   assistant message or the next request 400s. sys_agent handles this internally
@@ -692,11 +697,12 @@ Behavior, all paths:
 - A `[thinking…]` marker is shown while the model works; high-effort Opus turns
   can take a while.
 - `/effort` echoes the grade actually used, not just what you typed: on DeepSeek
-  it shows the clamped grade with a `(DeepSeek floor)` / `(DeepSeek ceiling)`
-  note (`low`–`high` → `high`, `xhigh`/`max` → `max`); on providers/models that
-  ignore effort it says `(no effect on this provider/model)`; and it appends
-  `needs /thinking on` when effort is set but thinking is off. The stored level
-  is your request, so switching to a finer-grained provider still honors it.
+  it shows the mapped grade with a `(rounded up to DeepSeek grade)` note when
+  the level has no native grade (`medium` → `high`, `xhigh` → `max`); on
+  providers/models that ignore effort it says `(no effect on this
+  provider/model)`; and it appends `needs /thinking on` when effort is set but
+  thinking is off. The stored level is your request, so switching to a
+  finer-grained provider still honors it.
 
 Anthropic-specific:
 
