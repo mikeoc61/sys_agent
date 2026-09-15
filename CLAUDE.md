@@ -57,9 +57,26 @@ startup prior). E.g. battery SoH passes; SoC fails.
 ## Verification
 - Baseline: `python3 -m py_compile sys_agent.py && python3 test_consult_render.py`
   (offline, no keys; must print `RESULT: ALL PASS`).
-- Extend `test_consult_render.py` for wire-format changes; prefer driving real
-  code with fake clients/providers over isolated unit tests. Mutation-check new
-  guards (revert the fix, confirm the test fails).
+- Hardware harness: `python3 test_hardware.py` — offline and keyless, but needs
+  a pty and a real process table, so it is per-host and NOT part of the
+  baseline. Run it on the Pi and the Mac before tagging. Covers what the
+  baseline structurally cannot: signal delivery and process-group teardown, the
+  approval prompt under real readline, env-file resolution at real startup. It
+  reports the live readline backend, so a run records which of the two paths
+  was exercised.
+- **NO-SPAWN invariant in `test_hardware.py`:** its REPL checks stub
+  `execute()`, the single point where an approved command becomes a subprocess.
+  Never restore the real one there. A mutation check on a safety gate must
+  neutralize the payload in the same step that removes the gate — removing the
+  gate is exactly what makes the payload live. (Learned the hard way: a
+  mutation run once put a live `rm -rf /` through the execution path on the Pi,
+  stopped only by coreutils' `--preserve-root`.)
+- Extend `test_consult_render.py` for wire-format changes and `test_hardware.py`
+  for anything touching signals, process management, readline, or startup
+  ordering; prefer driving real code with fake clients/providers over isolated
+  unit tests. Mutation-check new guards (revert the fix, confirm the test
+  fails), and make the mutation reproduce the ORIGINAL bug — a mutation that
+  merely reshapes the code can still pass and prove nothing.
 - Validate claims against raw API/command output, not model self-reports.
 - Before asserting a provider API behavior, probe it (curl) or cite current
   docs. Provider defaults change without notice.
@@ -72,8 +89,8 @@ startup prior). E.g. battery SoH passes; SoC fails.
   prompt-rule changes. Single commits unless a split helps bisect.
 - Commit subject: terse, imperative. Tag message: substantive (what and why,
   non-obvious reasoning such as replay contracts).
-- Commit freely; **tag only after Pi validation** (display-only changes may skip
-  hardware re-test). Never force-update a published tag. Push tags explicitly:
+- Commit freely; **tag only after Pi validation** — both harnesses green on the
+  Pi (display-only changes may skip hardware re-test). Never force-update a published tag. Push tags explicitly:
   `git push origin <tag>`. Check `git describe --tags` before choosing a number.
 - Do not tag or push without explicit instruction.
 
