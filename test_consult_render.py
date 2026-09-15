@@ -322,6 +322,44 @@ print(f"[killgroup] SIGTERM-ignoring descendant killed ({'OK' if ok_kill else 'F
       f"reaped proc safe ({'OK' if ok_reaped else 'FAIL'})")
 if not ok_pg: fails.append("kill-group")
 
+# 13) config resolution runs AFTER the env file is loaded. Every SYS_* setting
+#     used to be captured at import, before main() read the file, so a
+#     documented .env value was silently ignored. Shell vars must still win,
+#     and a bad value must be reported rather than abort startup.
+_saved = {k: os.environ.get(k) for k in
+          ("SYS_COMMAND_TIMEOUT", "SYS_THINKING", "SYS_TOP_PROCESSES",
+           "SYS_THINKING_EFFORT")}
+_orig = (S.COMMAND_TIMEOUT, S.ANTHROPIC_THINKING_DEFAULT,
+         S.RUNTIME_TOP_PROCESSES, S.ANTHROPIC_THINKING_EFFORT_DEFAULT)
+try:
+    # Simulate load_env_file having merged these in, then re-resolve.
+    os.environ["SYS_COMMAND_TIMEOUT"] = "7"
+    os.environ["SYS_THINKING"] = "on"
+    probs = S.init_config()
+    ok_cfg = (S.COMMAND_TIMEOUT == 7 and S.ANTHROPIC_THINKING_DEFAULT is True
+              and not probs)
+    # Bad values: reported, ignored, never raised.
+    os.environ["SYS_COMMAND_TIMEOUT"] = "abc"
+    os.environ["SYS_TOP_PROCESSES"] = "-4"
+    os.environ["SYS_THINKING_EFFORT"] = "turbo"
+    probs = S.init_config()
+    ok_bad = (len(probs) == 3 and S.COMMAND_TIMEOUT == 7
+              and S.RUNTIME_TOP_PROCESSES == _orig[2]
+              and S.ANTHROPIC_THINKING_EFFORT_DEFAULT in S._VALID_EFFORTS)
+    # Derived table tracks the model globals.
+    os.environ["SYS_ANTHROPIC_MODEL"] = "claude-sonnet-5"
+    S.init_config()
+    ok_derived = S.DEFAULT_MODELS["anthropic"] == "claude-sonnet-5"
+finally:
+    os.environ.pop("SYS_ANTHROPIC_MODEL", None)
+    for k, v in _saved.items():
+        if v is None: os.environ.pop(k, None)
+        else: os.environ[k] = v
+    S.init_config()
+ok_conf = ok_cfg and ok_bad and ok_derived
+print(f"[config] env file values applied, bad values reported not fatal: {'OK' if ok_conf else 'FAIL'}")
+if not ok_conf: fails.append("config-init")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)

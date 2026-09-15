@@ -128,7 +128,7 @@ from typing import Any
 # For a cost floor, gpt-4o-mini ($0.15/$0.60) is still marginally cheapest;
 # gpt-5.6-luna is the better-quality-per-dollar pick now. Switch via /model or
 # SYS_OPENAI_MODEL.
-DEFAULT_OPENAI_MODEL = os.environ.get("SYS_OPENAI_MODEL", "gpt-5.4-mini")
+DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"          # override: SYS_OPENAI_MODEL
 
 # Anthropic options (verified Jul 2026):
 #   claude-haiku-4-5-20251001  — fast/cheap, solid tool use, supports thinking
@@ -168,9 +168,7 @@ DEFAULT_OPENAI_MODEL = os.environ.get("SYS_OPENAI_MODEL", "gpt-5.4-mini")
 #                                for this tool (cf. gpt-5.6-sol): left out of
 #                                PROVIDER_MODELS, CONTEXT_WINDOWS entry only,
 #                                reachable via /model claude-fable-5 fallback.
-DEFAULT_ANTHROPIC_MODEL = os.environ.get(
-    "SYS_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"
-)
+DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"   # override: SYS_ANTHROPIC_MODEL
 
 # DeepSeek options (verified Sep 2026):
 #   deepseek-flash     — DeepSeek-V4.1-Flash (released 2026-09-10), new causal
@@ -192,7 +190,7 @@ DEFAULT_ANTHROPIC_MODEL = os.environ.get(
 # reasoning_content + reasoning_tokens returned), so DeepSeekProvider sends an
 # explicit disabled when /thinking is off. Effort grades low|high|max.
 # OpenAI-compatible endpoint (see DeepSeekProvider).
-DEFAULT_DEEPSEEK_MODEL = os.environ.get("SYS_DEEPSEEK_MODEL", "deepseek-flash")
+DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"      # override: SYS_DEEPSEEK_MODEL
 
 # Per-provider startup default, indexed by provider name. Used by
 # select_provider's interactive picker so it never instantiates an SDK client
@@ -305,7 +303,7 @@ OUTPUT_MAX_CHARS = 8000
 # Default raised to 120s so package upgrades on slower hosts (e.g. a Pi) are
 # less likely to be killed mid-operation. On timeout the whole process group
 # is signalled (see execute()), so a killed apt-get does not orphan dpkg.
-COMMAND_TIMEOUT = int(os.environ.get("SYS_COMMAND_TIMEOUT", "120"))
+COMMAND_TIMEOUT = 120                          # override: SYS_COMMAND_TIMEOUT
 
 # Anthropic requires max_tokens; pick something generous for tool dialogs.
 ANTHROPIC_MAX_TOKENS = 4096
@@ -325,23 +323,21 @@ ANTHROPIC_MAX_TOKENS = 4096
 #   - "enabled": thinking={"type":"enabled","budget_tokens":N} + the interleaved
 #     beta header (lets reasoning span tool calls and budget exceed max_tokens).
 #     Used by Haiku 4.5 and older Claude 4 models, which lack adaptive/effort.
-ANTHROPIC_THINKING_DEFAULT = os.environ.get("SYS_THINKING", "off").strip().lower() == "on"
+ANTHROPIC_THINKING_DEFAULT = False             # override: SYS_THINKING
 
 # effort: low|medium|high|xhigh|max. Steers adaptive thinking depth; "high" is
 # the API default. Ignored on the "enabled" (Haiku/legacy) path.
 _VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
-ANTHROPIC_THINKING_EFFORT_DEFAULT = os.environ.get("SYS_THINKING_EFFORT", "high").strip().lower()
-if ANTHROPIC_THINKING_EFFORT_DEFAULT not in _VALID_EFFORTS:
-    ANTHROPIC_THINKING_EFFORT_DEFAULT = "high"
+ANTHROPIC_THINKING_EFFORT_DEFAULT = "high"     # override: SYS_THINKING_EFFORT
 
 # budget_tokens for the legacy "enabled" path only (Haiku 4.5 / older).
-ANTHROPIC_THINKING_BUDGET = int(os.environ.get("SYS_THINKING_BUDGET", "4000"))
+ANTHROPIC_THINKING_BUDGET = 4000               # override: SYS_THINKING_BUDGET
 
 # On a thinking turn the model needs headroom to reason AND answer/act; the
 # 4096 default would truncate. Anthropic suggests a large cap at high+ effort.
 # 32K stays under every current model's output ceiling (Haiku/Sonnet 64K,
 # Opus 128K) and only bills for tokens actually produced.
-ANTHROPIC_THINKING_MAX_TOKENS = int(os.environ.get("SYS_THINKING_MAX_TOKENS", "32000"))
+ANTHROPIC_THINKING_MAX_TOKENS = 32000          # override: SYS_THINKING_MAX_TOKENS
 
 # Interleaved-thinking beta header — needed only on the "enabled" path. It is
 # deprecated/ignored on adaptive models, so it is NOT sent in adaptive mode.
@@ -381,7 +377,7 @@ API_MAX_RETRIES = 5
 # the failure mode here is not just wrong prose but wrong COMMANDS
 # (hallucinated flags, paths, unit names; stale syntax for newer tool
 # versions). Suppress with SYS_DISCLAIMER=off once internalized.
-SHOW_DISCLAIMER = os.environ.get("SYS_DISCLAIMER", "on").strip().lower() != "off"
+SHOW_DISCLAIMER = True                         # override: SYS_DISCLAIMER
 DISCLAIMER = (
     "model-proposed commands can be confidently wrong — LLMs hallucinate "
     "flags, paths, and facts, and may lag current software versions. The "
@@ -700,7 +696,7 @@ def save_readline_history() -> None:
 # marker so logs stay clean. Disable entirely with SYS_PROGRESS=off. Stdlib
 # only; the worker writes stdout solely while the main thread is parked in
 # chat(), and is stopped+joined before the line is cleared, so writes never race.
-SHOW_PROGRESS = os.environ.get("SYS_PROGRESS", "on").strip().lower() != "off"
+SHOW_PROGRESS = True                           # override: SYS_PROGRESS
 _SPINNER_INTERVAL = 0.1                 # seconds between frames
 _SPINNER_DELAY = 1.5                    # suppress the spinner for ops faster than this
 
@@ -1718,7 +1714,7 @@ def _gather_hardware_facts() -> dict[str, Any]:
 # silently dropped.
 RUNTIME_MAX_SERVICES = 80
 # Top-N processes by aggregate resident memory. Override with SYS_TOP_PROCESSES.
-RUNTIME_TOP_PROCESSES = int(os.environ.get("SYS_TOP_PROCESSES", "10"))
+RUNTIME_TOP_PROCESSES = 10                     # override: SYS_TOP_PROCESSES
 # macOS only: launchd label prefixes dropped from the service list, leaving the
 # user-relevant daemons (Homebrew, vendor helpers, custom LaunchAgents/Daemons)
 # the model actually needs to name.
@@ -4276,18 +4272,137 @@ def run_repl(provider: Provider) -> None:
 # main
 # -----------------------------------------------------------------------------
 
+def _env_str(name: str, current: str) -> str:
+    """Env override for a free-form string. Empty/whitespace means unset."""
+    raw = os.environ.get(name)
+    return raw.strip() if raw and raw.strip() else current
+
+
+def _env_int(name: str, current: int, *, minimum: int = 1) -> tuple[int, str | None]:
+    """Env override for an integer -> (value, problem). Never raises: these are
+    resolved before the REPL exists, and a bare int() here used to abort
+    startup with a traceback on a typo'd value."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return current, None
+    try:
+        val = int(raw.strip())
+    except ValueError:
+        return current, f"{name}={raw.strip()!r} is not an integer — keeping {current}"
+    if val < minimum:
+        return current, f"{name}={val} is below the minimum {minimum} — keeping {current}"
+    return val, None
+
+
+def _env_flag(name: str, current: bool) -> tuple[bool, str | None]:
+    """Env override for an on/off switch -> (value, problem)."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return current, None
+    val = raw.strip().lower()
+    if val in ("on", "1", "true", "yes"):
+        return True, None
+    if val in ("off", "0", "false", "no"):
+        return False, None
+    state = "on" if current else "off"
+    return current, f"{name}={raw.strip()!r} is not on/off — keeping {state}"
+
+
+def _env_choice(name: str, current: str,
+                valid: tuple[str, ...]) -> tuple[str, str | None]:
+    """Env override constrained to a fixed set -> (value, problem)."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return current, None
+    val = raw.strip().lower()
+    if val not in valid:
+        return current, (f"{name}={raw.strip()!r} is not one of "
+                         f"{'|'.join(valid)} — keeping {current}")
+    return val, None
+
+
+def init_config() -> list[str]:
+    """Resolve every SYS_* setting from os.environ into the module globals.
+
+    Called once at import (shell environment only) and again from main() after
+    the env file has been merged in. Without that second pass every setting
+    documented as .env-configurable was captured before the file was ever read,
+    so the file's value was silently ignored — the shell path worked, the
+    documented file path did not.
+
+    Shell variables still win: load_env_file() never overwrites an existing
+    os.environ entry, so re-resolving here cannot demote them.
+
+    Each global keeps its literal default at its definition site above (see the
+    `override:` comments); the lookups below only replace it when the variable
+    is set, which keeps one source of truth per setting. Idempotent.
+
+    Returns human-readable problems for the caller to print. A bad value is
+    reported and ignored, never fatal.
+    """
+    global DEFAULT_OPENAI_MODEL, DEFAULT_ANTHROPIC_MODEL, DEFAULT_DEEPSEEK_MODEL
+    global COMMAND_TIMEOUT, ANTHROPIC_THINKING_DEFAULT
+    global ANTHROPIC_THINKING_EFFORT_DEFAULT, ANTHROPIC_THINKING_BUDGET
+    global ANTHROPIC_THINKING_MAX_TOKENS, SHOW_DISCLAIMER, SHOW_PROGRESS
+    global RUNTIME_TOP_PROCESSES
+
+    problems: list[str] = []
+
+    def take(resolved: tuple[Any, str | None]) -> Any:
+        value, problem = resolved
+        if problem:
+            problems.append(problem)
+        return value
+
+    DEFAULT_OPENAI_MODEL = _env_str("SYS_OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+    DEFAULT_ANTHROPIC_MODEL = _env_str("SYS_ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL)
+    DEFAULT_DEEPSEEK_MODEL = _env_str("SYS_DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
+    # Derived table — mutated in place so references captured elsewhere stay
+    # valid. Model strings are not validated against PROVIDER_MODELS: pinning
+    # an unlisted model via SYS_*_MODEL is a supported escape hatch.
+    DEFAULT_MODELS.update({
+        "openai": DEFAULT_OPENAI_MODEL,
+        "anthropic": DEFAULT_ANTHROPIC_MODEL,
+        "deepseek": DEFAULT_DEEPSEEK_MODEL,
+    })
+
+    COMMAND_TIMEOUT = take(_env_int("SYS_COMMAND_TIMEOUT", COMMAND_TIMEOUT))
+    ANTHROPIC_THINKING_DEFAULT = take(
+        _env_flag("SYS_THINKING", ANTHROPIC_THINKING_DEFAULT))
+    ANTHROPIC_THINKING_EFFORT_DEFAULT = take(
+        _env_choice("SYS_THINKING_EFFORT",
+                    ANTHROPIC_THINKING_EFFORT_DEFAULT, _VALID_EFFORTS))
+    ANTHROPIC_THINKING_BUDGET = take(
+        _env_int("SYS_THINKING_BUDGET", ANTHROPIC_THINKING_BUDGET))
+    ANTHROPIC_THINKING_MAX_TOKENS = take(
+        _env_int("SYS_THINKING_MAX_TOKENS", ANTHROPIC_THINKING_MAX_TOKENS))
+    SHOW_DISCLAIMER = take(_env_flag("SYS_DISCLAIMER", SHOW_DISCLAIMER))
+    SHOW_PROGRESS = take(_env_flag("SYS_PROGRESS", SHOW_PROGRESS))
+    RUNTIME_TOP_PROCESSES = take(
+        _env_int("SYS_TOP_PROCESSES", RUNTIME_TOP_PROCESSES))
+    return problems
+
+
+# Shell environment only — main() re-runs this once the env file is loaded.
+init_config()
+
+
 def main() -> None:
     explicit = os.environ.get("SYS_ENV_FILE")
     env_file = find_env_file(explicit)
+    # The env file is loaded before the first coloured output and before
+    # config resolution: it may set SYS_COLOR/NO_COLOR (read by init_color)
+    # and any SYS_* setting captured at import.
+    loaded = load_env_file(env_file) if env_file else 0
     init_color()
     init_readline()
     atexit.register(save_readline_history)
-    if env_file:
-        n = load_env_file(env_file)
-        if n:
-            print(dim(f"[loaded {n} vars from {env_file}]"))
-    elif explicit:
+    if loaded:
+        print(dim(f"[loaded {loaded} vars from {env_file}]"))
+    elif explicit and not env_file:
         print(warn(f"[SYS_ENV_FILE={explicit} not found; relying on shell env]"))
+    for problem in init_config():
+        print(warn(f"[config] {problem}"))
     init_audit()
     if _audit_path:
         print(dim(f"[audit log → {_audit_path}]"))

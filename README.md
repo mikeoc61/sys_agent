@@ -147,7 +147,11 @@ exists:
 2. `$XDG_CONFIG_HOME/sys_agent/.env` (default `~/.config/sys_agent/.env`)
 3. `~/.sys_agent.env` — home dotfile fallback
 
-Shell-exported variables always override file values.
+Shell-exported variables always override file values. Every `SYS_*` setting
+is resolved *after* the file is loaded, so values set there take effect
+identically to shell-exported ones. A malformed value (a non-numeric timeout,
+an unknown effort grade) is reported as a `[config]` warning at startup and
+the built-in default is kept — it never aborts startup.
 
 ### Quick setup
 
