@@ -3,7 +3,16 @@
 Single-file Python CLI agent: an LLM (Anthropic, OpenAI, or DeepSeek) proposes
 shell commands via native tool calling; each runs only after per-command human
 approval. `sys_agent.py` + PEP 723 inline deps; runs via `uv run sys_agent.py`
-(pip+venv path also documented in README).
+(pip+venv path also documented in `docs/configuration.md`).
+
+## Docs layout
+`README.md` is getting-started only, written for a non-technical reader: what
+the tool is, the safety model, install, first session, everyday commands.
+Reference material lives in `docs/` — `configuration.md` (all `SYS_*` vars,
+files, alternative install), `advanced-usage.md` (all meta-commands, consult,
+thinking, line editing), `technical-reference.md` (host facts, hardware
+identity, SMART, safety layers, audit format, architecture). Keep new detail
+out of the README; link to the page that owns it.
 
 ## Hard constraints
 - **Single file.** Do not split `sys_agent.py` into modules or add deps beyond
@@ -85,8 +94,9 @@ startup prior). E.g. battery SoH passes; SoC fails.
 ## Git and release
 - Semver `vX.Y.Z`, annotated tags. Minor: new model support, new facts blocks.
   Patch: probe-list gaps, prompt-only, docs-only.
-- README updated in the same commit as the code; system prompt alongside
-  prompt-rule changes. Single commits unless a split helps bisect.
+- README and the `docs/` page that owns the affected material updated in the
+  same commit as the code; system prompt alongside prompt-rule changes. Single
+  commits unless a split helps bisect.
 - Commit subject: terse, imperative. Tag message: substantive (what and why,
   non-obvious reasoning such as replay contracts).
 - Commit freely; **tag only after Pi validation** — both harnesses green on the

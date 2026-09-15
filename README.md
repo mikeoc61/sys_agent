@@ -1,868 +1,240 @@
 # sys_agent
 
-A command-line agent for system administration. You ask in plain language; a
-remote LLM (OpenAI, Anthropic, or DeepSeek) proposes shell commands informed by
-real facts about your host; nothing runs until you approve it. Single Python
-file. No frameworks.
+Ask questions about your computer in plain language. sys_agent checks your
+system, asks an AI service for the next step, and shows you each suggested
+command for approval before running it.
+
+Use it to investigate problems, check disk space, understand running services,
+and maintain a Mac, Linux computer, or Raspberry Pi.
 
 <!-- BEGIN EXAMPLE -->
-![sys_agent example session](assets/example-session.svg)
+![Example sys_agent session showing a question and a proposed command](assets/example-session.svg)
 <!-- END EXAMPLE -->
 
-## Why
+[Why sys_agent](#why-sys_agent) · [Get started](#get-started) ·
+[Your first session](#your-first-session) ·
+[Everyday commands](#everyday-commands) · [More help](#more-help)
 
-Off-the-shelf agentic CLIs (aider, claude-code, etc.) optimize for code
-authoring. sys_agent optimizes for a different loop: ad-hoc system
-administration, infrastructure tuning, and debugging — the class of question
-whose correct answer depends on the OS distro, init system, package manager,
-and whichever tools happen to be on the invoking user's PATH.
+## Why sys_agent
 
-To close that gap it probes the host at startup and ships those facts with
-every turn, so the commands that come back are already in the syntax that
-machine takes.
+AI coding tools are built for writing code. sys_agent is built for a different
+job: ad-hoc system administration, where the right answer depends on the
+distro, init system, package manager, and which tools happen to be installed on
+the machine in front of you.
 
-## Features
+So it looks at the host before it asks anything. Hardware model, OS, disks,
+running services, and available tools are collected at startup and sent with
+every question, so the commands that come back already fit this machine — the
+same question gets a different answer on a Raspberry Pi than on a cloud server,
+without a round of guessing first. See
+[collected host information](docs/technical-reference.md) for the full list.
 
-- **Approval-gated execution** — every proposed command is shown with its
-  reason and CWD before anything is spawned. Per command: run, edit in place,
-  skip, or stop the whole workflow. See [Safety model](#safety-model).
-- **Local hard-deny list** — a short set of irrecoverable patterns (`rm -rf /`,
-  `mkfs`, fork bomb, raw `dd` to a block device) is blocked client-side,
-  whatever the model proposes and whatever you approve. `/auto on` cannot
-  bypass it.
-- **Multi-provider** — OpenAI, Anthropic, or DeepSeek, picked at startup from
-  the keys you have. Switch mid-session with
-  [`/provider` and `/model`](#runtime-providermodel-switching).
-- **Host-aware** — distro, shell, arch, package/init/container tooling, disk
-  topology, and PATH tool probes ship with every turn, so command syntax fits
-  the machine. Inspect or re-probe with [`/facts`](#refreshable-host-facts).
-- **Hardware identity** — vendor, model, `platform_class`
-  (`sbc`/`laptop`/`desktop`/`server`/`vm`/`container`), RAM, swap, and a cloud
-  label when DMI identifies one, so the model knows a Pi 5 from an EC2 instance
-  before it proposes telemetry that host cannot produce.
-  See [Hardware identity](#hardware-identity).
-- **Runtime snapshot** — running services (system and user scope), failed
-  units, and top processes by RSS, captured at startup so the model uses real
-  unit names on the first turn instead of probing for them. Process names only,
-  never arguments.
-  See [Runtime snapshot](#runtime-snapshot-services-and-processes).
-- **USB-bridge SMART hints** — startup resolves a USB enclosure's bridge chip
-  and precomputes the `smartctl -d` pass-through token, so a drive behind an
-  enclosure reads correctly on the first try rather than by trial and error.
-  See [SMART over USB bridges](#smart-over-usb-bridges).
-- **Extended thinking** (Anthropic / DeepSeek) — an opt-in reasoning pass via
-  [`/thinking`](#extended-thinking), surfaced inline. Off by default: thinking
-  tokens bill as output.
-- **Multi-provider consult** — [`/consult`](#multi-provider-consult) asks the
-  *other* configured providers how they would open the current question and
-  shows each first move beside the active provider's. Read-only; it executes
-  nothing and never touches the approval gate.
-- **Audit log** — an append-only JSONL record of every command proposed and its
-  disposition (`run`/`edit`/`skip`/`deny`/`abort`) plus exit code. On by
-  default, output bodies excluded; review it in place with
-  [`/history`](#reviewing-history).
-- **Model- and host-aware prompt** — `[claude-opus-5] you@m3mac>` keeps it
-  clear which model is answering, which machine will run the command, and that
-  this is not a plain shell.
-- **Persistent history** — readline line editing with recall across sessions.
-  Meta-commands and `y`/`n` answers are filtered out, so Up-arrow surfaces only
-  real prompts. See [Tips & shortcuts](#tips--shortcuts).
-- **Legible at runtime** — per-turn and session token usage, semantic ANSI
-  color (TTY- and `NO_COLOR`-aware), and an elapsed-seconds spinner so a slow
-  turn never looks hung. Each toggles at runtime or from the environment.
-- **Zero install footprint with uv** — PEP 723 inline dependencies; `uv` builds
-  and caches the environment on first run.
-## Requirements
+## Before you start
 
-- Python 3.10–3.13 recommended. Newer interpreters work only if binary
-  wheels exist for `pydantic-core` (pulled in by both SDKs); on a
-  just-released Python, pip may fall back to a Rust source build that
-  fails against PyO3's supported-version ceiling. `uv run --python 3.13`
-  sidesteps this.
-- One of: `uv` (recommended) **or** pip + venv
-- An OpenAI, Anthropic, and/or DeepSeek API key
-- macOS/Linux for the full experience. On Windows, the stdlib lacks
-  `readline` — the script still runs, but loses history persistence,
-  Up/Down recall, and line-editing keystrokes.
+You will need:
 
-## Install
+- **A Mac or Linux computer**, including Raspberry Pi, with internet access.
+- **A terminal** in which to paste the setup commands below.
+- **Git and uv** installed. Git downloads this project; [uv](https://docs.astral.sh/uv/)
+  manages Python and the libraries it needs.
+- **An API key from OpenAI, Anthropic, or DeepSeek.** This is a private access
+  key for the AI service you choose. One provider is enough. Check that
+  provider's API billing before use; do not assume a chat subscription
+  includes it.
 
-### With uv (recommended)
+### What runs locally, and what is shared?
+
+Commands run on the computer where you start sys_agent, with your user
+account's permissions. There is no sandbox separating them from your files.
+
+Your questions, collected system information, and command results are sent to
+the selected AI provider. System information includes hardware, disks, and
+running services. Command output can contain sensitive information, so consider
+what a proposed command will read before approving it.
+
+### You control execution
+
+Approval is required by default. Read each command and its explanation before
+running it: AI suggestions can be wrong. **Pressing Enter approves the
+command.**
+
+A short deny list blocks some destructive commands, but it cannot recognize
+every dangerous operation. Stopping a session does **not** undo changes already
+made. Automatic approval ([`/auto on`](docs/advanced-usage.md#meta-commands))
+runs every command without asking; leave it off while getting familiar with the
+tool.
+
+## Get started
+
+These steps use macOS or Linux. Paste shell commands into your terminal;
+questions and slash commands go into sys_agent after it starts.
+
+### 1. Check the prerequisites
+
+```bash
+git --version
+uv --version
+```
+
+Both should print a version number. If either command is missing, install it
+before continuing. See the [Git installation guide](https://git-scm.com/book/en/v2/Getting-Started-Installing-Git)
+and [uv installation guide](https://docs.astral.sh/uv/getting-started/installation/).
+
+### 2. Download sys_agent
 
 ```bash
 git clone https://github.com/mikeoc61/sys_agent.git
 cd sys_agent
-chmod +x sys_agent.py
-mkdir -p ~/.local/bin
-ln -sf "$PWD/sys_agent.py" ~/.local/bin/sys_agent
-sys_agent
 ```
 
-First invocation builds a cached environment from the script's inline
-dependency block; subsequent runs are instant.
+Keep this terminal open in the `sys_agent` folder for the remaining steps.
 
-> To pin the interpreter independently of the system Python:
-> `uv run --python 3.13 sys_agent.py`. uv fetches and caches a managed
-> CPython; nothing on the host changes. Useful on distributions that
-> ship a Python newer than the Rust extension wheels have caught up to.
+### 3. Add your API key
 
-> **macOS**: the inline block pulls in `gnureadline` automatically
-> (`sys_platform == 'darwin'`) to replace the system libedit-backed
-> readline with proper GNU readline so colored prompts render correctly
-> and Up/Down history navigation redraws cleanly. Linux installs skip
-> this dependency.
-
-### With pip + venv
-
-```bash
-git clone https://github.com/mikeoc61/sys_agent.git
-cd sys_agent
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
-python3 sys_agent.py
-```
-
-`requirements.txt` carries the same `gnureadline` macOS-only marker as
-the inline block.
-
-> Invoke with `python3 sys_agent.py`, not `./sys_agent.py` — the shebang
-> is `#!/usr/bin/env -S uv run --script`, which routes execution through
-> uv and bypasses the venv you just activated.
->
-> `pip install -U pip` is not optional on a freshly released Python. A
-> stale pip doesn't recognize the new interpreter's wheel tag, falls back
-> to building `pydantic-core` from source, and fails against PyO3's
-> supported-version ceiling.
-
-## Configuration
-
-API keys can come from the shell environment or from a key-value file. If
-`SYS_ENV_FILE` is set, that path is used exclusively. Otherwise sys_agent
-searches the following locations in priority order and uses the first that
-exists:
-
-1. `./.env` — current working directory (dotenv convention)
-2. `$XDG_CONFIG_HOME/sys_agent/.env` (default `~/.config/sys_agent/.env`)
-3. `~/.sys_agent.env` — home dotfile fallback
-
-Shell-exported variables always override file values. Every `SYS_*` setting
-is resolved *after* the file is loaded, so values set there take effect
-identically to shell-exported ones. A malformed value (a non-numeric timeout,
-an unknown effort grade) is reported as a `[config]` warning at startup and
-the built-in default is kept — it never aborts startup.
-
-### Quick setup
+Create a private configuration file:
 
 ```bash
 mkdir -p ~/.config/sys_agent
-cp .env.example ~/.config/sys_agent/.env
+touch ~/.config/sys_agent/.env
 chmod 600 ~/.config/sys_agent/.env
-$EDITOR ~/.config/sys_agent/.env
+nano ~/.config/sys_agent/.env
 ```
 
-The template (`.env.example`) is committed; the real `.env` is gitignored.
+In the editor, add **one** of these lines for the provider you use. Replace
+`YOUR_API_KEY` with your actual key. Do not paste all three unless you have
+keys for all three providers.
 
-### File format
-
-Shell-style `KEY=value`, one per line. `export` prefix and `#` comments
-are accepted; matching surrounding quotes are stripped.
-
-```sh
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
-DEEPSEEK_API_KEY=sk-...
-# Optional overrides
-SYS_PROVIDER=anthropic
-SYS_OPENAI_MODEL=gpt-4o-mini
-SYS_ANTHROPIC_MODEL=claude-sonnet-4-6
-SYS_DEEPSEEK_MODEL=deepseek-flash
+```text
+OPENAI_API_KEY=YOUR_API_KEY
+ANTHROPIC_API_KEY=YOUR_API_KEY
+DEEPSEEK_API_KEY=YOUR_API_KEY
 ```
 
-### All environment variables
+In nano, press **Ctrl-O**, then **Enter** to save, and **Ctrl-X** to exit.
+If nano is unavailable, open the same file in a text editor of your choice.
+Keep this file private; do not share your key in screenshots or messages.
 
-| Var | Purpose | Default |
-|---|---|---|
-| `OPENAI_API_KEY` | OpenAI auth (one of the three required) | — |
-| `ANTHROPIC_API_KEY` | Anthropic auth (one of the three required) | — |
-| `DEEPSEEK_API_KEY` | DeepSeek auth (one of the three required) | — |
-| `SYS_PROVIDER` | Skip provider prompt: `openai`, `anthropic`, or `deepseek` | (prompt) |
-| `SYS_OPENAI_MODEL` | OpenAI model string (default favors reliable tool use; set `gpt-4o-mini` for lower cost) | `gpt-5.4-mini` |
-| `SYS_ANTHROPIC_MODEL` | Anthropic model string | `claude-haiku-4-5-20251001` |
-| `SYS_DEEPSEEK_MODEL` | DeepSeek model string | `deepseek-flash` |
-| `SYS_THINKING` | Startup state for extended thinking: `on` / `off` (Anthropic / DeepSeek) | `off` |
-| `SYS_THINKING_EFFORT` | Thinking depth: `low`/`medium`/`high`/`xhigh`/`max` (DeepSeek rounds up to `low`/`high`/`max`) | `high` |
-| `SYS_THINKING_MAX_TOKENS` | Output-token cap on thinking turns (Anthropic only) | `32000` |
-| `SYS_THINKING_BUDGET` | Thinking budget for legacy Anthropic models only (Haiku 4.5) | `4000` |
-| `SYS_COMMAND_TIMEOUT` | Per-command wall-clock timeout, seconds | `120` |
-| `SYS_TOP_PROCESSES` | Top-N processes (by RSS) in the runtime snapshot | `10` |
-| `SYS_AUDIT_LOG` | Audit-log path, or `off`/empty to disable | `~/.config/sys_agent/audit.log` |
-| `SYS_AUDIT_BODY` | Also log command stdout/stderr in the audit log (capped) | `off` |
-| `SYS_ENV_FILE` | Explicit env-file path; skips the search above | (search) |
-| `SYS_COLOR` | `on` / `off` / `auto` | `auto` |
-| `NO_COLOR` | If set, disables color regardless of `SYS_COLOR=auto` | — |
-| `SYS_PROGRESS` | Activity spinner during model calls / command execution: `on`/`off` | `on` |
-| `SYS_DISCLAIMER` | Startup notice that model-proposed commands can be wrong: `on`/`off` | `on` |
+These steps use the default configuration location. If you have customized
+`XDG_CONFIG_HOME`, use that folder instead of `~/.config`.
 
-### Files
+Two things take precedence over this file: variables already exported in your
+shell, and a `.env` file in the folder you launch from. The project folder from
+step 2 is searched *first*, so if a `.env` ever appears there it wins over the
+one you just created — a surprise worth knowing about before you go looking
+for a key that seems to be ignored. The project also ships `.env.example`, a
+commented template listing every available setting; see
+[configuration lookup](docs/configuration.md#configuration) for both.
 
-| Path | Purpose |
+### 4. Start it
+
+From the downloaded `sys_agent` folder:
+
+```bash
+uv run --python 3.13 sys_agent.py
+```
+
+On the first run, uv downloads Python if needed and installs the required
+libraries in its cache. Later runs reuse them. If you configured more than one
+AI provider, sys_agent asks which one to use.
+
+Use the same command from this folder for future sessions. You can also set up
+an optional [terminal shortcut](docs/configuration.md#install-a-terminal-shortcut)
+to launch it as `sys_agent` from other folders.
+
+## Your first session
+
+Start with a question that only asks for information:
+
+```text
+How much disk space do I have left?
+```
+
+Other questions to try:
+
+- "Which programs are using the most memory?"
+- "How long has this computer been running?"
+- "Help me understand why this service keeps restarting."
+
+The prompt shows the AI model and the computer you are working on. When the AI
+suggests a command, sys_agent shows the command, its reason, and the folder
+where it will run (`CWD`).
+
+### Approve, skip, or stop
+
+| Your input | What happens |
 |---|---|
-| `~/.config/sys_agent/.env` *(or one of the alternatives above)* | API keys and `SYS_*` overrides |
-| `~/.config/sys_agent/history` | Readline history (1000-line cap, persistent across sessions) |
-| `~/.config/sys_agent/audit.log` | Append-only JSONL command audit trail (path/disable via `SYS_AUDIT_LOG`) |
+| `y` or Enter | Run the displayed command. |
+| `n` | Skip this command. The AI may suggest another step. |
+| `e` | Edit the command, then run the edited version if the deny list allows it. |
+| `q` | Stop the current task and return to the question prompt. |
 
-The history file is created on first exit. Only conversational prompts are
-retained — meta-commands (`/info`, `/exit`, etc.) and short-answer prompts
-(`y`/`n`, `1`/`2`) are excluded so Up-arrow recall stays useful. Clear with
-`> ~/.config/sys_agent/history` if you ever want a fresh slate.
+After an approved command finishes, its output goes back to the AI. It may
+explain the result or propose another command for approval. You can ask
+follow-up questions in the same session.
 
-## Usage
+**To interrupt:** press Ctrl-C during a task. sys_agent cancels the current
+operation and returns to the question prompt. Commands that already completed
+are not undone. The interrupted exchange is removed from the conversation,
+while its command audit records remain. With automatic approval on, Ctrl-C is
+the only way to stop a run, because there is no per-command prompt to answer.
 
-Once running, type natural-language requests. The prompt shows the active
-model and hostname, so it is always clear which model is answering and which
-machine will execute the command:
+**To exit:** type `/exit` at the question prompt, or press Ctrl-D there.
+Ctrl-C at an empty prompt clears the line without quitting.
 
-```
-[claude-opus-5]   you@m3mac>       show me which services are using the most RAM
-[claude-haiku-4-5] you@raspberrypi> check why bitcoind is restarting
-[deepseek-flash]   you@raspberrypi> what's the load average and top process?
-[gpt-5.4-mini]    you@m3mac>       upgrade nginx to the latest stable version
-```
+## Everyday commands
 
-For mutating actions, the approval prompt is your safety net. Per command:
+Type these inside sys_agent:
 
-| Key | Action |
+| Command | Use it to… |
 |---|---|
-| `y` / Enter | Run the command |
-| `n` | Skip this command — the agent **continues** the turn with its next step |
-| `e` | Edit the command in place, then run the edited form (re-checked against the deny list) |
-| `q` | **Stop the whole workflow** and return to the prompt (does *not* end the session) |
-
-### Interrupting a workflow
-
-`n` declines a single command and lets the agent carry on. When the agent is
-on the wrong path entirely, `q` (or Ctrl-C) abandons the **whole turn** and
-drops you back at the prompt to redirect it.
-
-Ctrl-C does this from anywhere in a turn — at the approval prompt, while a
-command is running (the command's process group is killed first), or while
-the model is still responding. This is the only way to break out of an
-`/auto on` run, where there is no per-command prompt.
-
-Stopping **rolls the conversation back** to the start of the turn, so the
-interrupted exchange leaves no trace and your next prompt starts clean. Note
-the rollback only forgets the attempt in-context — any command that already
-executed is **not** undone (its host side effects and audit record stand).
-
-Interrupting never ends the session. At an empty prompt, Ctrl-C just clears
-the current line. Quitting stays explicit: `/exit`, `/quit`, or Ctrl-D.
-
-### Tips & shortcuts
-
-Line editing is provided by readline (or gnureadline on macOS, installed
-automatically).
-
-| Key | Action |
-|---|---|
-| Up / Down | Cycle through prior conversational prompts |
-| Ctrl-R | Reverse-incremental search through history |
-| Ctrl-A / Ctrl-E | Jump to start / end of line |
-| Ctrl-W | Delete previous word |
-| Ctrl-U / Ctrl-K | Delete to start / end of line |
-| Tab | (No completion — sys_agent doesn't bind any) |
-
-History persists across sessions; recall surfaces only real prompts, so
-Up-arrow won't waste your time on `y`/`n` answers or meta-commands. To
-start with a clean slate: `> ~/.config/sys_agent/history`.
-
-### Meta-commands
-
-| Command | Effect |
-|---|---|
-| `/exit`, `/quit` | End the session (these and Ctrl-D are the only ways to quit) |
-| `/reset` | Clear conversation history and token counters |
-| `/info` | Print provider/model, session token usage, host facts |
-| `/auto on\|off` | Skip approval prompt (hard-deny list still applies) |
-| `/thinking on\|off` | Toggle extended thinking — Anthropic / DeepSeek (takes effect next turn) |
-| `/effort [level]` | Thinking depth — Anthropic adaptive (all 5), DeepSeek (`low`/`high`/`max`); shows the effective grade; needs `/thinking on` |
-| `/tokens on\|off` | Toggle per-turn token-usage line |
-| `/tokens` | Print current snapshot without changing toggle |
-| `/color on\|off` | Toggle ANSI color output |
-| `/audit` | Show audit-log status (enabled, path, body capture) |
-| `/audit on\|off` | Toggle the command audit log at runtime |
-| `/history` | Review recent command history from the audit log, paged (last 50) |
-| `/history N \| all` | Show the last N entries, or the full log |
-| `/consult` | Second opinion: ask the other configured providers how they'd open the current question (executes nothing) |
-| `/consult --fresh` | Same, but consult the question alone — no prior conversation history |
-| `/provider` | Show current provider/model and available providers |
-| `/provider openai\|anthropic\|deepseek` | Switch provider and reset conversation/token counters |
-| `/model` | Show current model/context-window metadata |
-| `/model MODEL_NAME` | Switch the model used by the active provider |
-| `/facts` | Print current host facts |
-| `/facts refresh` | Re-probe host facts and reset conversation/token counters |
-| `/facts verbose on\|off` | Toggle expanded host fact collection and refresh facts |
-
-### Runtime provider/model switching
-
-Provider and model selection are no longer startup-only. During a session:
-
-```text
-/provider
-/provider openai
-/provider anthropic
-/provider deepseek
-/model
-/model gpt-5.4-mini
-/model claude-sonnet-4-6
-/model deepseek-flash
-```
-
-Switching providers resets the active conversation and token counters because
-the providers use different tool-call message formats (Anthropic batches
-`tool_result` blocks; OpenAI and DeepSeek send one `role: tool` message per
-call). Host facts and REPL toggles are preserved.
-
-Changing the model keeps the same provider and session state. Unknown context
-windows are allowed; token display falls back to absolute token counts.
-
-### Multi-provider consult
-
-`/consult` asks the *other* configured providers how they would approach the
-current question and shows their opening move beside the active provider's — a
-second opinion at a decision point. It is **read-only: nothing it returns is
-executed**, and it never touches the approval gate. The point is not to vote or
-to auto-pick a winner; it is to surface agreement or disagreement so you decide.
-
-```text
-/consult
-/consult --fresh
-```
-
-Requires at least one *other* provider key configured — with a single key there
-is nothing to consult.
-
-**What you see.** Each consulted provider works the question independently from
-the same context the active provider had, and — because consult executes
-nothing — you see only its *opening turn*: the first command (or several) it
-would propose, or a direct answer. That opening is compared against the active
-provider's own first move, shown as the `reference`. An opening turn may bundle
-several commands; in the REPL those are still approved and run one at a time, so
-the count reflects how many approvals that opening would cost you, not
-concurrency.
-
-**Convergence / divergence.** When the consulted providers propose the same
-command(s) it is flagged as convergence; when they don't, as divergence. The
-comparison is deliberately *literal* — it never claims two differently-worded
-commands are equivalent, since overstating sameness is the failure mode to
-avoid. Read divergence as a prompt to compare approaches, weighted by stakes:
-on an interchangeable read-only probe it is low-signal; on a non-obvious
-diagnosis — where one provider refreshes state before reading and another does
-not, say — it is exactly the second opinion worth having before you commit.
-
-**Second opinion before running anything.** Abort a turn with `q` (or Ctrl-C)
-*before* approving its first command, then `/consult`: the aborted question —
-not the previous turn — is what gets consulted. This is the cleanest use of the
-feature: see how every provider would open, with zero side effects, then decide
-what to actually run.
-
-**`--fresh`.** By default consult carries the prior conversation as context
-(apples-to-apples with what the active provider saw). On a context switch — a
-new, self-contained question where the accumulated session is just noise —
-`/consult --fresh` consults the question alone (question + host facts, no prior
-turns), which is also cheaper. It applies on every path: aborting only drops the
-one aborted turn, not the earlier session, so the abort and skip paths carry the
-same history without it.
-
-Consult queries the providers concurrently and reports its token cost
-*separately* from the session counters, which stay tied to the active
-conversation's context-window accounting. The active provider, model, thinking,
-and effort all carry into the consult call, so it reflects what you would
-actually run.
-
-### Refreshable host facts
-
-```text
-/facts
-/facts refresh
-/facts verbose on
-/facts verbose off
-```
-
-`/facts` prints the currently injected host metadata. `/facts refresh`
-re-probes the machine and rebuilds the system prompt. Verbose mode adds
-additional environment details such as CPU count, PATH, basic container
-detection, and network-tool availability. Refreshing host facts resets the
-active conversation and token counters so the model receives a clean, current
-system prompt.
-
-### Runtime snapshot: services and processes
-
-Alongside the static host facts, startup probes capture a point-in-time
-snapshot of what the machine is actually running, so the model uses real
-service and process names on the first turn instead of burning a round trip to
-discover them. Four keys are injected into the facts when non-empty:
-
-- **`running_services`** — the active services. On Linux, the running `systemd`
-  service units (`systemctl list-units --type=service --state=running`); empty
-  on hosts without `systemd`, or where the bus is unreachable (e.g. inside a
-  container). On macOS, the currently-running `launchctl` jobs with Apple
-  system agents and per-GUI-app jobs filtered out (see the platform note),
-  leaving the user-relevant daemons (Homebrew, vendor helpers, custom
-  LaunchAgents/Daemons).
-- **`running_services_user`** (Linux/systemd) — the running **per-user** units
-  from `systemctl --user`, the manager where a user's own services live (e.g. a
-  `bitcoind.service` you start with `systemctl --user`, invisible to the
-  system-scope list above). Present only when non-empty, which requires a
-  reachable user D-Bus session: present when sys_agent runs in the invoking
-  user's login session (keep it alive headless with
-  `loginctl enable-linger <user>`), absent under sudo, cron, or a user without
-  linger. The system prompt tells the model to match scope to the list a unit
-  appears in — `systemctl --user status <unit>` and `journalctl --user -u
-  <unit>` for these (no sudo), `systemctl status` / `journalctl -u` for the
-  system list — and that `journalctl` is the log source for a service rather
-  than hunting `/var/log`.
-- **`failed_services`** (Linux/systemd) — SYSTEM service units in a **failed**
-  state at probe time (`systemctl list-units --type=service --state=failed`),
-  empty on a healthy host and under the same conditions that empty
-  `running_services` (no systemd, unreachable bus). High-signal for turn-one
-  triage: a unit named here is a failure the model would otherwise spend a
-  discovery pass finding. The system prompt has it confirm the unit is still
-  failed and read the cause (`systemctl status <unit>`, `journalctl -u <unit>`)
-  before acting, since a unit may have been restarted since startup. SYSTEM
-  scope only — user-scope failures carry the same bus-availability caveat as
-  `running_services_user` and are left to an explicit `systemctl --user
-  --failed`.
-- **`top_processes`** — the top processes by resident memory (RSS), 10 by
-  default (`SYS_TOP_PROCESSES`). Processes sharing a name are aggregated into a
-  single entry with summed RSS and an instance `count`, so a worker pool reads
-  as one `gunicorn ×8` line rather than eight rows. On Linux this is read
-  straight from `/proc` — no `ps` dependency, so it behaves identically across
-  distros, init systems, and userlands; on macOS via `ps -axo rss=,comm=`.
-
-Both are a **snapshot taken at startup**, not live state: a process that is hot
-at launch may be idle later, and the service list reflects startup. The model
-is instructed to use them for naming and orientation but to confirm current
-state with a command before acting on a reading. `/facts refresh` re-probes.
-
-**Privacy.** Only the process *name* is recorded — the executable basename,
-never its arguments — so secrets passed on a command line (`--password=…`, API
-tokens) are dropped before anything is sent to the model.
-
-**Platform note.** The two service lists are intentionally asymmetric. Linux
-includes system units (`dbus`, `polkit`, `systemd-*`); macOS drops the
-equivalent Apple tier (`com.apple.*`) plus launchd's per-GUI-app jobs
-(`application.*`), because launchd registers hundreds of these that would
-otherwise bury the handful of services worth naming. The macOS filter lives in
-the `_DARWIN_SERVICE_SKIP_PREFIXES` tuple in `sys_agent.py`; extend it if a
-host's noise differs. Expect the service list to carry far more signal on a
-server — where it names your actual workload — than on a desktop, where it is
-mostly background updaters.
-
-### Hardware identity
-
-Alongside the OS facts, startup resolves what the machine *is* — not just
-which OS it runs — and injects it as a `hardware` block:
-
-```json
-"hardware": {
-  "model": "Raspberry Pi 5 Model B Rev 1.0",
-  "platform_class": "sbc",
-  "memory_gb": 7.9,
-  "swap_gb": 0.2
-}
-```
-
-On a recognized cloud instance the block also carries a `cloud` label:
-
-```json
-"hardware": {
-  "model": "t3.micro",
-  "vendor": "Amazon EC2",
-  "platform_class": "vm",
-  "memory_gb": 0.9,
-  "swap_gb": 0.0,
-  "cloud": "aws"
-}
-```
-
-| Field | Source (Linux) | Source (macOS) |
-|---|---|---|
-| `model` | `/proc/device-tree/model` (SBCs), else DMI `product_name` | `sysctl hw.model` |
-| `vendor` | DMI `sys_vendor` | `Apple` |
-| `platform_class` | see below | battery in `pmset -g batt` → `laptop`, else `desktop` |
-| `memory_gb` | `/proc/meminfo` MemTotal | `sysctl hw.memsize` |
-| `swap_gb` | `/proc/meminfo` SwapTotal (`0` = none) | — |
-| `cloud` | DMI vendor/product needle, else `bios_version`/`bios_vendor` (Xen-gen EC2), else Azure `chassis_asset_tag` | — |
-| `cpu_model` | — | `machdep.cpu.brand_string` |
-
-`platform_class` is one of `container | vm | sbc | laptop | desktop | server`,
-resolved in that precedence order (a Pi inside Docker reads as `container`):
-container detection (`/.dockerenv`, cgroup probe), then
-`systemd-detect-virt --vm` (DMI vendor/product needles as fallback), then
-device-tree presence, then the SMBIOS chassis-type code. Placeholder DMI junk
-("To Be Filled By O.E.M.") is filtered out rather than surfaced as identity.
-Fields are attached only when resolved; everything is static, unprivileged,
-and effectively free at startup. On macOS the laptop/desktop split keys on
-battery presence, not the model string — Apple Silicon identifiers
-(`Mac15,6`) no longer encode the form factor.
-
-**Why it matters.** The hardware identity tells the model which telemetry
-classes are even plausible before it proposes anything: PMIC rails and
-`vcgencmd` on a Raspberry Pi, battery/`pmset`/`upower` on a laptop, IPMI on
-a server, "you can't measure that" inside a VM. The system prompt pairs the
-block with two rules: a negative capability claim ("there is no live wattage
-reading on this host") must be verified with a one-line probe before being
-asserted, and on a Raspberry Pi the model is pointed directly at
-`vcgencmd get_throttled` and (Pi 5) `vcgencmd pmic_read_adc` for live
-undervoltage/throttle state and per-rail power draw. The startup tool probe
-now also detects `vcgencmd`, `sensors`, `upower`, `dmidecode`, and
-`ipmitool`, so tool presence corroborates the hardware identity.
-
-The default facts also enumerate `/sys/class/hwmon/*/name` on Linux as
-`hwmon_sensors` (e.g. `cpu_thermal`, `rpi_volt`, `pwmfan`, `nvme`) — derived
-from sysfs, not a curated map — so the sensor channels that exist on the
-host are listed in context rather than guessed.
-
-**Cloud classification.** When DMI identifies a recognized cloud platform, the
-hardware block carries a `cloud` label (`aws | gcp | azure | oci |
-digitalocean`). It is a *classification*, not identity — it says "an EC2
-instance," never which instance or whose account — derived from the same
-world-readable DMI fields VM detection already reads (vendor/product needles,
-with Azure's fixed `chassis_asset_tag` as its discriminator, since Azure shares
-the generic "Microsoft Corporation" vendor with on-prem Hyper-V). Nitro-
-generation EC2 is caught by its `sys_vendor` of "Amazon EC2"; Xen-generation
-instances (t2/m4/…) report `sys_vendor` "Xen" / `product_name` "HVM domU" with
-no "amazon" string, so they fall back to the BIOS, which stamps
-`bios_version` "4.11.amazon" (or `bios_vendor` "Amazon"). The world-readable
-`/sys/hypervisor/uuid` would also identify Xen-EC2 but is a UUID-class file, so
-it is deliberately left unread. No metadata service is contacted at startup.
-
-The label steers command strategy: on a cloud VM, storage is network-attached
-(a full root disk is a volume resize via the provider, not local `parted`) and
-connectivity is governed by provider-level security groups / NACLs on top of
-host `iptables`/`ufw`, so a capacity or reachability question may have its real
-answer at the provider. Instance metadata (region, AZ, instance-type,
-instance-id, IAM role) is deliberately **not** pre-loaded; the system prompt
-has the model query IMDS (`169.254.169.254`, IMDSv2 token flow) or GCP's
-`metadata.google.internal` on demand only when a task needs it, and treat
-instance-id, account-id, and IAM role as sensitive.
-
-**Temporal orientation.** The default facts include `timezone`,
-`boot_time` (ISO-8601 local), and `uptime_hours`, resolved from `/proc/uptime`
-on Linux and `kern.boottime` on macOS. These are stable startup facts — the
-model uses them to interpret log timestamps and gauge reboot recency without a
-probe, while current wall-clock and live uptime are still a `date`/`uptime`
-away. `swap_gb` rounds out the memory picture: a value of `0` means no swap is
-configured, so on a low-RAM host memory pressure ends in OOM-kills rather than
-swapping — context the model weighs when diagnosing killed processes.
-
-### SMART over USB bridges
-
-The injected host facts include a mount-first disk topology under `disks`
-(mounts, sizes, fstype, and a `device` sub-record per physical disk with model,
-transport, and rotational flag). On macOS, Time Machine snapshot automounts
-under `/Volumes/.timemachine/` are filtered out — a host with regular local
-backups mounts dozens of them, all reporting the destination volume's identical
-totals — while the backup destination volumes themselves are kept. For
-USB-attached disks, two extra fields are resolved at startup so the model can
-read SMART/health without a probing round trip:
-
-- **`usb_ids`** — the USB bridge's `vendor:product` (e.g. `04e8:4001`),
-  resolved at runtime from `udevadm` (sysfs fallback when udevadm is absent).
-- **`smartctl_device_type`** — the `smartctl -d` pass-through token for that
-  bridge (e.g. `sntasmedia`), present only when the bridge is recognized.
-
-```json
-"disks": {
-  "mounts": [{
-    "mount": "/media/mikeoc/T72GB",
-    "device": {
-      "name": "/dev/sda",
-      "model": "PSSD T7",
-      "transport": "usb",
-      "rotational": false,
-      "usb_ids": { "vendor": "04e8", "product": "4001" },
-      "smartctl_device_type": "sntasmedia"
-    }
-  }]
-}
-```
-
-**Why this is needed.** A USB enclosure hides whether the drive behind it is
-SATA or NVMe, so a bare `smartctl -a /dev/sdX` often fails to auto-detect it and
-the correct `-d` token is bridge-chip-specific. With `smartctl_device_type`
-present the model goes straight to `smartctl -d sntasmedia -a /dev/sda`; when
-only `usb_ids` is present (an unrecognized bridge) the prompt steers it to try
-`-d sat`, then the NVMe pass-through types.
-
-**Minimal hard-coding.** The `vendor:product` pair is derived at runtime — only
-the small chip→token map (`_USB_BRIDGE_SMART_HINTS` in `sys_agent.py`) is
-hard-coded, because that mapping is not derivable from anything the kernel
-exposes. It mirrors the `KNOWN_BRIDGE_HINTS` table in the companion
-`disk_smart.py`; keep the two in sync when adding a bridge.
-
-**Interpreting NVMe counters.** The system prompt also tells the model that
-Unsafe Shutdowns, Warning/Critical Composite Temperature Time, and Error Log
-Entries are *cumulative lifetime totals* — to be read as a rate of change, not
-as alarming absolutes — and that an unsafe-shutdown count is low-signal on a
-USB-bridged drive (many bridges never forward the NVMe shutdown notification, so
-it climbs even on clean unmounts).
-
-### Extended thinking
-
-Anthropic and DeepSeek models support a reasoning pass before the model acts.
-It is **off by default**: thinking tokens are billed as output (expensive on
-Opus), and routine commands don't need it.
-
-```text
-/model claude-opus-5
-/thinking on
-/effort xhigh        # optional; default is high
-```
-
-DeepSeek works the same way — `/thinking on` with `deepseek-flash`.
-
-Or from the environment:
-
-```sh
-SYS_THINKING=on SYS_THINKING_EFFORT=xhigh sys_agent
-```
-
-The thinking API differs by model/provider, and sys_agent picks the right one
-automatically:
-
-- **Anthropic adaptive** (Opus 5 / 4.8 / 4.7, Sonnet 5 / 4.6, Opus 4.6): the
-  model decides per turn whether and how much to think. Depth is controlled by
-  **effort** (`/effort`), not a token budget. Interleaved thinking is automatic.
-  Manual budgets are rejected with a 400 on Opus 4.7/4.8 — sys_agent never sends
-  them for these models. **Sonnet 5 and Opus 5 think by default** even when no
-  thinking field is sent, so with `/thinking off` sys_agent sends an explicit
-  `disabled` to keep the off-by-default cost rationale intact. On Opus 5 that
-  `disabled` is sent without an effort field (the API rejects `disabled` at
-  effort `xhigh`/`max`); with thinking disabled Opus 5 may occasionally phrase a
-  proposed command as text rather than a tool call, so use `/thinking on` if you
-  hit that.
-- **Anthropic legacy** (Haiku 4.5 and older): use a fixed `budget_tokens` budget
-  (`SYS_THINKING_BUDGET`) plus the interleaved-thinking beta header so reasoning
-  can span tool calls. Effort does not apply here.
-- **DeepSeek** (`deepseek-flash` = V4.1 Flash): thinking is set per turn via the
-  request body. **DeepSeek thinks by default** when no thinking field is sent,
-  so with `/thinking off` sys_agent sends an explicit `disabled` (same rationale
-  as Sonnet 5 / Opus 5). Depth maps from **effort** to DeepSeek's three grades:
-  `low` → `low`, `medium`/`high` → `high`, `xhigh`/`max` → `max` (levels without
-  a native grade round up; DeepSeek's own server table maps `xhigh` → `high`).
-  No token budget or max-tokens raise applies. The legacy `deepseek-v4-flash`
-  and `deepseek-v4-pro` names are accepted but server-routed to V4.1 Flash
-  (`v4-pro` from 2026-09-14, until V4.1 Pro ships).
-  DeepSeek imposes a strict replay contract: once a thinking turn makes a tool
-  call, the reasoning scratchpad must be echoed back on every subsequent
-  assistant message or the next request 400s. sys_agent handles this internally
-  by preserving `reasoning_content` on each assistant turn, so multi-turn tool
-  use just works.
-
-Behavior, all paths:
-
-- Reasoning is surfaced dimmed, with a `│` margin, ahead of any proposed command
-  or final answer.
-- The flag is read once at the start of each turn; toggling mid-turn applies on
-  the next turn (the API ignores a mid-turn toggle).
-- A `[thinking…]` marker is shown while the model works; high-effort Opus turns
-  can take a while.
-- `/effort` echoes the grade actually used, not just what you typed: on DeepSeek
-  it shows the mapped grade with a `(rounded up to DeepSeek grade)` note when
-  the level has no native grade (`medium` → `high`, `xhigh` → `max`); on
-  providers/models that ignore effort it says `(no effect on this
-  provider/model)`; and it appends `needs /thinking on` when effort is set but
-  thinking is off. The stored level is your request, so switching to a
-  finer-grained provider still honors it.
-
-Anthropic-specific:
-
-- On a thinking turn the output cap is raised to `SYS_THINKING_MAX_TOKENS`
-  (default 32K) so the model has room to reason and act without truncation —
-  you are only billed for tokens actually produced. (DeepSeek needs no such
-  raise.)
-- Thinking turns are streamed internally (required by the SDK once the token
-  cap is large) and buffered until complete. DeepSeek uses a plain
-  non-streaming call.
-
-**OpenAI**: both flags are inert. Displays say so — the banner and `/help`
-show `thinking=on (inactive: openai)`, and `/info` reports `thinking_enabled`,
-`thinking_active`, and `thinking_mode`.
-
-Reach for it on a non-obvious multi-step diagnosis (tricky `systemd`,
-partitioning, networking). For everyday work, leave it off and stay on a fast
-tier (Haiku, Flash).
-
-## Safety model
-
-Three layers, weakest to strongest:
-
-1. **Approval prompt** (default-on, per-command). Every `run_command` shows
-   the exact shell string, the model's stated reason, and the CWD before any
-   subprocess is spawned. Default answer is `y` so casual `Enter` runs it —
-   read the line. Per command: `y` run, `n` skip (the agent
-   continues), `e` edit, `q` stop the whole workflow. Ctrl-C stops the
-   workflow from anywhere in the turn — killing a running command's process
-   group first — and returns to the prompt; it never ends the session.
-2. **Local hard-deny list** (always-on). A short set of irrecoverable command
-   patterns is blocked before the approval prompt is even shown. The model
-   cannot disable this and `/auto on` cannot bypass it. Matching is
-   intent-based (argv inspection through wrappers like `sudo`/`env`/`timeout`).
-   Editing a command with `e` re-runs the check on the edited string, so what
-   is actually spawned is always what was matched — an edit cannot walk a
-   denied pattern past the gate. See `is_denied()` and the `_DENY_*` /
-   `_FORKBOMB_RE` tables in `sys_agent.py`.
-3. **Command timeout** (120s wall-clock per command, configurable via
-   `SYS_COMMAND_TIMEOUT`). Prevents runaway model loops from hanging the REPL
-   on a single command. On timeout — and on Ctrl-C — the command's entire
-   process group is signalled, not just the shell: SIGTERM first, then SIGKILL
-   for anything still in the group after a grace period. A descendant that
-   ignores SIGTERM (or outlives the shell that spawned it) is still cleaned
-   up, so a cancelled `apt-get` cannot leave `dpkg` running.
-
-A dimmed startup notice restates the premise of layer 1: model-proposed
-commands can be confidently wrong (hallucinated flags, paths, unit names;
-stale syntax), and the approval prompt is where you catch that. Suppress it
-with `SYS_DISCLAIMER=off`.
-
-The deny list is intentionally short and pattern-matched. It is **not** a
-substitute for paying attention to the approval prompt. Sandbox the agent
-(VM, container, `firejail`) if you want to test it on untrusted prompts.
-
-## Audit log
-
-A forensic record of what the agent did — **observability, not a control**. It
-does not prevent anything (the approval prompt and deny list do that); it
-records what was proposed and what happened, which is what you want after the
-fact on a 24/7 host.
-
-On by default. Each `run_command` the model proposes appends one JSON line to
-`~/.config/sys_agent/audit.log` capturing its disposition:
-
-| Field | When present | Meaning |
-|---|---|---|
-| `ts` | always | UTC timestamp, ISO-8601 (`Z`) |
-| `host` / `provider` / `model` | always | active host node and backend at execution time |
-| `action` | always | `run` / `edit` / `skip` / `deny` / `abort` |
-| `command` | always | the command the model proposed |
-| `explanation` | when given | the model's stated reason |
-| `edited_command` | `action=edit`, or `action=deny` for a blocked edit | the command as you rewrote it before running |
-| `returncode` | run/edit | process exit code (`124` = timeout) |
-| `truncated` | run/edit | whether output to the model was clipped at `OUTPUT_MAX_CHARS` |
-| `reason` | `action=deny` | which hard-deny rule matched (on the proposed command, or on your edit) |
-| `note` | as needed | e.g. `interrupted (workflow stopped)` |
-| `stdout` / `stderr` | only with `SYS_AUDIT_BODY=on` | command output, capped at `OUTPUT_MAX_CHARS` |
-
-`abort` records a workflow stopped at the approval prompt (`q` / Ctrl-C)
-before that command ran. A command interrupted *mid-execution* by Ctrl-C is
-logged as `run`/`edit` with `note: interrupted (workflow stopped)` — it did
-start, so its disposition is not `abort`.
-
-Output **bodies are not logged by default** — stdout/stderr can carry secrets.
-Enable with `SYS_AUDIT_BODY=on` only if you accept that.
-
-Disable the log, send it elsewhere, or opt into output bodies:
-
-```sh
-SYS_AUDIT_LOG=off sys_agent
-SYS_AUDIT_LOG=/var/log/sys_agent.jsonl sys_agent
-SYS_AUDIT_BODY=on sys_agent
-```
-
-At runtime: `/audit` shows status; `/audit on|off` toggles. Disposition follows
-provider/model/host live, so a mid-session `/provider`, `/model`, or `/facts`
-switch is reflected in subsequent records. The log is not rotated (one short
-line per command); truncate with `> ~/.config/sys_agent/audit.log`.
-
-### Reviewing history
-
-`/history` renders the log as a numbered, human-readable list in **host-local
-time** (the stored timestamps are UTC), paged through `$PAGER` (default
-`less -RFX`, falling back to `more`). Day-change separators disambiguate
-multi-session logs; edited commands show the form that actually ran, and
-`skip`/`deny`/`abort` entries are tagged.
-
-```text
-/history          # last 50 entries (default)
-/history 200      # last 200
-/history all      # entire log
-```
-
-```
-# audit history — last 50 of 312 records  (host-local time)
-── 2026-05-31 ──
- 1.  17:11:36  systemctl status bitcoind   — Checked bitcoind service status
- 2.  17:11:43  tail -100 debug.log | head -50 [edited]   — Reviewed log entries
- 3.  17:11:49  bitcoin-cli getblockchaininfo (exit 1)   — Got blockchain status
- 4.  17:16:29  rm -rf / [denied: recursive delete targeting the filesystem root]
-```
-
-For ad-hoc queries on the raw JSONL, `jq` is still the sharper tool:
-
-```sh
-jq -r 'select(.action=="run") | "\(.ts) [\(.returncode)] \(.command)"' \
-  ~/.config/sys_agent/audit.log
-jq 'select(.action=="deny")' ~/.config/sys_agent/audit.log
-```
-
-## Architecture
-
-```
-                  ┌────────────────────────────────────┐
-                  │           User REPL                │
-                  │  (sys_agent.py: run_repl)          │
-                  └──────────────┬─────────────────────┘
-                                 │
-                 host_facts +    │     command output
-                 conversation    │     (stdout, stderr, exit)
-                                 ▼
-                  ┌─────────────────────────────────────────────┐
-                  │            Provider abstraction             │
-                  │ OpenAIProvider | AnthropicProvider |        │
-                  │ DeepSeekProvider (OpenAI-compatible)        │
-                  └──────────────┬──────────────────────────────┘
-                                 │  HTTPS + tool calling
-                                 ▼
-                  ┌────────────────────────────────────┐
-                  │       Remote LLM API               │
-                  └────────────────────────────────────┘
-                                 ▲
-                                 │  run_command(cmd, reason)
-                                 │  ──┐
-                                 │    │ approval gate
-                                 │    │ deny-list check
-                                 │    │ subprocess.run(...)
-                                 │    │
-                                 ▼    ▼
-                  ┌────────────────────────────────────┐
-                  │         Local host                 │
-                  └────────────────────────────────────┘
-```
-
-The provider abstraction normalizes tool-call/tool-result message structure
-across the APIs (OpenAI and DeepSeek send one `role: tool` message per call;
-Anthropic batches all `tool_result` blocks into a single user message).
-`DeepSeekProvider` subclasses `OpenAIProvider` — same wire shape over DeepSeek's
-OpenAI-compatible endpoint — overriding only client construction (base URL +
-key) and the thinking path (`reasoning_effort` plus `reasoning_content`
-preservation). The REPL is provider-agnostic.
-
-### Runtime state
-
-The REPL tracks active provider, active model, host facts, verbosity, token
-counters, and conversation messages as mutable runtime state. `/provider`,
-`/model`, and `/facts` update that state without restarting the process.
-
-## What this is not
-
-- Not a coding agent. Use aider, claude-code, or Cursor for that.
-- Not a long-horizon autonomous agent. There is no planner, no memory beyond
-  the active conversation, no parallel workers.
-- Not sandboxed. Commands run as the invoking user, with that user's full
-  privileges.
+| `/help` | See all available commands. |
+| `/history` | Review recent commands and what happened to them. |
+| `/reset` | Start a fresh conversation and clear token counters. |
+| `/info` | See the selected AI model and collected system information. |
+| `/facts refresh` | Collect fresh system information and start a new conversation. |
+| `/consult` | Get a second opinion from your other configured AI providers. |
+| `/exit` | End the session. |
+
+Use **Up/Down** to recall previous questions and **Ctrl-R** to search them.
+Question history is saved between sessions; the AI conversation itself is not.
+Other [line-editing keys](docs/advanced-usage.md#line-editing-and-history)
+work as they do in a normal shell.
+
+### Get a second opinion
+
+If you have keys for more than one provider, `/consult` asks the others how
+they would approach your latest question. It displays suggestions without
+running any commands and makes additional API requests.
+
+To compare suggestions before executing anything, stop at the first approval
+prompt with `q`, then type `/consult`. See
+[second opinions](docs/advanced-usage.md#multi-provider-consult) for details
+and the option to exclude earlier conversation history.
+
+### Review what happened
+
+`/history` shows a readable command log, including skipped and blocked commands.
+If it opens in a pager, press `q` to close that view. The log is enabled by
+default; command output is excluded unless you explicitly enable its capture.
+
+Your API-key file, saved question history, and command log normally live under
+`~/.config/sys_agent/`. See [configuration files](docs/configuration.md#files)
+for their names and settings.
+
+## More help
+
+- **[Configuration reference](docs/configuration.md):** all settings, alternative
+  installation, file locations, and the optional terminal shortcut.
+- **[Advanced usage](docs/advanced-usage.md):** all slash commands, choosing models,
+  second opinions, thinking settings, and command history.
+- **[Technical reference](docs/technical-reference.md):** collected host information,
+  disk-health detection, execution controls, audit format, and architecture.
+
+sys_agent is designed for interactive system administration. It is not a coding
+agent — use a tool built for authoring code for that — and it is not
+sandboxed: commands run as you, with your full privileges. It does not run
+scheduled jobs or retain an AI conversation between sessions. Windows has
+reduced terminal functionality; macOS and Linux are the primary targets.
 
 ## License
 
