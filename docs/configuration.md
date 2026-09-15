@@ -22,8 +22,18 @@ Shell-exported variables always override file values. Every `SYS_*` setting
 is resolved *after* the file is loaded, so values set there take effect
 identically to shell-exported ones. A malformed value (a non-numeric timeout,
 an unknown effort grade) is reported as a `[config]` warning at startup and
-the current value (normally the built-in default) is kept — a bad setting is
-never fatal and never aborts startup.
+the current value (normally the built-in default) is kept, rather than aborting
+startup. That warn-and-continue handling covers the numeric settings
+(`SYS_COMMAND_TIMEOUT`, `SYS_THINKING_BUDGET`, `SYS_THINKING_MAX_TOKENS`,
+`SYS_TOP_PROCESSES`), the on/off switches (`SYS_THINKING`, `SYS_DISCLAIMER`,
+`SYS_PROGRESS`), and `SYS_THINKING_EFFORT`.
+
+Two settings behave differently. `SYS_PROVIDER` is validated separately and
+**does** exit with an error message: an unrecognized provider name, or a valid
+one whose API key is not set, stops startup rather than falling back. The
+`SYS_*_MODEL` strings are not validated here at all — pinning an unlisted model
+is a supported escape hatch, so a typo in one surfaces later as a warning from
+`/model` or as an API error, not as a `[config]` line.
 
 ### Quick setup
 

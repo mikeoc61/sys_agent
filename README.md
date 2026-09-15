@@ -18,9 +18,10 @@ and maintain a Mac, Linux computer, or Raspberry Pi.
 ## Why sys_agent
 
 AI coding tools are built for writing code. sys_agent is built for a different
-job: ad-hoc system administration, where the right answer depends on the
-distro, init system, package manager, and which tools happen to be installed on
-the machine in front of you.
+job: everyday system administration, where the right answer depends on the
+machine in front of you — which operating system it runs, how it starts and
+stops background services, how it installs software, and which tools are
+actually present.
 
 So it looks at the host before it asks anything. Hardware model, OS, disks,
 running services, and available tools are collected at startup and sent with
@@ -122,8 +123,10 @@ shell, and a `.env` file in the folder you launch from. The project folder from
 step 2 is searched *first*, so if a `.env` ever appears there it wins over the
 one you just created — a surprise worth knowing about before you go looking
 for a key that seems to be ignored. The project also ships `.env.example`, a
-commented template listing every available setting; see
-[configuration lookup](docs/configuration.md#configuration) for both.
+commented template covering the common settings; see
+[configuration lookup](docs/configuration.md#configuration) for both, and
+[all environment variables](docs/configuration.md#all-environment-variables)
+for the complete list.
 
 ### 4. Start it
 
