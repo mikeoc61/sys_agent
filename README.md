@@ -233,7 +233,7 @@ For mutating actions, the approval prompt is your safety net. Per command:
 |---|---|
 | `y` / Enter | Run the command |
 | `n` | Skip this command — the agent **continues** the turn with its next step |
-| `e` | Edit the command in place, then run the edited form |
+| `e` | Edit the command in place, then run the edited form (re-checked against the deny list) |
 | `q` | **Stop the whole workflow** and return to the prompt (does *not* end the session) |
 
 ### Interrupting a workflow
@@ -707,11 +707,17 @@ Three layers, weakest to strongest:
    patterns is blocked before the approval prompt is even shown. The model
    cannot disable this and `/auto on` cannot bypass it. Matching is
    intent-based (argv inspection through wrappers like `sudo`/`env`/`timeout`).
-   See `is_denied()` and the `_DENY_*` / `_FORKBOMB_RE` tables in
-   `sys_agent.py`.
+   Editing a command with `e` re-runs the check on the edited string, so what
+   is actually spawned is always what was matched — an edit cannot walk a
+   denied pattern past the gate. See `is_denied()` and the `_DENY_*` /
+   `_FORKBOMB_RE` tables in `sys_agent.py`.
 3. **Command timeout** (120s wall-clock per command, configurable via
    `SYS_COMMAND_TIMEOUT`). Prevents runaway model loops from hanging the REPL
-   on a single command.
+   on a single command. On timeout — and on Ctrl-C — the command's entire
+   process group is signalled, not just the shell: SIGTERM first, then SIGKILL
+   for anything still in the group after a grace period. A descendant that
+   ignores SIGTERM (or outlives the shell that spawned it) is still cleaned
+   up, so a cancelled `apt-get` cannot leave `dpkg` running.
 
 A dimmed startup notice restates the premise of layer 1: model-proposed
 commands can be confidently wrong (hallucinated flags, paths, unit names;
@@ -739,10 +745,10 @@ On by default. Each `run_command` the model proposes appends one JSON line to
 | `action` | always | `run` / `edit` / `skip` / `deny` / `abort` |
 | `command` | always | the command the model proposed |
 | `explanation` | when given | the model's stated reason |
-| `edited_command` | `action=edit` | the command as you rewrote it before running |
+| `edited_command` | `action=edit`, or `action=deny` for a blocked edit | the command as you rewrote it before running |
 | `returncode` | run/edit | process exit code (`124` = timeout) |
 | `truncated` | run/edit | whether output to the model was clipped at `OUTPUT_MAX_CHARS` |
-| `reason` | `action=deny` | which hard-deny rule matched |
+| `reason` | `action=deny` | which hard-deny rule matched (on the proposed command, or on your edit) |
 | `note` | as needed | e.g. `interrupted (workflow stopped)` |
 | `stdout` / `stderr` | only with `SYS_AUDIT_BODY=on` | command output, capped at `OUTPUT_MAX_CHARS` |
 

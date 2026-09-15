@@ -2413,6 +2413,36 @@ def is_denied(cmd: str) -> str | None:
     return None
 
 
+def parse_command_args(args: Any) -> tuple[str, str, str | None]:
+    """Validate a run_command tool call's arguments -> (command, explanation, error).
+
+    The model controls this payload and the tool schema is not enforced on the
+    wire: json.loads() of a bare array or scalar succeeds, so `arguments` can
+    be any JSON type (only JSONDecodeError is caught at the provider seam), and
+    a field can hold a non-string. The tool loop is not inside the turn's
+    try/except, so an AttributeError from a blind .get()/.strip() here escapes
+    run_repl() and takes the session down with it. Everything unusable is
+    returned as an error string instead and handed back to the model as a tool
+    error, which keeps the turn alive and lets it retry.
+
+    A non-string explanation is demoted to "" rather than rejected: the reason
+    line is cosmetic, and failing an otherwise valid command over it is worse.
+    """
+    if not isinstance(args, dict):
+        return "", "", (f"malformed tool arguments: expected a JSON object, "
+                        f"got {type(args).__name__}")
+    raw_cmd = args.get("command")
+    if raw_cmd is not None and not isinstance(raw_cmd, str):
+        return "", "", (f"malformed 'command': expected a string, "
+                        f"got {type(raw_cmd).__name__}")
+    raw_why = args.get("explanation")
+    why = raw_why.strip() if isinstance(raw_why, str) else ""
+    cmd = raw_cmd.strip() if isinstance(raw_cmd, str) else ""
+    if not cmd:
+        return "", why, "empty command"
+    return cmd, why, None
+
+
 def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | None]:
     """Returns (action, edited_cmd_or_none). action in {run, skip, stop}.
 
@@ -2468,36 +2498,70 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
                 return "run", new
 
 
+# Bounds on _terminate_group(). GRACE is how long the group gets to honour
+# SIGTERM before SIGKILL; only descendants that ignore or outlive SIGTERM pay
+# it, since a clear group is detected by polling. KILL_WAIT bounds reaping the
+# shell afterwards so a cancel can never hang the REPL indefinitely.
+_GROUP_TERM_GRACE = 5.0
+_GROUP_KILL_WAIT = 5.0
+
+
 def _terminate_group(proc: subprocess.Popen) -> None:
     """
-    Best-effort SIGTERM-then-SIGKILL of the command's entire process group.
+    Bounded SIGTERM-then-SIGKILL of the command's entire process group.
     subprocess's own timeout only kills the immediate child (the shell), which
-    leaves grandchildren (e.g. apt-get under /bin/sh) orphaned. Requires the
-    process to have been started with start_new_session=True. POSIX only; on
-    platforms without killpg this degrades to killing the direct child.
+    leaves grandchildren (e.g. apt-get under /bin/sh) orphaned.
+
+    Requires start_new_session=True, which makes the shell the leader of a new
+    group: pgid == proc.pid. Using the pid directly instead of
+    os.getpgid(proc.pid) keeps cleanup working once the shell has been reaped,
+    when that lookup raises ProcessLookupError and would abandon the group.
+
+    Escalation is driven by probing the group with signal 0, never by the
+    shell's exit status. The shell almost always dies on the first SIGTERM, so
+    waiting on it says nothing about whether the group is clear — a descendant
+    that ignores SIGTERM outlives it, and returning on the shell's exit (as
+    this once did) meant SIGKILL was never sent. The shell is reaped first so
+    its zombie does not keep the group looking alive.
+
+    POSIX only; without killpg this degrades to killing the direct child.
     """
     killpg = getattr(os, "killpg", None)
-    getpgid = getattr(os, "getpgid", None)
-    if not (killpg and getpgid):
+    if killpg is None:
         try:
             proc.kill()
         except ProcessLookupError:
             pass
         return
+    pgid = proc.pid                     # group leader, per start_new_session
     try:
-        pgid = getpgid(proc.pid)
-    except ProcessLookupError:
+        killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
         return
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+    deadline = time.monotonic() + _GROUP_TERM_GRACE
+    try:
+        # Reap the shell so it stops counting as a live member of the group.
+        proc.wait(timeout=_GROUP_TERM_GRACE)
+    except subprocess.TimeoutExpired:
+        pass
+    while True:
         try:
-            killpg(pgid, sig)
+            killpg(pgid, 0)             # anyone left?
         except ProcessLookupError:
-            return
-        try:
-            proc.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+            return                      # group is clear; SIGTERM was enough
+        except PermissionError:
+            break                       # alive but not ours to probe
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    try:
+        killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        proc.wait(timeout=_GROUP_KILL_WAIT)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def execute(cmd: str) -> CmdResult:
@@ -3461,10 +3525,10 @@ def _turn_commands(turn: ChatTurn) -> list[tuple[str, str]]:
     for tc in turn.tool_calls:
         if tc.name != TOOL_NAME:
             continue
-        cmd = (tc.arguments.get("command") or "").strip()
-        why = (tc.arguments.get("explanation") or "").strip()
-        if cmd:
-            out.append((cmd, why))
+        cmd, why, arg_err = parse_command_args(tc.arguments)
+        if arg_err:
+            continue
+        out.append((cmd, why))
     return out
 
 
@@ -3478,10 +3542,10 @@ def _first_move_commands(events: list["CanonicalEvent"]) -> list[tuple[str, str]
         if ev.kind == "assistant" and ev.tool_calls:
             for tc in ev.tool_calls:
                 if tc.name == TOOL_NAME:
-                    cmd = (tc.arguments.get("command") or "").strip()
-                    why = (tc.arguments.get("explanation") or "").strip()
-                    if cmd:
-                        out.append((cmd, why))
+                    cmd, why, arg_err = parse_command_args(tc.arguments)
+                    if arg_err:
+                        continue
+                    out.append((cmd, why))
             break
     return out
 
@@ -4117,12 +4181,11 @@ def run_repl(provider: Provider) -> None:
                     results.append((tc.id, json.dumps({"error": f"unknown tool: {tc.name}"})))
                     continue
 
-                cmd = (tc.arguments.get("command") or "").strip()
-                why = (tc.arguments.get("explanation") or "").strip() or "(no explanation)"
-
-                if not cmd:
-                    results.append((tc.id, json.dumps({"error": "empty command"})))
+                cmd, why, arg_err = parse_command_args(tc.arguments)
+                if arg_err:
+                    results.append((tc.id, json.dumps({"error": arg_err})))
                     continue
+                why = why or "(no explanation)"
 
                 deny = is_denied(cmd)
                 if deny:
@@ -4148,6 +4211,19 @@ def run_repl(provider: Provider) -> None:
 
                 to_run = edited or cmd
                 if edited:
+                    # The deny check above ran against the model's proposal;
+                    # an edit replaces that string, so re-check what will
+                    # actually be spawned. Without this, editing is a hole in
+                    # an otherwise always-on backstop.
+                    deny = is_denied(to_run)
+                    if deny:
+                        print(f"\n{err_bold('[blocked]')} {to_run}")
+                        print(fail(f"   reason: {deny}"))
+                        results.append((tc.id, json.dumps(
+                            {"error": f"blocked locally (edited command): {deny}"})))
+                        audit("deny", cmd, explanation=why,
+                              edited=to_run, reason=deny)
+                        continue
                     # tag colored, edited command body plain
                     print(f"{warn('[running edited]:')} {to_run}")
 

@@ -200,6 +200,128 @@ ok_tab = not missing and not unlisted
 print(f"[models] PROVIDER_MODELS/CONTEXT_WINDOWS/DEFAULT_MODELS consistency: {'OK' if ok_tab else f'FAIL {missing} {unlisted}'}")
 if not ok_tab: fails.append("model-tables")
 
+# 10) tool-argument validation. The model controls this payload and the wire
+#     schema is not enforced: json.loads of a bare array/scalar succeeds, and a
+#     field can hold a non-string. The tool loop sits outside the turn's
+#     try/except, so an uncaught AttributeError here ends the session.
+arg_cases = [
+    ({"command": "ls -l", "explanation": "list"}, ("ls -l", "list", None)),
+    ({"command": "  ls  ", "explanation": None},  ("ls", "", None)),
+    ({"command": "ls"},                           ("ls", "", None)),
+]
+ok_args = all(S.parse_command_args(a) == exp for a, exp in arg_cases)
+# Malformed shapes must come back as errors, not exceptions.
+bad = [[1, 2], "ls", 5, None, {"command": ["ls", "-l"]}, {"command": 5},
+       {"command": ""}, {"command": "   "}, {}]
+for b in bad:
+    try:
+        cmd, why, e = S.parse_command_args(b)
+    except Exception as exc:                        # noqa: BLE001
+        ok_args = False
+        print(f"   raised on {b!r}: {type(exc).__name__}")
+        continue
+    if not e or cmd:
+        ok_args = False
+        print(f"   accepted malformed {b!r} -> {(cmd, why, e)!r}")
+# A non-string explanation is demoted, not rejected: the reason line is
+# cosmetic and must not fail an otherwise valid command.
+ok_args = ok_args and S.parse_command_args(
+    {"command": "ls", "explanation": 7}) == ("ls", "", None)
+print(f"[toolargs] malformed tool arguments return errors, never raise: {'OK' if ok_args else 'FAIL'}")
+if not ok_args: fails.append("tool-args")
+
+# 11) deny check covers the EDITED command. The check in the tool loop runs
+#     against the model's proposal; an edit replaces that string, so the
+#     approved-and-edited form is what must be re-checked before spawning.
+#     Mutation check: drop the re-check in the loop and this still passes
+#     (it asserts is_denied, not the call site) -- the call site is covered by
+#     the audit/flow shape, so keep both in mind when editing run_repl.
+ok_deny = (S.is_denied("rm -rf /") is not None
+           and S.is_denied("ls -l") is None
+           and S.is_denied("sudo rm -fr /") is not None)
+import inspect
+_loop_src = inspect.getsource(S.run_repl)
+# The edited command must be passed through is_denied before execute().
+_edit_idx = _loop_src.find("to_run = edited or cmd")
+_exec_idx = _loop_src.find("execute(to_run)")
+ok_recheck = (_edit_idx != -1 and _exec_idx != -1
+              and "is_denied(to_run)" in _loop_src[_edit_idx:_exec_idx])
+ok_deny = ok_deny and ok_recheck
+print(f"[deny-edit] edited command is re-checked before execute: {'OK' if ok_deny else 'FAIL'}")
+if not ok_deny: fails.append("deny-edit")
+
+# 12) process-group cleanup. The shell almost always dies on the first SIGTERM,
+#     so its exit says nothing about whether the group is clear. A descendant
+#     that ignores SIGTERM must still be SIGKILLed (this returned on the shell's
+#     exit before, so SIGKILL was never sent), while a well-behaved group must
+#     not pay the grace period.
+import subprocess, time as _time, os as _os, tempfile
+
+def _alive(pid):
+    try:
+        _os.kill(pid, 0); return True
+    except (ProcessLookupError, OSError):
+        return False
+
+def _run_group(body):
+    """Spawn `body` under a shell in its own session; return (proc, child_pid)."""
+    pf = tempfile.NamedTemporaryFile("r", suffix=".pid", delete=False)
+    pf.close()
+    proc = subprocess.Popen(body.format(pid=pf.name), shell=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    for _ in range(50):                      # wait for the child to register
+        _time.sleep(0.1)
+        try:
+            txt = open(pf.name).read().strip()
+            if txt:
+                return proc, int(txt)
+        except (OSError, ValueError):
+            pass
+    return proc, -1
+
+_IGNORER = ('python3 -c "import signal,os,time,sys;'
+            'signal.signal(signal.SIGTERM, signal.SIG_IGN);'
+            "open('{pid}','w').write(str(os.getpid()));"
+            'time.sleep(60)" & sleep 60')
+_WELLBEHAVED = ('python3 -c "import os,time;'
+                "open('{pid}','w').write(str(os.getpid()));"
+                'time.sleep(60)" & sleep 60')
+
+proc, gp = _run_group(_IGNORER)
+ok_kill = gp > 0 and _alive(gp)
+S._terminate_group(proc)
+_time.sleep(0.5)
+ok_kill = ok_kill and not _alive(gp)
+if not ok_kill and gp > 0 and _alive(gp):
+    _os.kill(gp, 9)
+
+proc2, gp2 = _run_group(_WELLBEHAVED)
+_t0 = _time.monotonic()
+S._terminate_group(proc2)
+_fast = _time.monotonic() - _t0
+_time.sleep(0.3)
+# Well-behaved group: dies on SIGTERM and returns well inside the grace window.
+ok_fast = gp2 > 0 and not _alive(gp2) and _fast < S._GROUP_TERM_GRACE
+if gp2 > 0 and _alive(gp2):
+    _os.kill(gp2, 9)
+
+# An already-reaped process must not raise or hang.
+p3 = subprocess.Popen("true", shell=True, stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE, text=True, start_new_session=True)
+p3.wait()
+try:
+    S._terminate_group(p3)
+    ok_reaped = True
+except Exception:                                   # noqa: BLE001
+    ok_reaped = False
+
+ok_pg = ok_kill and ok_fast and ok_reaped
+print(f"[killgroup] SIGTERM-ignoring descendant killed ({'OK' if ok_kill else 'FAIL'}), "
+      f"clean group fast-path {_fast:.2f}s ({'OK' if ok_fast else 'FAIL'}), "
+      f"reaped proc safe ({'OK' if ok_reaped else 'FAIL'})")
+if not ok_pg: fails.append("kill-group")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)
