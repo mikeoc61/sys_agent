@@ -76,6 +76,18 @@ model with `/models`. Astra is also priced at $10/$50 per million input/output
 tokens, the same tier as `claude-fable-5`, which sys_agent leaves out of its
 model list as too expensive for this workload.
 
+The rest of the GPT-6 family *does* work and is in the model list:
+`gpt-6-luna` ($0.10/$0.50) is the low-cost option, and `gpt-6-sol` ($2/$10) is
+the mid tier. GPT-6 renamed its tiers: Luna, then Sol, then Astra at the top,
+with no Terra. Both accept `reasoning_effort` `none`, and sys_agent sends it
+automatically, so both run without reasoning here. The default stays
+`gpt-5.4-mini` until the GPT-6 models' tool use holds up in real sessions.
+
+`gpt-4o-mini`, `gpt-5.6-luna`, and `gpt-5.6-terra` were removed from the model
+list on 2026-09-23. Each costs the same as or more than a GPT-6 replacement.
+A `SYS_OPENAI_MODEL` setting or `/model` switch that names one of them still
+works, with an unlisted-model warning.
+
 ## Multi-provider consult
 
 `/consult` asks the *other* configured providers how they would approach the

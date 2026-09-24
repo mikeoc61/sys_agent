@@ -62,7 +62,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 DEEPSEEK_API_KEY=sk-...
 # Optional overrides
 SYS_PROVIDER=anthropic
-SYS_OPENAI_MODEL=gpt-4o-mini
+SYS_OPENAI_MODEL=gpt-6-luna
 SYS_ANTHROPIC_MODEL=claude-sonnet-5
 SYS_DEEPSEEK_MODEL=deepseek-flash
 ```
@@ -75,7 +75,7 @@ SYS_DEEPSEEK_MODEL=deepseek-flash
 | `ANTHROPIC_API_KEY` | Anthropic auth (one of the three required) | — |
 | `DEEPSEEK_API_KEY` | DeepSeek auth (one of the three required) | — |
 | `SYS_PROVIDER` | Skip provider prompt: `openai`, `anthropic`, or `deepseek` | (prompt) |
-| `SYS_OPENAI_MODEL` | OpenAI model string (default favors reliable tool use; set `gpt-4o-mini` for lower cost) | `gpt-5.4-mini` |
+| `SYS_OPENAI_MODEL` | OpenAI model string (default favors reliable tool use; set `gpt-6-luna` for lower cost) | `gpt-5.4-mini` |
 | `SYS_ANTHROPIC_MODEL` | Anthropic model string | `claude-haiku-4-5-20251001` |
 | `SYS_DEEPSEEK_MODEL` | DeepSeek model string | `deepseek-flash` |
 | `SYS_THINKING` | Startup state for extended thinking: `on` / `off` (Anthropic / DeepSeek) | `off` |

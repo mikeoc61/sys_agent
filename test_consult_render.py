@@ -392,6 +392,42 @@ print(f"[apierr] unlisted-model warning hedges only on unknown window: "
 if not ok_x: fails.append("apierr-astra")
 if not ok_w: fails.append("unlisted-warning")
 
+# 15) reasoning_effort="none" routing through the real OpenAIProvider.chat().
+#     gpt-6-luna needs it or every tools turn 400s; gpt-6-astra must NOT get
+#     it (a bare "gpt-6" prefix would send it, turning Astra's translated
+#     tools 400 into an untranslated unsupported_value 400). DeepSeek inherits
+#     chat() plumbing and must stay untouched.
+class _FakeCompletions:
+    def __init__(self) -> None: self.kwargs: dict = {}
+    def create(self, **kw):
+        self.kwargs = kw
+        msg = _NS(content="ok", tool_calls=None,
+                  model_dump=lambda **_: {"role": "assistant", "content": "ok"})
+        return _NS(choices=[_NS(message=msg)],
+                   usage=_NS(prompt_tokens=1, completion_tokens=1))
+def _sent_effort(model: str) -> object:
+    p = _mk(S.OpenAIProvider, "openai", model)
+    fc = _FakeCompletions()
+    p.client = _NS(chat=_NS(completions=fc))
+    p.chat([{"role": "user", "content": "hi"}], SYS)
+    return fc.kwargs.get("extra_body", {}).get("reasoning_effort")
+#     Models dropped from the list (gpt-4o-mini, GPT-5.6) keep their window
+#     and, for GPT-5.6, the forced "none", so existing pins keep working.
+_want = {"gpt-6-luna": "none", "gpt-6-sol": "none", "gpt-5.6-luna": "none",
+         "gpt-5.6-terra": "none", "gpt-6-astra": None, "gpt-5.4-mini": None,
+         "gpt-4.1-nano": None}
+_eff = {m: _sent_effort(m) for m in _want}
+_listed = S.PROVIDER_MODELS["openai"]
+ok_eff = (_eff == _want
+          and _listed == ("gpt-4.1-nano", "gpt-5.4-mini", "gpt-6-luna",
+                          "gpt-6-sol")
+          and all(m in S.CONTEXT_WINDOWS for m in
+                  ("gpt-6-luna", "gpt-6-sol", "gpt-4o-mini", "gpt-5.6-luna",
+                   "gpt-5.6-terra")))
+print(f"[openai] effort=none routing (luna/sol yes, astra no), list: "
+      f"{'OK' if ok_eff else f'FAIL {_eff}'}")
+if not ok_eff: fails.append("effort-none-routing")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)
