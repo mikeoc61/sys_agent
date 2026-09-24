@@ -252,6 +252,29 @@ History persists across sessions; recall surfaces only real prompts, so
 Up-arrow won't waste your time on `y`/`n` answers or meta-commands. To
 start with a clean slate: `> ~/.config/sys_agent/history`.
 
+## Multi-line input
+
+Each Enter submits a message, so a pasted multi-line block would otherwise
+become one conversational turn per line. Wrap it in `"""` delimiters to send it
+as a single message:
+
+| Input | Effect |
+|---|---|
+| A line starting with `"""` | Opens a block; any text after the `"""` is its first line |
+| A line ending with `"""` | Closes the block and sends it; text before the `"""` is kept |
+| `"""text"""` on one line | Sends `text` |
+| Ctrl-D inside a block | Closes the block and sends it |
+| Ctrl-C inside a block | Discards the block and returns to the prompt |
+
+Continuation lines are prompted with `...` and keep their indentation. A
+block is always a message to the AI: text starting with `/` inside it is not
+run as a meta-command. It is saved to history as a single line, so Up-arrow
+recalls it as one line that you can edit and send again.
+
+This is plain line reading, not terminal bracketed paste, so it behaves the
+same on GNU readline and libedit. Limitation: a pasted line that itself ends
+in `"""`, such as a Python docstring, closes the block early.
+
 ## Review command history
 
 `/history` renders the log as a numbered, human-readable list in **host-local

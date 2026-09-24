@@ -205,6 +205,22 @@ Question history is saved between sessions; the AI conversation itself is not.
 Other [line-editing keys](docs/advanced-usage.md#line-editing-and-history)
 work as they do in a normal shell.
 
+### Paste several lines at once
+
+Normally, pressing Enter sends your question, so pasted text with several lines
+would be sent one line at a time. To send it as one message, type `"""` and
+press Enter, paste your text, then type `"""` and press Enter again:
+
+```text
+"""
+Why does this error keep appearing?
+kernel: EXT4-fs warning: mounting fs with errors, running e2fsck is recommended
+"""
+```
+
+Press Ctrl-C before the closing `"""` to discard the text. See
+[multi-line input](docs/advanced-usage.md#multi-line-input) for details.
+
 ### Get a second opinion
 
 If you have keys for more than one provider, `/consult` asks the others how

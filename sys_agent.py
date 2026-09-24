@@ -612,6 +612,45 @@ def _input_prefilled(prompt: str, text: str) -> str:
     return input(prompt)
 
 
+# Multi-line message delimiter. input() returns at every newline, so a pasted
+# block would otherwise arrive as one turn per line. Plain line reading, not
+# bracketed paste: it behaves identically on GNU readline and libedit (which
+# has no bracketed-paste support). The pasted lines still sitting in the tty
+# buffer are consumed by the successive continuation input() calls.
+PASTE_DELIM = '"""'
+
+
+def read_paste_block(first: str) -> str:
+    """
+    Collect a multi-line message opened by a line starting with PASTE_DELIM.
+    Text after the opening delimiter is the first line; a line ending with the
+    delimiter closes the block, and its text before the delimiter is kept, so
+    both `\"\"\"` on its own line and `\"\"\"text ... text\"\"\"` work. Ctrl-D
+    closes the block too (end of input, like `cat`). Ctrl-C propagates so the
+    caller can discard the partial block — never ends the session.
+
+    Known limit: pasted content with a line ending in the delimiter (Python
+    docstrings) closes the block early.
+    """
+    body = first[len(PASTE_DELIM):]
+    if body.rstrip().endswith(PASTE_DELIM) and body.strip() != "":
+        return body.rstrip()[:-len(PASTE_DELIM)].strip()
+    lines = [body] if body.strip() else []
+    while True:
+        try:
+            line = colored_input(dim("... "))
+        except EOFError:
+            print()
+            break
+        if line.rstrip().endswith(PASTE_DELIM):
+            tail = line.rstrip()[:-len(PASTE_DELIM)]
+            if tail.strip():
+                lines.append(tail)
+            break
+        lines.append(line)
+    return "\n".join(lines).strip("\n").rstrip()
+
+
 # -----------------------------------------------------------------------------
 # readline (input history + line editing)
 # -----------------------------------------------------------------------------
@@ -3375,6 +3414,10 @@ def print_help(
     for cmd, desc in META_COMMANDS:
         print(f"  {cmd.ljust(width)}   {dim(desc)}")
     print()
+    print(f"  {PASTE_DELIM} ... {PASTE_DELIM}   " + dim(
+        "Multi-line message: open with \"\"\", paste, close with \"\"\" "
+        "(Ctrl-C cancels)"))
+    print()
     print(dim(
         f"  state: auto-approve={auto_approve}  "
         f"show-tokens={show_tokens}  "
@@ -3800,32 +3843,49 @@ def run_repl(provider: Provider) -> None:
         if not user_in:
             continue
 
+        pasted = user_in.startswith(PASTE_DELIM)
+        if pasted:
+            try:
+                user_in = read_paste_block(user_in)
+            except KeyboardInterrupt:
+                print()
+                print(dim("[multi-line input cancelled]"))
+                continue
+            if not user_in:
+                continue
+
         # Add the typed line to history explicitly. input()'s implicit add is
         # disabled (init_readline) because it is unreliable with colored
         # prompts on stdlib readline; doing it here makes recall deterministic
         # across backends. Meta-commands are then dropped again so they do not
-        # pollute Up-arrow recall of real conversational prompts.
+        # pollute Up-arrow recall of real conversational prompts. A pasted
+        # block is flattened to one line: recall hands input() a single line
+        # regardless, so store the form that resubmits as the same message.
         if _HAVE_READLINE:
             try:
-                readline.add_history(user_in)
+                readline.add_history(" ".join(user_in.split()) if pasted
+                                     else user_in)
             except Exception:   # noqa: BLE001
                 pass
-        if user_in.startswith("/"):
+        if user_in.startswith("/") and not pasted:
             drop_last_history_entry()
 
-        # REPL meta-commands
-        if user_in in ("/exit", "/quit"):
+        # REPL meta-commands. Matched against `meta`, which is blank for a
+        # pasted block: pasted text starting with "/model" or equal to "/exit"
+        # is conversation, never a command.
+        meta = "" if pasted else user_in
+        if meta in ("/exit", "/quit"):
             return
-        if user_in in ("/help", "/?"):
+        if meta in ("/help", "/?"):
             print_help(provider, auto_approve, show_tokens, thinking_enabled, effort)
             continue
-        if user_in == "/reset":
+        if meta == "/reset":
             messages = provider.initial_messages(system)
             session_in = session_out = 0
             last_usage = Usage()
             print(dim("[conversation reset, token counters cleared]"))
             continue
-        if user_in == "/info":
+        if meta == "/info":
             ctx_used = last_usage.context_tokens
             ctx_str = (
                 f"{ctx_used}/{ctx_window} ({100 * ctx_used / ctx_window:.1f}%)"
@@ -3861,8 +3921,8 @@ def run_repl(provider: Provider) -> None:
                 "host": facts,
             }, indent=2))
             continue
-        if user_in.startswith("/provider"):
-            parts = user_in.split()
+        if meta.startswith("/provider"):
+            parts = meta.split()
             if len(parts) == 1:
                 print(json.dumps({
                     "current_provider": provider.name,
@@ -3892,8 +3952,8 @@ def run_repl(provider: Provider) -> None:
                 "conversation/token counters reset]"
             ))
             continue
-        if user_in.startswith("/model"):
-            parts = user_in.split(maxsplit=1)
+        if meta.startswith("/model"):
+            parts = meta.split(maxsplit=1)
             requested = parts[1].strip() if len(parts) == 2 else ""
             known = PROVIDER_MODELS.get(provider.name, ())
             prefixes = PROVIDER_MODEL_PREFIXES.get(provider.name, ())
@@ -3917,8 +3977,8 @@ def run_repl(provider: Provider) -> None:
             ctx_window = CONTEXT_WINDOWS.get(provider.model)
             print(dim(f"[model switched to {provider.model}]"))
             continue
-        if user_in.startswith("/facts"):
-            parts = user_in.split()
+        if meta.startswith("/facts"):
+            parts = meta.split()
             if len(parts) == 1:
                 print(json.dumps(facts, indent=2))
                 continue
@@ -3944,16 +4004,16 @@ def run_repl(provider: Provider) -> None:
                 continue
             print(dim("usage: /facts | /facts refresh | /facts verbose on|off"))
             continue
-        if user_in.startswith("/auto"):
-            parts = user_in.split()
+        if meta.startswith("/auto"):
+            parts = meta.split()
             if len(parts) == 2 and parts[1] in ("on", "off"):
                 auto_approve = parts[1] == "on"
                 print(dim(f"[auto-approve = {auto_approve}]"))
             else:
                 print(dim(f"[auto-approve = {auto_approve}]  usage: /auto on|off"))
             continue
-        if user_in.startswith("/thinking"):
-            parts = user_in.split()
+        if meta.startswith("/thinking"):
+            parts = meta.split()
             if len(parts) == 2 and parts[1] in ("on", "off"):
                 thinking_enabled = parts[1] == "on"
                 print(dim(
@@ -3965,8 +4025,8 @@ def run_repl(provider: Provider) -> None:
                     "  usage: /thinking on|off"
                 ))
             continue
-        if user_in.startswith("/effort"):
-            parts = user_in.split()
+        if meta.startswith("/effort"):
+            parts = meta.split()
             # Valid set vs. bare/invalid query both render through the same
             # readout, so the no-effect / clamp / thinking annotation is
             # identical whether you set effort or just inspect it.
@@ -3981,8 +4041,8 @@ def run_repl(provider: Provider) -> None:
                      if with_usage else "")
             print(dim(f"[effort = {shown}]{note_str}{usage}"))
             continue
-        if user_in.startswith("/tokens"):
-            parts = user_in.split()
+        if meta.startswith("/tokens"):
+            parts = meta.split()
             if len(parts) == 2 and parts[1] in ("on", "off"):
                 show_tokens = parts[1] == "on"
                 print(dim(f"[show_tokens = {show_tokens}]"))
@@ -3991,16 +4051,16 @@ def run_repl(provider: Provider) -> None:
                 print(fmt_tokens(last_usage))
                 print(dim(f"  show_tokens = {show_tokens}  (usage: /tokens on|off)"))
             continue
-        if user_in.startswith("/color"):
-            parts = user_in.split()
+        if meta.startswith("/color"):
+            parts = meta.split()
             if len(parts) == 2 and parts[1] in ("on", "off"):
                 _color_enabled = parts[1] == "on"
                 print(dim(f"[color = {_color_enabled}]"))
             else:
                 print(dim(f"[color = {_color_enabled}]  usage: /color on|off"))
             continue
-        if user_in.startswith("/audit"):
-            parts = user_in.split()
+        if meta.startswith("/audit"):
+            parts = meta.split()
             if len(parts) == 2 and parts[1] in ("on", "off"):
                 if parts[1] == "off":
                     _audit_path = None
@@ -4027,8 +4087,8 @@ def run_repl(provider: Provider) -> None:
                     "usage: /audit | /audit on|off"
                 ))
             continue
-        if user_in.startswith("/history"):
-            parts = user_in.split()
+        if meta.startswith("/history"):
+            parts = meta.split()
             limit: int | None = 50
             if len(parts) == 2 and parts[1] == "all":
                 limit = None
@@ -4044,7 +4104,7 @@ def run_repl(provider: Provider) -> None:
             else:
                 page_text(text)
             continue
-        if user_in.startswith("/consult"):
+        if meta.startswith("/consult"):
             targets = [n for n in available_provider_names() if n != provider.name]
             if not targets:
                 print(dim("[no other providers configured — set another API key "
@@ -4058,7 +4118,7 @@ def run_repl(provider: Provider) -> None:
             # uniformly: rollback (q) discards only the aborted turn, not the
             # earlier session, so the abort path carries the same history as the
             # skip (n) path and benefits identically.
-            args = user_in.split()[1:]
+            args = meta.split()[1:]
             fresh = any(a in ("--fresh", "fresh", "-f") for a in args)
 
             # Two sources for the question to consult on:

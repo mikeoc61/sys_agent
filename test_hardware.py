@@ -185,6 +185,9 @@ _calls = [0]
 def chat(messages, system, thinking=False, effort="high"):
     i = _calls[0]
     _calls[0] += 1
+    # Echo what the model received, JSON-escaped so embedded newlines survive
+    # the pty and a check can assert on exact message boundaries.
+    print("@USER@" + json.dumps(messages[-1].get("content")), flush=True)
     spec = SCRIPT[i] if i < len(SCRIPT) else {"text": "done", "calls": []}
     calls = [S.ToolCall(c["id"], c.get("name", "run_command"), c["args"])
              for c in spec.get("calls", [])]
@@ -286,6 +289,30 @@ def check_tool_args() -> None:
     report("toolargs", ok, "(non-dict args + non-string command survived)")
 
 
+def check_paste_block() -> None:
+    """A \"\"\"-delimited block must reach the model as ONE message. The block
+    is written to the pty in a single burst, as a terminal paste arrives, so
+    the continuation input() calls must drain the rest of the lines from the
+    tty buffer under the live readline backend. Also: Ctrl-C discards a
+    partial block without sending it or ending the session, and a line inside
+    the block that looks like a meta-command ("/exit") is content."""
+    q = '"""'
+    out, _ = run_repl_pty([], [
+        ("you@", f"{q}\npartial draft\n"),
+        ("... ", "\x03"),
+        ("cancelled]", f"{q}\nline one\n  line two\n/exit\n{q}\n"),
+        ('@USER@"line one', f"{q}hi there{q}\n"),
+        ('@USER@"hi there"', "/exit\n"),
+    ])
+    sent = [json.loads(line.split("@USER@", 1)[1])
+            for line in out.replace("\r", "").splitlines()
+            if line.startswith("@USER@")]
+    ok = (sent == ["line one\n  line two\n/exit", "hi there"]
+          and "[multi-line input cancelled]" in out
+          and "REPL-EXITED-CLEANLY" in out and "Traceback" not in out)
+    report("paste-block", ok, f"(model received {sent!r})")
+
+
 # -----------------------------------------------------------------------------
 # Startup: env file resolution and readline backend
 # -----------------------------------------------------------------------------
@@ -344,6 +371,7 @@ def main() -> int:
     check_sigterm_ignorer()
     check_deny_edit()
     check_tool_args()
+    check_paste_block()
     check_config()
     check_readline()
     print()
