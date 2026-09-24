@@ -479,10 +479,10 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/exit, /quit",    "End the session"),
 )
 
-# Startup banner shows only these, so the meta line fits ~80 columns without
-# wrapping; /help lists the full META_COMMANDS table.
+# Startup banner shows only these, so the meta line stays one short line;
+# /help lists the full META_COMMANDS table.
 BANNER_META_COMMANDS: tuple[str, ...] = (
-    "/info", "/model", "/provider", "/thinking", "/consult", "/auto",
+    "/info", "/model", "/provider", "/thinking", "/consult", "/auto", "/exit",
 )
 
 # Local hard-deny tables — these commands are never executed regardless of
