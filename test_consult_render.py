@@ -762,6 +762,102 @@ ok_rules = ("`password_required`" in _p and "plain text for the" in _p
 print(f"[prompt] sudo and host-data rules present: {'OK' if ok_rules else 'FAIL'}")
 if not ok_rules: fails.append("prompt-rules")
 
+# 21) Update check: is the running file what GitHub main ships? Offline:
+#     GitHub and git are faked; the real hashing, compare-direction logic,
+#     and banner wiring run. compare/LOCAL...main reports MAIN relative to
+#     local, so status "ahead" means local is behind; reading it the other
+#     way round would nag developers and stay silent for stale installs.
+import urllib.error as _ue, tempfile as _tf, threading as _th
+_uf = _tf.NamedTemporaryFile("wb", suffix=".py", delete=False)
+_uf.write(b"print('hi')\n"); _uf.close()
+_blob = S._git_blob_sha(b"print('hi')\n")
+_gh_paths: list = []
+def _upd(remote_sha, head="a" * 40, cmp=None, exc=None, cmp_exc=None):
+    def gh(path):
+        _gh_paths.append(path)
+        if exc: raise exc
+        if path.startswith("/contents/"): return {"sha": remote_sha}
+        if cmp_exc: raise cmp_exc
+        return cmp
+    saved = (S._github_json, S._git_head)
+    S._github_json, S._git_head = gh, (lambda d: head)
+    try:
+        return S.check_for_update(_uf.name)
+    finally:
+        S._github_json, S._git_head = saved
+_gh_paths.clear()
+u_same = _upd(_blob)
+_same_calls = list(_gh_paths)
+u_behind = _upd("f" * 40, cmp={"status": "ahead", "ahead_by": 3, "behind_by": 0})
+u_one = _upd("f" * 40, cmp={"status": "ahead", "ahead_by": 1, "behind_by": 0})
+u_ahead = _upd("f" * 40, cmp={"status": "behind", "ahead_by": 0, "behind_by": 2})
+u_ident = _upd("f" * 40, cmp={"status": "identical", "ahead_by": 0, "behind_by": 0})
+u_div = _upd("f" * 40, cmp={"status": "diverged", "ahead_by": 3, "behind_by": 2})
+u_nogit = _upd("f" * 40, head=None)
+_404 = _ue.HTTPError("u", 404, "Not Found", {}, None)
+u_unpushed = _upd("f" * 40, cmp_exc=_404)
+u_ratelim = _upd("f" * 40, cmp_exc=_ue.HTTPError("u", 403, "rate", {}, None))
+u_offline = _upd("f" * 40, exc=_ue.URLError("no route"))
+u_garbage = _upd("f" * 40, exc=ValueError("bad json"))
+os.unlink(_uf.name)
+ok_upd_logic = (
+    u_same is None and len(_same_calls) == 1       # equal blob: one request, silent
+    and u_behind and "3 commits behind GitHub main" in u_behind and "pull" in u_behind
+    and u_one and "1 commit behind" in u_one
+    and u_ahead is None and u_ident is None        # local newer / local edits: silent
+    and u_div and "3 behind, 2 ahead" in u_div
+    and u_nogit and "differs from GitHub main" in u_nogit
+    and u_unpushed and "commits GitHub does not" in u_unpushed
+    and u_ratelim is None and u_offline is None and u_garbage is None)
+print(f"[update] blob compare + compare-API direction, failures silent: "
+      f"{'OK' if ok_upd_logic else f'FAIL {[u_same, u_behind, u_ahead, u_ident, u_div, u_nogit, u_unpushed]}'}")
+if not ok_upd_logic: fails.append("update-check-logic")
+
+# The notice reaches the banner, once; a check still in flight at the banner
+# is reported before a later prompt instead of being dropped or blocking.
+_saved_ucf = S.check_for_update
+_gate = _th.Event()
+def _slow_check():
+    _gate.wait(5); return "update available: 2 commits behind GitHub main"
+S.check_for_update = _slow_check
+try:
+    _uc = S.UpdateCheck()
+    _early = _uc.take(0.05)
+    _gate.set()
+    _late, _again = _uc.take(2), _uc.take(2)
+finally:
+    S.check_for_update = _saved_ucf
+S.check_for_update = lambda: "update available: 5 commits behind GitHub main"
+_saved_repl = (S.gather_host_facts, S.build_system_prompt, S.colored_input,
+               S.SHOW_DISCLAIMER, S._audit_path, S._update_check)
+S.gather_host_facts = lambda: {"node": "t", "system": "T", "machine": "m"}
+S.build_system_prompt = lambda facts: SYS
+def _eof(prompt): raise EOFError
+S.colored_input = _eof
+S.SHOW_DISCLAIMER = False; S._audit_path = None
+_ubuf = io.StringIO()
+try:
+    S._update_check = S.UpdateCheck()
+    with contextlib.redirect_stdout(_ubuf):
+        S.run_repl(_mk(S.OpenAIProvider, "openai", "gpt-5.4-mini"))
+finally:
+    S.check_for_update = _saved_ucf
+    (S.gather_host_facts, S.build_system_prompt, S.colored_input,
+     S.SHOW_DISCLAIMER, S._audit_path, S._update_check) = _saved_repl
+_saved_env = os.environ.get("SYS_UPDATE_CHECK")
+os.environ["SYS_UPDATE_CHECK"] = "off"
+S.init_config()
+_off = S.UPDATE_CHECK
+if _saved_env is None: os.environ.pop("SYS_UPDATE_CHECK", None)
+else: os.environ["SYS_UPDATE_CHECK"] = _saved_env
+S.init_config()
+ok_upd_ui = (_early is None and _late and "2 commits" in _late and _again is None
+             and _ubuf.getvalue().count("5 commits behind") == 1
+             and _off is False)
+print(f"[update] notice shown once at banner, late result deferred, env opt-out: "
+      f"{'OK' if ok_upd_ui else f'FAIL early={_early} late={_late} again={_again} off={_off}'}")
+if not ok_upd_ui: fails.append("update-check-ui")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)

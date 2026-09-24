@@ -26,7 +26,7 @@ the current value (normally the built-in default) is kept, rather than aborting
 startup. That warn-and-continue handling covers the numeric settings
 (`SYS_COMMAND_TIMEOUT`, `SYS_THINKING_BUDGET`, `SYS_THINKING_MAX_TOKENS`,
 `SYS_TOP_PROCESSES`), the on/off switches (`SYS_THINKING`, `SYS_DISCLAIMER`,
-`SYS_PROGRESS`), and `SYS_THINKING_EFFORT`.
+`SYS_PROGRESS`, `SYS_UPDATE_CHECK`), and `SYS_THINKING_EFFORT`.
 
 Two settings behave differently. `SYS_PROVIDER` is validated separately and
 **does** exit with an error message: an unrecognized provider name, or a valid
@@ -91,6 +91,7 @@ SYS_DEEPSEEK_MODEL=deepseek-flash
 | `NO_COLOR` | If set, disables color regardless of `SYS_COLOR=auto` | — |
 | `SYS_PROGRESS` | Activity spinner during model calls / command execution: `on`/`off` | `on` |
 | `SYS_DISCLAIMER` | Startup notice that model-proposed commands can be wrong: `on`/`off` | `on` |
+| `SYS_UPDATE_CHECK` | Check at startup whether `sys_agent.py` matches GitHub `main` ([details](technical-reference.md#update-check)): `on`/`off` | `on` |
 
 ### Files
 

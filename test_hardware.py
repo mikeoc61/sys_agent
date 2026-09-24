@@ -328,6 +328,7 @@ def check_config() -> None:
     env = {k: v for k, v in os.environ.items()
            if k not in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY")}
     env["SYS_ENV_FILE"] = env_path
+    env["SYS_UPDATE_CHECK"] = "off"         # offline harness: no GitHub call
     proc = subprocess.run([sys.executable, os.path.join(HERE, "sys_agent.py")],
                           capture_output=True, text=True, env=env,
                           stdin=subprocess.DEVNULL)
@@ -347,6 +348,55 @@ def check_config() -> None:
          "print('TIMEOUT', S.COMMAND_TIMEOUT)"],
         capture_output=True, text=True)
     report("config-bind", "TIMEOUT 7" in bind.stdout, f"({bind.stdout.strip()})")
+
+
+def check_update_check_exit() -> None:
+    """The update check starts at the top of real main() and must never hold
+    the process: startup exits (here at "no API key set") while a request is
+    stuck. The GitHub URL is pointed at a local socket that accepts and never
+    replies, so this stays offline and the request is genuinely in flight
+    (the accept proves the thread ran) for the full UPDATE_HTTP_TIMEOUT.
+    Provider selection is held 0.5s so the no-key exit lands mid-request;
+    unheld, the exit beats the connect and the check proves nothing. A
+    non-daemon thread, or an executor joined at exit, holds exit that long."""
+    import socket
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY",
+                        "SYS_UPDATE_CHECK")}
+    env["SYS_ENV_FILE"] = os.path.join(tempfile.mkdtemp(), "absent.env")
+    t0 = time.monotonic()
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         f"import sys; sys.path.insert(0, {HERE!r})\n"
+         "import sys_agent as S\n"
+         f"S.UPDATE_REPO_API = 'http://127.0.0.1:{port}'\n"
+         "S.UPDATE_HTTP_TIMEOUT = 5.0\n"
+         "_real = S.select_provider\n"
+         "def _held():\n"
+         "    import time; time.sleep(0.5)\n"
+         "    return _real()\n"
+         "S.select_provider = _held\n"
+         "S.main()"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+        stdin=subprocess.DEVNULL)
+    srv.settimeout(5)
+    try:
+        conn, _ = srv.accept()
+        connected = True
+    except OSError:
+        conn, connected = None, False
+    out, _ = proc.communicate(timeout=15)
+    elapsed = time.monotonic() - t0
+    if conn:
+        conn.close()
+    srv.close()
+    ok = connected and "no API key set" in out and elapsed < 3.0
+    report("update-exit", ok,
+           f"(request in flight={connected}, exit after {elapsed:.1f}s)")
 
 
 def check_readline() -> None:
@@ -400,6 +450,7 @@ def main() -> int:
     check_tool_args()
     check_paste_block()
     check_config()
+    check_update_check_exit()
     check_readline()
     check_sudo_probe()
     print()

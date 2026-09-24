@@ -255,6 +255,44 @@ as alarming absolutes — and that an unsafe-shutdown count is low-signal on a
 USB-bridged drive (many bridges never forward the NVMe shutdown notification, so
 it climbs even on clean unmounts).
 
+## Update check
+
+At startup a background thread checks whether the running `sys_agent.py` is
+the version on GitHub `main`. It reports only; it never downloads or replaces
+code, because an agent that runs shell commands must not change itself
+without being asked.
+
+1. The git blob hash of the running file (what `git hash-object` prints) is
+   compared with the `sha` that the GitHub contents API reports for
+   `sys_agent.py` on `main`. If they match, nothing is printed. No version
+   constant is involved, so the check works for a clone, a copied file, or
+   `uv run`.
+2. If they differ and the file is in a git checkout, `git rev-parse HEAD` gives
+   the local commit, and the compare API (`compare/<HEAD>...main`) classifies
+   it. GitHub answers, so the check never runs `git fetch` or touches the
+   repository.
+
+| Situation | Startup line |
+|---|---|
+| File matches `main` | none |
+| Checkout is behind `main` | `update available: N commits behind GitHub main — run: git -C <dir> pull` |
+| Checkout has diverged from `main` | `this checkout has diverged from GitHub main (N behind, M ahead)` |
+| HEAD not on GitHub (unpushed commits) | `… differs from GitHub main and this checkout has commits GitHub does not` |
+| Not a git checkout, or git missing | `sys_agent.py differs from GitHub main (an update, or local edits)` |
+| Checkout ahead of `main`, or equal with uncommitted edits | none |
+
+The compare direction is easy to misread: `compare/BASE...HEAD` describes
+`main` relative to the local commit, so status `ahead` means the local copy is
+behind.
+
+Startup waits at most one second for the result at the banner. A slower result
+is printed before a later prompt, never over the input line. Any failure
+(offline, DNS, the unauthenticated 60 requests/hour limit, unexpected JSON) is
+silent. Each startup makes at most two requests to `api.github.com`. They
+carry your IP address, a `sys_agent-update-check` User-Agent, and, in the
+second request, the local HEAD commit id. No host facts are sent. Disable with
+`SYS_UPDATE_CHECK=off`.
+
 ## Safety model
 
 Execution controls:

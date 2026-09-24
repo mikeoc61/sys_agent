@@ -149,6 +149,17 @@ Use the same command from this folder for future sessions. You can also set up
 an optional [terminal shortcut](docs/configuration.md#install-a-terminal-shortcut)
 to launch it as `sys_agent` from other folders.
 
+When a newer version is available on GitHub, sys_agent says so when it starts.
+To update, run this from the `sys_agent` folder:
+
+```bash
+git pull
+```
+
+The check only asks GitHub which version is current; none of your system
+information is sent. See
+[Update check](docs/technical-reference.md#update-check) for details.
+
 ## Your first session
 
 Start with a question that only asks for information:

@@ -62,6 +62,7 @@ except ImportError:
         _HAVE_READLINE = False
         _IS_LIBEDIT = False
 
+import hashlib
 import json
 import os
 import platform
@@ -75,6 +76,8 @@ import sys
 import textwrap
 import threading
 import time
+import urllib.error
+import urllib.request
 import itertools
 import atexit
 import datetime
@@ -438,6 +441,15 @@ API_MAX_RETRIES = 5
 # (hallucinated flags, paths, unit names; stale syntax for newer tool
 # versions). Suppress with SYS_DISCLAIMER=off once internalized.
 SHOW_DISCLAIMER = True                         # override: SYS_DISCLAIMER
+
+# Startup check that the running sys_agent.py matches GitHub main. Notify only:
+# an agent that runs shell commands must never replace its own code unasked.
+# See check_for_update().
+UPDATE_CHECK = True                            # override: SYS_UPDATE_CHECK
+UPDATE_REPO_API = "https://api.github.com/repos/mikeoc61/sys_agent"
+UPDATE_BRANCH = "main"
+UPDATE_HTTP_TIMEOUT = 3.0     # per request; the check makes at most two
+UPDATE_BANNER_WAIT = 1.0      # max extra startup delay waiting for the result
 DISCLAIMER = (
     "model-proposed commands can be confidently wrong — LLMs hallucinate "
     "flags, paths, and facts, and may lag current software versions. The "
@@ -4053,12 +4065,16 @@ def run_repl(provider: Provider) -> None:
     ))
     print(dim("meta: " + "  ".join(cmd for cmd, _ in META_COMMANDS)
               + "   — /help for details"))
+    if _update_check and (notice := _update_check.take(UPDATE_BANNER_WAIT)):
+        print(warn(f"[{notice}]"))
     if SHOW_DISCLAIMER:
         print()
         print(warn("note:") + " " + dim(DISCLAIMER))
     print()
 
     while True:
+        if _update_check and (notice := _update_check.take()):
+            print(warn(f"[{notice}]"))
         try:
             # Prompt carries the active model (dim, bracketed) ahead of the
             # bold-cyan you@host tag: it makes the current model visible at a
@@ -4645,6 +4661,118 @@ def run_repl(provider: Provider) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Update check (is this file what GitHub main ships?)
+# -----------------------------------------------------------------------------
+# Compares the running file's git blob hash with sys_agent.py on GitHub main,
+# so it needs no version constant to keep in sync and works for any install
+# (clone, copy, uv run). Equal hashes are silent. A difference alone cannot
+# say who is newer, so when the file sits in a git checkout the compare API
+# classifies local HEAD against main; the answer comes from GitHub, not a
+# `git fetch`, so the check never touches the repo. Quiet when local is ahead
+# or HEAD equals main (uncommitted edits): the user runs something at least as
+# new as main. Unauthenticated GitHub API: 60 req/h per IP, two per startup.
+# Every failure (offline, DNS, rate limit, no git) is silent: a missed notice
+# costs nothing, a startup error would.
+
+def _git_blob_sha(data: bytes) -> str:
+    """The object id `git hash-object` gives this content; GitHub's contents
+    API reports the same value as `sha`."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _github_json(path: str) -> Any:
+    req = urllib.request.Request(
+        UPDATE_REPO_API + path,
+        headers={"Accept": "application/vnd.github+json",
+                 "User-Agent": "sys_agent-update-check"})
+    with urllib.request.urlopen(req, timeout=UPDATE_HTTP_TIMEOUT) as resp:
+        return json.load(resp)
+
+
+def _git_head(directory: str) -> str | None:
+    """HEAD commit of the checkout holding this file, or None when it is not
+    a checkout or git is unavailable."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", directory, "rev-parse", "HEAD"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=UPDATE_HTTP_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    head = proc.stdout.strip()
+    return head if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", head) else None
+
+
+def check_for_update(path: str | None = None) -> str | None:
+    """One-line notice when the running file is behind GitHub main, else None.
+    Never raises."""
+    try:
+        path = path or os.path.abspath(__file__)
+        with open(path, "rb") as fh:
+            local = _git_blob_sha(fh.read())
+        remote = _github_json(f"/contents/sys_agent.py?ref={UPDATE_BRANCH}")
+        if remote.get("sha") == local:
+            return None
+        directory = os.path.dirname(path)
+        head = _git_head(directory)
+        if head is None:
+            return (f"sys_agent.py differs from GitHub {UPDATE_BRANCH} "
+                    "(an update, or local edits)")
+        try:
+            cmp = _github_json(f"/compare/{head}...{UPDATE_BRANCH}")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            # HEAD is not on GitHub: unpushed local commits, base unknown.
+            return (f"sys_agent.py differs from GitHub {UPDATE_BRANCH} and this "
+                    "checkout has commits GitHub does not")
+        # compare/BASE...HEAD reports main relative to local: "ahead" means
+        # main has commits this checkout lacks.
+        status = cmp.get("status")
+        behind, ahead = cmp.get("ahead_by", 0), cmp.get("behind_by", 0)
+        if status == "ahead":
+            return (f"update available: {behind} commit{'s' * (behind != 1)} "
+                    f"behind GitHub {UPDATE_BRANCH} — run: git -C {directory} pull")
+        if status == "diverged":
+            return (f"this checkout has diverged from GitHub {UPDATE_BRANCH} "
+                    f"({behind} behind, {ahead} ahead)")
+        return None                     # identical or local ahead
+    except Exception:
+        return None
+
+
+class UpdateCheck:
+    """Runs check_for_update() on a daemon thread from the top of main(), so
+    it overlaps provider selection and fact gathering. Daemon, not an
+    executor: a request stuck in its timeout must never delay exit."""
+
+    def __init__(self) -> None:
+        self._notice: str | None = None
+        self._shown = False
+        self._thread = threading.Thread(
+            target=self._run, name="update-check", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        self._notice = check_for_update()
+
+    def take(self, wait: float = 0.0) -> str | None:
+        """The notice, at most once. Called at the banner with a short wait,
+        then before each prompt with none, so a slow network still reports
+        (between prompts, never over readline's line)."""
+        if self._shown:
+            return None
+        self._thread.join(wait)
+        if self._thread.is_alive():
+            return None
+        self._shown = True
+        return self._notice
+
+
+_update_check: UpdateCheck | None = None
+
+
+# -----------------------------------------------------------------------------
 # main
 # -----------------------------------------------------------------------------
 
@@ -4720,7 +4848,7 @@ def init_config() -> list[str]:
     global COMMAND_TIMEOUT, ANTHROPIC_THINKING_DEFAULT
     global ANTHROPIC_THINKING_EFFORT_DEFAULT, ANTHROPIC_THINKING_BUDGET
     global ANTHROPIC_THINKING_MAX_TOKENS, SHOW_DISCLAIMER, SHOW_PROGRESS
-    global RUNTIME_TOP_PROCESSES
+    global RUNTIME_TOP_PROCESSES, UPDATE_CHECK
 
     problems: list[str] = []
 
@@ -4754,6 +4882,7 @@ def init_config() -> list[str]:
         _env_int("SYS_THINKING_MAX_TOKENS", ANTHROPIC_THINKING_MAX_TOKENS))
     SHOW_DISCLAIMER = take(_env_flag("SYS_DISCLAIMER", SHOW_DISCLAIMER))
     SHOW_PROGRESS = take(_env_flag("SYS_PROGRESS", SHOW_PROGRESS))
+    UPDATE_CHECK = take(_env_flag("SYS_UPDATE_CHECK", UPDATE_CHECK))
     RUNTIME_TOP_PROCESSES = take(
         _env_int("SYS_TOP_PROCESSES", RUNTIME_TOP_PROCESSES))
     return problems
@@ -4764,6 +4893,7 @@ init_config()
 
 
 def main() -> None:
+    global _update_check
     explicit = os.environ.get("SYS_ENV_FILE")
     env_file = find_env_file(explicit)
     # The env file is loaded before the first coloured output and before
@@ -4779,6 +4909,8 @@ def main() -> None:
         print(warn(f"[SYS_ENV_FILE={explicit} not found; relying on shell env]"))
     for problem in init_config():
         print(warn(f"[config] {problem}"))
+    if UPDATE_CHECK:
+        _update_check = UpdateCheck()
     init_audit()
     if _audit_path:
         print(dim(f"[audit log → {_audit_path}]"))
