@@ -40,6 +40,15 @@ out of the README; link to the page that owns it.
 - Providers share Turn / Usage / CmdResult / ChatTurn shapes. Anthropic batches
   tool_results per assistant turn; OpenAI/DeepSeek send one `role: tool` per
   call. Don't unify message formats without thinking this through.
+- **Stop-reason contract:** every `chat()` classifies `stop_reason` /
+  `finish_reason` into `ChatTurn.stop` (`""` | `refusal` | `truncated`) with a
+  user-facing `stop_detail`. Branch on `stop_reason`, never on `stop_details`
+  (populated only on refusal; category/explanation may be null). The REPL
+  discards a stopped turn's tool calls BEFORE the deny check and approval
+  prompt — a `tool_use` cut mid-input parses as a valid shorter command, so
+  the stop reason is the only signal. `tool_calls` stays populated so the loop
+  can tell a cut command from a cut text answer. No server-side fallbacks
+  (`fallbacks` param) without discussion: they change which model runs.
 - `DeepSeekProvider` subclasses `OpenAIProvider` (OpenAI-compatible endpoint).
   **Replay contract:** with `tools` present, `reasoning_content` must be on
   every replayed assistant message or the next call 400s.

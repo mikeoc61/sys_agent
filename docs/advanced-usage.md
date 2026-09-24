@@ -265,6 +265,56 @@ Reach for it on a non-obvious multi-step diagnosis (tricky `systemd`,
 partitioning, networking). For everyday work, leave it off and stay on a fast
 tier (Haiku, Flash).
 
+## Declined and truncated replies
+
+Two outcomes arrive from the API as a normal HTTP 200, not an error, so
+sys_agent inspects the response's stop reason (`stop_reason` on Anthropic,
+`finish_reason` on OpenAI/DeepSeek) on every turn and says what happened:
+
+- **Model declined.** Anthropic's safety classifiers (Opus 5: `cyber`;
+  Opus 5.5 / Fable 5.x: also `bio`, `reasoning_extraction`, `frontier_llm`,
+  `general_harms`) or the model itself can decline a request. Benign sysadmin
+  and security work occasionally trips them. You see, in red:
+
+  ```text
+  [model declined: category=cyber — <API explanation> — try rephrasing, /model <other>, or /consult for a second opinion]
+  ```
+
+  Any partial output is discarded and the turn is rolled back as if you had
+  pressed Ctrl-C, so the conversation is left exactly as before you asked.
+  The question is kept for `/consult`, which asks the other configured
+  providers — they run different classifiers. On OpenAI/DeepSeek the
+  equivalent is `finish_reason=content_filter`, reported as
+  `openai content_filter`.
+
+- **Reply truncated.** The reply hit the output-token cap. On Anthropic the
+  cap is 4096 on a plain turn and `SYS_THINKING_MAX_TOKENS` (default 32000) on
+  a thinking turn or an always-on model; the notice names the cap that
+  applied and the knob that would have helped:
+
+  ```text
+  [reply truncated — hit the 4096-token output cap; /thinking on raises it to 32000 (SYS_THINKING_MAX_TOKENS), then resend]
+  [reply truncated — hit the 32000-token output cap; raise SYS_THINKING_MAX_TOKENS or lower /effort, then resend]
+  ```
+
+  OpenAI/DeepSeek are sent no cap, so `finish_reason=length` means the
+  model's own output limit; ask for a shorter answer or fewer steps. A full
+  context window (`model_context_window_exceeded`) is reported the same way
+  and points at `/reset`.
+
+  What happens next depends on what was cut. A text answer is shown and kept
+  (it is valid history), then flagged. A **proposed command is discarded
+  without reaching the approval prompt**: a tool call truncated mid-input
+  parses as a valid, shorter command, so the stop reason is the only signal
+  that the model never finished writing it. The assistant turn is dropped; on
+  the first step of a turn the question goes with it (re-ask after adjusting
+  the cap), on a later step the results of commands already run stay in
+  history, so resending continues from there.
+
+`/consult` applies the same rule: a consulted provider whose turn was declined
+or truncated shows the notice instead of a "first move", and is left out of
+the convergence check.
+
 ## Line editing and history
 
 Line editing is provided by readline (or gnureadline on macOS, installed

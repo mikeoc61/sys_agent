@@ -2721,6 +2721,35 @@ class ChatTurn:
     raw_message: Any           # provider-native dict, appended to history
     usage: Usage
     thinking_text: str = ""    # extended-thinking scratchpad (Anthropic/DeepSeek)
+    # Provider-neutral stop classification. "" is a normal stop (end_turn /
+    # tool_use on Anthropic; stop / tool_calls on OpenAI-compatible APIs).
+    # STOP_REFUSAL: a safety classifier or the model itself declined — arrives
+    # as HTTP 200, so no exception fires, and any content present is partial
+    # (a tool_use can be cut mid-input). STOP_TRUNCATED: output hit the token
+    # cap or the context window. A truncated tool_use input parses as a valid
+    # partial object, so stop_reason is the ONLY signal that the command text
+    # is incomplete. The REPL never lets a stopped turn's tool calls reach the
+    # approval prompt; tool_calls is still populated so callers can tell a cut
+    # command from a cut text answer. stop_detail is the provider's one-line
+    # account for the user (refusal category, cap that was hit, remedy).
+    stop: str = ""
+    stop_detail: str = ""
+
+
+STOP_REFUSAL = "refusal"
+STOP_TRUNCATED = "truncated"
+
+
+def stop_notice(turn: "ChatTurn") -> str:
+    """One-line user-facing account of a refused or truncated turn. Empty for
+    a normal stop. Callers add the disposition (what was discarded, whether
+    anything ran) since that depends on where the turn was consumed."""
+    if turn.stop == STOP_REFUSAL:
+        return (f"[model declined: {turn.stop_detail} — try rephrasing, "
+                "/model <other>, or /consult for a second opinion]")
+    if turn.stop == STOP_TRUNCATED:
+        return f"[reply truncated — {turn.stop_detail}]"
+    return ""
 
 
 class Provider:
@@ -2788,7 +2817,8 @@ class OpenAIProvider(Provider):
         ):
             kwargs["extra_body"] = {"reasoning_effort": "none"}
         resp = self.client.chat.completions.create(**kwargs)
-        msg = resp.choices[0].message
+        choice = resp.choices[0]
+        msg = choice.message
         calls: list[ToolCall] = []
         for tc in (msg.tool_calls or []):
             try:
@@ -2796,6 +2826,7 @@ class OpenAIProvider(Provider):
             except json.JSONDecodeError:
                 args = {}
             calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
+        stop, stop_detail = self._classify_finish(choice)
         return ChatTurn(
             text=msg.content or "",
             tool_calls=calls,
@@ -2804,7 +2835,29 @@ class OpenAIProvider(Provider):
                 input_tokens=getattr(resp.usage, "prompt_tokens", 0) or 0,
                 output_tokens=getattr(resp.usage, "completion_tokens", 0) or 0,
             ),
+            stop=stop,
+            stop_detail=stop_detail,
         )
+
+    def _classify_finish(self, choice: Any) -> tuple[str, str]:
+        """Map Chat Completions finish_reason to (ChatTurn.stop, detail).
+
+        Documented values (openai SDK 3.19 Choice.finish_reason): stop,
+        tool_calls, function_call (normal); `length` = max_tokens or the
+        model's output limit reached; `content_filter` = content omitted by
+        the provider's filter. sys_agent sends no max_tokens on this path, so
+        `length` means the model's own output ceiling — the remedy is a
+        smaller ask, not a config change. DeepSeek inherits this (same wire
+        enum on its OpenAI-compatible endpoint).
+        """
+        reason = getattr(choice, "finish_reason", None)
+        if reason == "length":
+            return STOP_TRUNCATED, (
+                f"hit {self.name}'s output-token limit for {self.model}; "
+                "ask for a shorter answer or fewer steps and resend")
+        if reason == "content_filter":
+            return STOP_REFUSAL, f"{self.name} content_filter"
+        return "", ""
 
     def append_tool_results(
         self, messages: list[dict], results: list[tuple[str, str]]
@@ -2910,7 +2963,8 @@ class DeepSeekProvider(OpenAIProvider):
         else:
             kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         resp = self.client.chat.completions.create(**kwargs)
-        msg = resp.choices[0].message
+        choice = resp.choices[0]
+        msg = choice.message
         calls: list[ToolCall] = []
         for tc in (msg.tool_calls or []):
             try:
@@ -2923,6 +2977,7 @@ class DeepSeekProvider(OpenAIProvider):
         # Always carry reasoning_content (verbatim, else "") so the replay
         # contract holds for any /thinking toggle history within the session.
         raw["reasoning_content"] = reasoning
+        stop, stop_detail = self._classify_finish(choice)
         return ChatTurn(
             text=msg.content or "",
             tool_calls=calls,
@@ -2932,6 +2987,8 @@ class DeepSeekProvider(OpenAIProvider):
                 output_tokens=getattr(resp.usage, "completion_tokens", 0) or 0,
             ),
             thinking_text=reasoning,
+            stop=stop,
+            stop_detail=stop_detail,
         )
 
     def render_assistant(self, text: str, tool_calls: list["ToolCall"]) -> dict:
@@ -3048,6 +3105,7 @@ class AnthropicProvider(Provider):
                     name=block.name,
                     arguments=dict(block.input or {}),
                 ))
+        stop, stop_detail = self._classify_stop(resp, kwargs["max_tokens"])
         return ChatTurn(
             text="\n".join(text_parts),
             tool_calls=calls,
@@ -3060,7 +3118,51 @@ class AnthropicProvider(Provider):
                     resp.usage, "cache_creation_input_tokens", 0) or 0,
             ),
             thinking_text="\n".join(thinking_parts),
+            stop=stop,
+            stop_detail=stop_detail,
         )
+
+    @staticmethod
+    def _classify_stop(resp: Any, max_tokens: int) -> tuple[str, str]:
+        """Map Message.stop_reason to (ChatTurn.stop, detail).
+
+        Documented values (anthropic SDK 1.8 StopReason): end_turn, tool_use,
+        stop_sequence, pause_turn (normal here — no server tools are used);
+        `max_tokens` = the requested cap or the model's maximum was reached;
+        `model_context_window_exceeded`; `refusal` = a classifier intervened
+        (Opus 5 cyber; Opus 5.5 / Fable 5.x also bio, reasoning_extraction,
+        frontier_llm, general_harms) or the model declined. Branch on
+        stop_reason only: stop_details is populated solely on refusal and
+        both its category and explanation may be null even then.
+
+        `max_tokens` here is the cap this request actually sent — 4096 on a
+        plain turn, ANTHROPIC_THINKING_MAX_TOKENS on a thinking or always-on
+        turn — so the remedy names the knob that would have helped.
+        """
+        reason = getattr(resp, "stop_reason", None)
+        if reason == "refusal":
+            details = getattr(resp, "stop_details", None)
+            category = getattr(details, "category", None) or "unspecified"
+            explanation = getattr(details, "explanation", None)
+            detail = f"category={category}"
+            if explanation:
+                detail += f" — {explanation}"
+            return STOP_REFUSAL, detail
+        if reason == "max_tokens":
+            if max_tokens >= ANTHROPIC_THINKING_MAX_TOKENS:
+                remedy = "raise SYS_THINKING_MAX_TOKENS or lower /effort"
+            else:
+                remedy = (f"/thinking on raises it to "
+                          f"{ANTHROPIC_THINKING_MAX_TOKENS} "
+                          "(SYS_THINKING_MAX_TOKENS)")
+            return STOP_TRUNCATED, (
+                f"hit the {max_tokens}-token output cap; {remedy}, "
+                "then resend")
+        if reason == "model_context_window_exceeded":
+            return STOP_TRUNCATED, (
+                "the context window is full; /reset starts a fresh "
+                "conversation")
+        return "", ""
 
     def append_tool_results(
         self, messages: list[dict], results: list[tuple[str, str]]
@@ -3750,10 +3852,15 @@ def print_consult(
             print(f"{agent_tag(name)} {dim('(' + model + ')')}")
             print(fail(f"  [error] {turn}"))
             continue
-        cmds = _turn_commands(turn)
+        # A refused or truncated turn proposes nothing: its tool_use may have
+        # been cut mid-input, so listing it as a "first move" would compare a
+        # command the model never finished writing against the reference.
+        cmds = [] if turn.stop else _turn_commands(turn)
         proposed_norms.append({_norm_cmd(c) for c, _ in cmds})
         print(f"{agent_tag(name)} {dim('(' + model + ')')}"
               + _cmd_count_suffix(len(cmds)))
+        if turn.stop:
+            print(warn(f"  {stop_notice(turn)}"))
         if cmds:
             for c, why in cmds:
                 tag = ok("  [matches reference]") if _norm_cmd(c) in ref_norm else ""
@@ -4312,6 +4419,38 @@ def run_repl(provider: Provider) -> None:
             if show_tokens:
                 print(fmt_tokens(last_usage))
 
+            # Stop-reason guard — runs BEFORE the assistant message is stored
+            # and before any tool call can reach the approval prompt. HTTP 200
+            # with stop_reason refusal/max_tokens is the one way a command the
+            # model did not finish writing can arrive looking well-formed, so
+            # this is the only place it can be caught (the deny list and the
+            # prompt both see a plausible string).
+            if turn.stop == STOP_REFUSAL:
+                # Partial output is discarded whole (a refusal can cut a
+                # tool_use mid-input). Roll the turn back like Ctrl-C (Design
+                # B) and keep the question for /consult, which is the natural
+                # next move — another provider runs different classifiers.
+                print(fail(f"\n{stop_notice(turn)}"))
+                if turn.tool_calls:
+                    print(fail("[proposed command discarded — nothing ran]"))
+                aborted_turn_events = normalize(provider.name,
+                                                messages[turn_start:])
+                del messages[turn_start:]
+                break
+            if turn.stop == STOP_TRUNCATED and turn.tool_calls:
+                # A cut tool_use input parses as a valid partial object, so
+                # its command text cannot be trusted. Drop the assistant turn
+                # exactly like the api-error path: nothing appended means no
+                # dangling tool_use awaiting a tool_result, and on the first
+                # iteration the orphan question goes too. Later iterations
+                # keep their tool results so a resend continues from there.
+                print(warn(f"\n{stop_notice(turn)}"))
+                print(warn("[proposed command discarded as incomplete — "
+                           "nothing ran]"))
+                if iteration == 1:
+                    messages.pop()
+                break
+
             provider.append_assistant(messages, turn)
 
             # Surface the reasoning scratchpad dimmed, ahead of any proposed
@@ -4323,6 +4462,11 @@ def run_repl(provider: Provider) -> None:
                 if turn.text:
                     # Prefix colored, body plain (per preference)
                     print(f"\n{agent_tag('agent>')} {turn.text}\n")
+                if turn.stop == STOP_TRUNCATED:
+                    # Text-only answer cut at the cap: what arrived is shown
+                    # and kept (valid history), flagged so the cut-off is
+                    # not mistaken for the model's full answer.
+                    print(warn(stop_notice(turn)))
                 # A turn completed cleanly; any earlier aborted question is now
                 # stale — its successor (this turn) lives in `messages`, so
                 # /consult reads it from there.

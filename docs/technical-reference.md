@@ -251,6 +251,22 @@ Execution controls:
    up while it remains in that process group. Descendants that create a separate
    session or group are outside this cleanup mechanism.
 
+Ahead of all three sits a **stop-reason guard** in the REPL loop. A reply
+that the API cut short (`stop_reason` `max_tokens` /
+`model_context_window_exceeded`, `finish_reason` `length`) or declined
+(`refusal`, `content_filter`) arrives as HTTP 200 with well-formed-looking
+content, and a `tool_use` input truncated mid-string parses as a valid,
+shorter command — one the deny list and the approval prompt would both judge
+on its face. `chat()` classifies the stop into `ChatTurn.stop`
+(`refusal` / `truncated`) on every provider, and the loop discards a stopped
+turn's tool calls before the deny check or prompt ever sees them, printing
+what happened and why (see `docs/advanced-usage.md`, "Declined and truncated
+replies"). A refused turn is rolled back like Ctrl-C; a truncated tool turn
+is dropped like an API error, so no dangling `tool_use` is left awaiting a
+`tool_result`. Guarded by `test_consult_render.py` (fake clients through the
+real `chat()`, a scripted `run_repl()` with `execute()` stubbed), with the
+mutation check that removing the guard sends the cut command to the prompt.
+
 A dimmed startup notice restates the premise of layer 1: model-proposed
 commands can be confidently wrong (hallucinated flags, paths, unit names;
 stale syntax), and the approval prompt is where you catch that. Suppress it

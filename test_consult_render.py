@@ -517,6 +517,181 @@ print(f"[deepseek] v4-pro listed, thinking off/on routing: "
       f"{'OK' if ok_ds else f'FAIL {_ds_got}'}")
 if not ok_ds: fails.append("deepseek-v4-pro")
 
+# 18) stop_reason / finish_reason. A refusal (safety classifier; Opus 5.5 runs
+#     cyber/bio/reasoning_extraction) and a max_tokens cut both arrive as
+#     HTTP 200, so no except-path fires. Before this, chat() never read the
+#     field: a refusal became an empty "answer" with no explanation, and a
+#     tool_use truncated at the cap parsed as a valid partial object and went
+#     to the approval prompt as if the model had finished writing it. Both
+#     wire paths (real chat() on fake clients) and the REPL disposition are
+#     checked; mutation: drop the stop_reason read, or the REPL guard, and
+#     the truncated command reaches prompt_approval() again.
+def _ant_stop(stop_reason, blocks, details=None, *, model, thinking):
+    p = _mk(S.AnthropicProvider, "anthropic", model)
+    fm = _FakeMessages()
+    resp = fm._resp()
+    resp.content = blocks
+    resp.stop_reason = stop_reason
+    resp.stop_details = details
+    fm._resp = lambda: resp
+    p.client = _NS(messages=fm)
+    return p.chat([{"role": "user", "content": "hi"}], SYS,
+                  thinking=thinking, effort="high")
+_TXT = _NS(type="text", text="Let me look",
+           model_dump=lambda **_: {"type": "text", "text": "Let me look"})
+_CUT = _NS(type="tool_use", id="toolu_cut", name="run_command",
+           input={"command": "rm -rf /var/lib/apt/lists/partial"},
+           model_dump=lambda **_: {"type": "tool_use", "id": "toolu_cut"})
+_HK = "claude-haiku-4-5-20251001"
+t_ref = _ant_stop("refusal", [_TXT, _CUT], model=_HK, thinking=False,
+                  details=_NS(type="refusal", category="cyber",
+                              explanation="could enable cyber harm"))
+t_ref_bare = _ant_stop("refusal", [], None, model=_HK, thinking=False)
+t_cut = _ant_stop("max_tokens", [_TXT, _CUT], model=_HK, thinking=False)
+t_cut_think = _ant_stop("max_tokens", [_TXT], model=_HK, thinking=True)
+t_cut_always = _ant_stop("max_tokens", [_TXT], model="claude-opus-5-5",
+                         thinking=False)
+t_ctx = _ant_stop("model_context_window_exceeded", [_TXT], model=_HK,
+                  thinking=False)
+t_ok = _ant_stop("tool_use", [_TXT, _CUT], model=_HK, thinking=False)
+ok_ant_stop = (
+    t_ref.stop == S.STOP_REFUSAL and "category=cyber" in t_ref.stop_detail
+    and "cyber harm" in t_ref.stop_detail
+    and len(t_ref.tool_calls) == 1                 # kept: REPL must know a command was cut
+    and t_ref_bare.stop == S.STOP_REFUSAL          # null stop_details must not crash
+    and "unspecified" in t_ref_bare.stop_detail
+    and t_cut.stop == S.STOP_TRUNCATED
+    and f"{S.ANTHROPIC_MAX_TOKENS}-token" in t_cut.stop_detail
+    and "/thinking on" in t_cut.stop_detail        # plain turn: the fix is the bigger cap
+    and f"{S.ANTHROPIC_THINKING_MAX_TOKENS}-token" in t_cut_think.stop_detail
+    and "SYS_THINKING_MAX_TOKENS" in t_cut_think.stop_detail
+    and "/thinking on" not in t_cut_think.stop_detail
+    and f"{S.ANTHROPIC_THINKING_MAX_TOKENS}-token" in t_cut_always.stop_detail
+    and t_ctx.stop == S.STOP_TRUNCATED and "/reset" in t_ctx.stop_detail
+    and t_ok.stop == "" and t_ok.stop_detail == ""
+    and "declined" in S.stop_notice(t_ref) and "/consult" in S.stop_notice(t_ref)
+    and "truncated" in S.stop_notice(t_cut) and S.stop_notice(t_ok) == "")
+print(f"[anthropic] stop_reason refusal/max_tokens/ctx → ChatTurn.stop: "
+      f"{'OK' if ok_ant_stop else 'FAIL'}")
+if not ok_ant_stop: fails.append("anthropic-stop-reason")
+
+def _oai_stop(cls, name, finish_reason):
+    p = _mk(cls, name, "gpt-5.4-mini" if name == "openai" else "deepseek-flash")
+    fc = _FakeCompletions()
+    real = fc.create
+    def create(**kw):
+        r = real(**kw)
+        r.choices[0].finish_reason = finish_reason
+        r.choices[0].message.reasoning_content = None
+        return r
+    fc.create = create
+    p.client = _NS(chat=_NS(completions=fc))
+    return p.chat([{"role": "user", "content": "hi"}], SYS)
+o_len = _oai_stop(S.OpenAIProvider, "openai", "length")
+o_filt = _oai_stop(S.OpenAIProvider, "openai", "content_filter")
+o_ok = _oai_stop(S.OpenAIProvider, "openai", "tool_calls")
+d_len = _oai_stop(S.DeepSeekProvider, "deepseek", "length")
+d_ok = _oai_stop(S.DeepSeekProvider, "deepseek", "stop")
+ok_oai_stop = (
+    o_len.stop == S.STOP_TRUNCATED and "openai" in o_len.stop_detail
+    and o_filt.stop == S.STOP_REFUSAL and "content_filter" in o_filt.stop_detail
+    and o_ok.stop == "" and d_len.stop == S.STOP_TRUNCATED
+    and "deepseek" in d_len.stop_detail and d_ok.stop == ""
+    and d_len.raw_message.get("reasoning_content") == "")   # replay contract intact
+print(f"[openai/deepseek] finish_reason length/content_filter → ChatTurn.stop: "
+      f"{'OK' if ok_oai_stop else 'FAIL'}")
+if not ok_oai_stop: fails.append("openai-finish-reason")
+
+# REPL disposition, driving the real run_repl() with scripted input and a
+# scripted provider. execute() and prompt_approval() are stubbed recorders
+# (NO-SPAWN, as in test_hardware): the check is that a cut or refused command
+# never reaches either, that the conversation is left valid for the next
+# question, and that a normal turn afterwards still runs end to end.
+import io, contextlib
+_seen_hist: list = []          # messages (copied) at each chat() call
+_approved: list = []
+_ran: list = []
+def _tc(cmd, tid="c1"):
+    return S.ToolCall(tid, S.TOOL_NAME, {"command": cmd, "explanation": "x"})
+def _turn(text="", calls=(), stop="", detail=""):
+    return S.ChatTurn(text=text, tool_calls=list(calls),
+                      raw_message={"role": "assistant", "content": text or None,
+                                   **({"tool_calls": [{"id": c.id}
+                                       for c in calls]} if calls else {})},
+                      usage=S.Usage(input_tokens=1, output_tokens=1),
+                      stop=stop, stop_detail=detail)
+_SCRIPT = [
+    _turn("partial", [_tc("rm -rf /var/lib/apt/lists/partial")],
+          S.STOP_TRUNCATED, "hit the 4096-token output cap"),
+    _turn("", [_tc("cat /etc/shadow", "c2")], S.STOP_REFUSAL, "category=cyber"),
+    _turn("", [_tc("uptime", "c3")]),                          # normal tool turn
+    _turn("up 3 days and then the answer stops mid", [],
+          S.STOP_TRUNCATED, "hit the 4096-token output cap"),  # text-only cut
+]
+_REPL_INPUT = iter(["clean apt cache", "show shadow", "how long up?"])
+def _fake_chat(messages, system, thinking=False, effort="high"):
+    _seen_hist.append([dict(m) for m in messages])
+    return _SCRIPT[len(_seen_hist) - 1]
+def _fake_input(prompt):
+    try:
+        return next(_REPL_INPUT)
+    except StopIteration:
+        raise EOFError
+def _fake_approval(cmd, why, auto):
+    _approved.append(cmd); return "run", None
+def _fake_execute(cmd):
+    _ran.append(cmd)
+    return S.CmdResult(cmd, 0, "(execution stubbed by test)", "")
+_saved = (S.gather_host_facts, S.build_system_prompt, S.colored_input,
+          S.prompt_approval, S.execute, S.SHOW_DISCLAIMER, S.SHOW_PROGRESS,
+          S._audit_path)
+S.gather_host_facts = lambda: {"node": "t", "system": "T", "machine": "m"}
+S.build_system_prompt = lambda facts: SYS
+S.colored_input = _fake_input
+S.prompt_approval = _fake_approval
+S.execute = _fake_execute
+S.SHOW_DISCLAIMER = False; S.SHOW_PROGRESS = False; S._audit_path = None
+_rp = _mk(S.OpenAIProvider, "openai", "gpt-5.4-mini")
+_rp.chat = _fake_chat
+_buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(_buf):
+        S.run_repl(_rp)
+finally:
+    (S.gather_host_facts, S.build_system_prompt, S.colored_input,
+     S.prompt_approval, S.execute, S.SHOW_DISCLAIMER, S.SHOW_PROGRESS,
+     S._audit_path) = _saved
+_out = _buf.getvalue()
+def _user_texts(h):
+    return [m["content"] for m in h if m.get("role") == "user"]
+ok_repl = (
+    _approved == ["uptime"] and _ran == ["uptime"]      # cut + refused never reached the gate
+    and len(_seen_hist) == 4
+    and _user_texts(_seen_hist[1]) == ["show shadow"]   # cut turn: question popped, no assistant msg
+    and _user_texts(_seen_hist[2]) == ["how long up?"]  # refused turn: rolled back whole
+    and _seen_hist[3][-1].get("role") == "tool"         # normal turn fed its result back
+    and "reply truncated" in _out and "discarded as incomplete" in _out
+    and "model declined: category=cyber" in _out and "nothing ran" in _out
+    and "answer stops mid" in _out                      # text-only cut is shown...
+    and _out.count("reply truncated") == 2)             # ...and flagged
+print(f"[repl] refused/truncated tool call never reaches approval; history valid: "
+      f"{'OK' if ok_repl else f'FAIL approved={_approved} ran={_ran}'}")
+if not ok_repl: fails.append("repl-stop-guard")
+
+# /consult must not present a cut command as a provider's "first move".
+_cbuf = io.StringIO()
+with contextlib.redirect_stdout(_cbuf):
+    S.print_consult(OAI, [("uptime", "x")], [
+        ("anthropic", "claude-opus-5-5", _SCRIPT[0]),
+        ("deepseek", "deepseek-flash", _turn("", [_tc("uptime")])),
+    ])
+_cout = _cbuf.getvalue()
+ok_consult_stop = ("apt/lists/partial" not in _cout and "reply truncated" in _cout
+                   and "uptime" in _cout)
+print(f"[consult] stopped turn shows notice, not its cut command: "
+      f"{'OK' if ok_consult_stop else 'FAIL'}")
+if not ok_consult_stop: fails.append("consult-stop-notice")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)
