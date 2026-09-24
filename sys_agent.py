@@ -3234,6 +3234,20 @@ def explain_api_error(e: Exception) -> str:
     s = str(e)
     # status_code attribute is present on both SDKs' APIStatusError subclasses
     code = getattr(e, "status_code", None)
+    # OpenAI's tools+reasoning 400 says "set reasoning_effort to 'none'", but
+    # models that reject "none" outright (gpt-6-astra, probe 2026-09-23) have
+    # no Chat Completions path with tools at all, so the raw text sends the
+    # user after a fix that cannot work. Keyed on the message, not the model
+    # name, so a future model with the same restriction is covered too.
+    m = re.search(r"Function tools with reasoning_effort are not supported "
+                  r"for (\S+) in /v1/chat/completions", s)
+    if m:
+        return (f"{m.group(1)} cannot call tools on Chat Completions, the "
+                "endpoint sys_agent uses, so it cannot propose commands. "
+                "OpenAI's suggested reasoning_effort='none' is rejected by "
+                "some models (gpt-6-astra among them). Pick a listed model "
+                "with /models. See "
+                "docs/advanced-usage.md#unsupported-openai-gpt-6-astra.")
     if code == 529 or "overloaded" in s.lower():
         return ("API overloaded (529) — the provider is at capacity. "
                 "Retries were exhausted. Wait a minute and resend, or try "
@@ -3251,6 +3265,19 @@ def explain_api_error(e: Exception) -> str:
         return ("Network error reaching the API — check connectivity "
                 "(the Pi's wlan0 power-save quirk can cause this).")
     return s          # fall back to the raw message for anything unrecognized
+
+
+def unlisted_model_warning(provider_name: str, model: str) -> str:
+    """Warning for a prefix-matched model absent from PROVIDER_MODELS.
+
+    The context-% hedge applies only when CONTEXT_WINDOWS lacks the model;
+    deliberately-unlisted models (claude-fable-5, gpt-5.6-sol, gpt-6-astra)
+    have windows recorded and display context-% normally.
+    """
+    tail = ("" if model in CONTEXT_WINDOWS
+            else "; context-% may be unavailable")
+    return (f"[warning: {model!r} is not a known {provider_name} model — "
+            f"switching anyway{tail}]")
 
 
 def thinking_active(provider: Provider, flag: bool) -> bool:
@@ -3875,10 +3902,7 @@ def run_repl(provider: Provider) -> None:
             elif requested and requested.startswith(prefixes):
                 # Unlisted but the prefix matches this provider — likely a
                 # newer release. Accept it, but warn it is unrecognised.
-                print(warn(
-                    f"[warning: {requested!r} is not a known {provider.name} "
-                    "model — switching anyway; context-% may be unavailable]"
-                ))
+                print(warn(unlisted_model_warning(provider.name, requested)))
                 chosen = requested
             else:
                 # No arg, or a wrong-provider / nonsense name: show selector.

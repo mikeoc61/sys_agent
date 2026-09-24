@@ -360,6 +360,38 @@ ok_conf = ok_cfg and ok_bad and ok_derived
 print(f"[config] env file values applied, bad values reported not fatal: {'OK' if ok_conf else 'FAIL'}")
 if not ok_conf: fails.append("config-init")
 
+# 14) gpt-6-astra's tools 400 tells the user to "set reasoning_effort to
+#     'none'", which that model rejects; the raw text used to reach the REPL
+#     untranslated. The unlisted-model warning must drop its context-% hedge
+#     when the window is recorded.
+class _FakeAPIError(Exception):
+    # Stand-in for the SDK's BadRequestError (the baseline runs without the
+    # SDKs installed): same status_code attribute and str() shape.
+    def __init__(self, msg: str, status_code: int) -> None:
+        super().__init__(msg); self.status_code = status_code
+# Verbatim str(e) from a live M3 session, 2026-09-23.
+_e = _FakeAPIError(
+    "Error code: 400 - {'error': {'message': \"Function tools with "
+    "reasoning_effort are not supported for gpt-6-astra in "
+    "/v1/chat/completions. To use function tools, use /v1/responses or set "
+    "reasoning_effort to 'none'.\", 'type': 'invalid_request_error', "
+    "'param': 'reasoning_effort', 'code': None}}", 400)
+_x = S.explain_api_error(_e)
+ok_x = ("gpt-6-astra cannot call tools" in _x and "/models" in _x
+        and "set reasoning_effort to 'none'" not in _x)
+# Unrelated 400s still fall through to the raw message.
+_e2 = _FakeAPIError("Error code: 400 - other", 400)
+ok_x = ok_x and S.explain_api_error(_e2) == "Error code: 400 - other"
+_w_known = S.unlisted_model_warning("openai", "gpt-6-astra")
+_w_unknown = S.unlisted_model_warning("openai", "gpt-9-nova")
+ok_w = ("context-%" not in _w_known and "context-% may be unavailable"
+        in _w_unknown)
+print(f"[apierr] astra tools-400 translated: {'OK' if ok_x else 'FAIL: ' + _x}")
+print(f"[apierr] unlisted-model warning hedges only on unknown window: "
+      f"{'OK' if ok_w else 'FAIL'}")
+if not ok_x: fails.append("apierr-astra")
+if not ok_w: fails.append("unlisted-warning")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)

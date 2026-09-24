@@ -69,8 +69,10 @@ tools error. Leaving the field out hits it as well. Astra with tools works only
 on OpenAI's Responses API, which sys_agent does not use.
 
 `/model gpt-6-astra` is still accepted (it matches the `gpt-` prefix), but the
-first question fails with a 400 error and no command is run. Switch back with
-`/model gpt-5.4-mini`. Astra is also priced at $10/$50 per million input/output
+first question fails with a 400 error and no command is run. sys_agent replaces
+OpenAI's misleading "set reasoning_effort to 'none'" advice with an explanation
+that links here. Switch back with `/model gpt-5.4-mini`, or pick a listed
+model with `/models`. Astra is also priced at $10/$50 per million input/output
 tokens, the same tier as `claude-fable-5`, which sys_agent leaves out of its
 model list as too expensive for this workload.
 
