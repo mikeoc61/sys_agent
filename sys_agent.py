@@ -63,6 +63,7 @@ except ImportError:
         _IS_LIBEDIT = False
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -462,6 +463,7 @@ DISCLAIMER = (
 META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help",           "Show this command list and current toggle states"),
     ("/info",           "Provider, model, session token usage, host facts"),
+    ("/version",        "sys_agent version, GitHub main status, runtime versions"),
     ("/reset",          "Clear conversation history and token counters"),
     ("/auto on|off",    "Skip the per-command approval prompt (deny list still applies)"),
     ("/thinking on|off", "Toggle extended thinking — Anthropic/DeepSeek (next turn)"),
@@ -4147,6 +4149,19 @@ def run_repl(provider: Provider) -> None:
             last_usage = Usage()
             print(dim("[conversation reset, token counters cleared]"))
             continue
+        if meta == "/version":
+            # Foreground GitHub check (up to two requests). Ctrl-C cancels it
+            # and returns to the prompt: the idle-prompt handler above does
+            # not cover a running meta-command.
+            try:
+                with Activity("checking GitHub"):
+                    lines = version_report()
+            except KeyboardInterrupt:
+                print()
+                print(dim("[version check cancelled]"))
+                continue
+            print("\n".join(lines))
+            continue
         if meta == "/info":
             ctx_used = last_usage.context_tokens
             ctx_str = (
@@ -4709,42 +4724,118 @@ def _git_head(directory: str) -> str | None:
     return head if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", head) else None
 
 
-def check_for_update(path: str | None = None) -> str | None:
-    """One-line notice when the running file is behind GitHub main, else None.
-    Never raises."""
+def update_status(path: str | None = None) -> tuple[bool, str]:
+    """(notify, message) for the running file against GitHub main. notify is
+    True only when the user may be missing main's code; the message is
+    always set, so /version can report the silent outcomes too (current,
+    ahead, local edits, or why the check failed). Never raises Exception."""
     try:
         path = path or os.path.abspath(__file__)
         with open(path, "rb") as fh:
             local = _git_blob_sha(fh.read())
         remote = _github_json(f"/contents/sys_agent.py?ref={UPDATE_BRANCH}")
         if remote.get("sha") == local:
-            return None
+            return False, f"up to date with GitHub {UPDATE_BRANCH}"
         directory = os.path.dirname(path)
         head = _git_head(directory)
         if head is None:
-            return (f"sys_agent.py differs from GitHub {UPDATE_BRANCH} "
-                    "(an update, or local edits)")
+            return True, (f"sys_agent.py differs from GitHub {UPDATE_BRANCH} "
+                          "(an update, or local edits)")
         try:
             cmp = _github_json(f"/compare/{head}...{UPDATE_BRANCH}")
         except urllib.error.HTTPError as e:
             if e.code != 404:
                 raise
             # HEAD is not on GitHub: unpushed local commits, base unknown.
-            return (f"sys_agent.py differs from GitHub {UPDATE_BRANCH} and this "
-                    "checkout has commits GitHub does not")
+            return True, (f"sys_agent.py differs from GitHub {UPDATE_BRANCH} and "
+                          "this checkout has commits GitHub does not")
         # compare/BASE...HEAD reports main relative to local: "ahead" means
         # main has commits this checkout lacks.
         status = cmp.get("status")
         behind, ahead = cmp.get("ahead_by", 0), cmp.get("behind_by", 0)
         if status == "ahead":
-            return (f"update available: {behind} commit{'s' * (behind != 1)} "
-                    f"behind GitHub {UPDATE_BRANCH} — run: git -C {directory} pull")
+            return True, (f"update available: {behind} commit{'s' * (behind != 1)} "
+                          f"behind GitHub {UPDATE_BRANCH} — run: git -C {directory} pull")
         if status == "diverged":
-            return (f"this checkout has diverged from GitHub {UPDATE_BRANCH} "
-                    f"({behind} behind, {ahead} ahead)")
-        return None                     # identical or local ahead
-    except Exception:
+            return True, (f"this checkout has diverged from GitHub {UPDATE_BRANCH} "
+                          f"({behind} behind, {ahead} ahead)")
+        if status == "behind":
+            return False, (f"{ahead} commit{'s' * (ahead != 1)} ahead of GitHub "
+                           f"{UPDATE_BRANCH} (newer than main)")
+        if status == "identical":
+            return False, (f"at GitHub {UPDATE_BRANCH}'s commit, with local "
+                           "edits to sys_agent.py")
+        return False, f"could not check GitHub: unexpected compare status {status!r}"
+    except urllib.error.HTTPError as e:
+        hint = " (rate limited?)" if e.code in (403, 429) else ""
+        return False, f"could not check GitHub: HTTP {e.code}{hint}"
+    except urllib.error.URLError as e:
+        return False, f"could not check GitHub: {e.reason}"
+    except Exception as e:                                    # noqa: BLE001
+        return False, f"could not check GitHub: {type(e).__name__}: {e}"
+
+
+def check_for_update(path: str | None = None) -> str | None:
+    """Startup notice: the message only when the user may be missing main's
+    code. Everything else, failures included, is silent at startup."""
+    notify, message = update_status(path)
+    return message if notify else None
+
+
+def _git_describe(directory: str) -> str | None:
+    """`git describe --tags --dirty --always` for the checkout holding this
+    file: release tag, commits past it, commit, and local edits in one."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", directory, "describe", "--tags", "--dirty", "--always"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=UPDATE_HTTP_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
         return None
+    out = proc.stdout.strip()
+    return out if proc.returncode == 0 and out else None
+
+
+def _readline_backend() -> str:
+    """Live line-editing backend. GNU vs libedit is the Pi/Mac asymmetry that
+    real bugs have hinged on, so a bug report needs it."""
+    if not _HAVE_READLINE:
+        return "none"
+    if _IS_LIBEDIT:
+        return "libedit (stdlib)"
+    ver = getattr(readline, "_READLINE_LIBRARY_VERSION", "?")
+    src = "gnureadline" if readline.__name__ == "gnureadline" else "stdlib"
+    return f"GNU {ver} ({src})"
+
+
+def _dist_version(name: str) -> str:
+    # Package metadata, not `import`: reading a version must not import an SDK.
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not installed"
+
+
+def version_report(path: str | None = None) -> list[str]:
+    """Lines for /version: which file runs, which version it is, whether it
+    matches GitHub main, and the runtime a bug report needs. The GitHub part
+    is checked fresh and, unlike the startup check, says so when current and
+    reports failures instead of hiding them."""
+    path = path or os.path.abspath(__file__)
+    version = _git_describe(os.path.dirname(path))
+    if version is None:
+        try:
+            with open(path, "rb") as fh:
+                version = f"unversioned copy (blob {_git_blob_sha(fh.read())[:7]})"
+        except OSError as e:
+            version = f"unreadable ({e.strerror})"
+    _, status = update_status(path)
+    return [
+        f"sys_agent {version}   ({path})",
+        f"github {UPDATE_BRANCH}: {status}",
+        f"python {platform.python_version()}   readline: {_readline_backend()}   "
+        f"anthropic {_dist_version('anthropic')}   openai {_dist_version('openai')}",
+    ]
 
 
 class UpdateCheck:

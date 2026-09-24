@@ -858,6 +858,93 @@ print(f"[update] notice shown once at banner, late result deferred, env opt-out:
       f"{'OK' if ok_upd_ui else f'FAIL early={_early} late={_late} again={_again} off={_off}'}")
 if not ok_upd_ui: fails.append("update-check-ui")
 
+# 22) /version. update_status() must name the outcomes the startup check
+#     keeps quiet (current, ahead, local edits, failure) since /version is
+#     where "current" and "check failed" become distinguishable. Driven
+#     through the real run_repl(): output, and Ctrl-C during the GitHub
+#     check cancels the command without ending the session.
+def _ust(remote_sha, cmp=None, exc=None, head="a" * 40):
+    def gh(path):
+        if exc: raise exc
+        if path.startswith("/contents/"): return {"sha": remote_sha}
+        return cmp
+    saved = (S._github_json, S._git_head)
+    S._github_json, S._git_head = gh, (lambda d: head)
+    try:
+        return S.update_status(S.__file__)
+    finally:
+        S._github_json, S._git_head = saved
+with open(S.__file__, "rb") as _fh:
+    _self_blob = S._git_blob_sha(_fh.read())
+v_cur = _ust(_self_blob)
+v_ahead = _ust("f" * 40, {"status": "behind", "ahead_by": 0, "behind_by": 2})
+v_edit = _ust("f" * 40, {"status": "identical", "ahead_by": 0, "behind_by": 0})
+v_behind = _ust("f" * 40, {"status": "ahead", "ahead_by": 4, "behind_by": 0})
+v_rate = _ust("f" * 40, exc=_ue.HTTPError("u", 403, "rate", {}, None))
+v_off = _ust("f" * 40, exc=_ue.URLError("nodename nor servname provided"))
+ok_ustat = (
+    v_cur == (False, "up to date with GitHub main")
+    and v_ahead[0] is False and "2 commits ahead of GitHub main" in v_ahead[1]
+    and v_edit[0] is False and "local edits" in v_edit[1]
+    and v_behind[0] is True and "4 commits behind" in v_behind[1]
+    and v_rate[0] is False and "HTTP 403 (rate limited?)" in v_rate[1]
+    and v_off[0] is False and "nodename nor servname" in v_off[1])
+print(f"[version] update_status names silent outcomes and failures: "
+      f"{'OK' if ok_ustat else f'FAIL {[v_cur, v_ahead, v_edit, v_behind, v_rate, v_off]}'}")
+if not ok_ustat: fails.append("version-status")
+
+_saved_gd = S._git_describe
+S._git_describe = lambda d: None
+try:
+    _unv = S.version_report(S.__file__)[0]
+finally:
+    S._git_describe = _saved_gd
+
+_vin = iter(["/version", "/version", "/version"])
+_vcalls = [0]
+def _v_input(prompt):
+    try: return next(_vin)
+    except StopIteration: raise EOFError
+def _v_status(path=None):
+    _vcalls[0] += 1
+    if _vcalls[0] == 2: raise KeyboardInterrupt      # Ctrl-C mid-check
+    return False, "up to date with GitHub main"
+_saved_v = (S.gather_host_facts, S.build_system_prompt, S.colored_input,
+            S.SHOW_DISCLAIMER, S._audit_path, S._update_check,
+            S.update_status, S._git_describe)
+S.gather_host_facts = lambda: {"node": "t", "system": "T", "machine": "m"}
+S.build_system_prompt = lambda facts: SYS
+S.colored_input = _v_input
+S.SHOW_DISCLAIMER = False; S._audit_path = None; S._update_check = None
+S.update_status = _v_status
+S._git_describe = lambda d: "v9.9.9-3-gabcdef0"
+_vbuf = io.StringIO()
+_v_escaped = None
+try:
+    with contextlib.redirect_stdout(_vbuf):
+        S.run_repl(_mk(S.OpenAIProvider, "openai", "gpt-5.4-mini"))
+except KeyboardInterrupt as e:
+    _v_escaped = e
+finally:
+    (S.gather_host_facts, S.build_system_prompt, S.colored_input,
+     S.SHOW_DISCLAIMER, S._audit_path, S._update_check,
+     S.update_status, S._git_describe) = _saved_v
+_vout = _vbuf.getvalue()
+import platform as _pf
+ok_vrepl = (
+    _v_escaped is None and _vcalls[0] == 3              # session survived Ctrl-C
+    and _vout.count("sys_agent v9.9.9-3-gabcdef0") == 2
+    and S.__file__ in _vout
+    and _vout.count("github main: up to date with GitHub main") == 2
+    and "[version check cancelled]" in _vout
+    and f"python {_pf.python_version()}" in _vout and "readline: " in _vout
+    and "anthropic " in _vout and "openai " in _vout
+    and _unv.startswith("sys_agent unversioned copy (blob " + _self_blob[:7])
+    and any(c == "/version" for c, _ in S.META_COMMANDS))
+print(f"[version] /version in the REPL; Ctrl-C cancels, session survives: "
+      f"{'OK' if ok_vrepl else f'FAIL escaped={_v_escaped!r} calls={_vcalls[0]}'}")
+if not ok_vrepl: fails.append("version-repl")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)

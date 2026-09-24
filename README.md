@@ -210,6 +210,7 @@ Type these inside sys_agent:
 | `/history` | Review recent commands and what happened to them. |
 | `/reset` | Start a fresh conversation and clear token counters. |
 | `/info` | See the selected AI model and collected system information. |
+| `/version` | See which version you are running and whether it is up to date. |
 | `/facts refresh` | Collect fresh system information and start a new conversation. |
 | `/consult` | Get a second opinion from your other configured AI providers. |
 | `/exit` | End the session. |

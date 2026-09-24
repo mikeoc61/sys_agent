@@ -15,6 +15,7 @@ the [terminal shortcut](configuration.md#install-a-terminal-shortcut).
 | `/exit`, `/quit` | End the session (these and Ctrl-D are the only ways to quit) |
 | `/reset` | Clear conversation history and token counters |
 | `/info` | Print provider/model, session token usage, host facts |
+| `/version` | Print the running version and file path, whether it matches GitHub `main`, and Python/readline/SDK versions |
 | `/auto on\|off` | Skip approval prompt (hard-deny list still applies) |
 | `/thinking on\|off` | Toggle extended thinking — Anthropic / DeepSeek (takes effect next turn) |
 | `/effort [level]` | Thinking depth — Anthropic adaptive (all 5), DeepSeek (`low`/`high`/`max`); shows the effective grade; needs `/thinking on` |
@@ -166,6 +167,32 @@ additional environment details such as CPU count, PATH, basic container
 detection, and network-tool availability. Refreshing host facts resets the
 active conversation and token counters so the model receives a clean, current
 system prompt.
+
+## Version and update status
+
+```text
+/version
+```
+
+```text
+sys_agent v1.23.2-3-g4f1a9c2-dirty   (/home/pi/projects/sys_agent/sys_agent.py)
+github main: update available: 1 commit behind GitHub main — run: git -C /home/pi/projects/sys_agent pull
+python 3.13.5   readline: GNU 8.2 (stdlib)   anthropic 1.8.0   openai 3.19.2
+```
+
+- **Version** is `git describe --tags --dirty`: the release tag, commits past
+  it, the commit, and `-dirty` for local edits. Outside a git checkout it
+  shows `unversioned copy (blob <hash>)`, which still identifies the exact
+  file.
+- **Path** is the file actually running, which matters when a shortcut, a
+  checkout, and a stray copy exist on one machine.
+- **github main** runs the [update check](technical-reference.md#update-check)
+  fresh. Unlike at startup, it also reports the quiet outcomes: `up to date`,
+  `ahead of GitHub main`, `local edits`, and `could not check GitHub: <reason>`.
+  Ctrl-C cancels it and returns to the prompt.
+- **Runtime** is the Python version, the live readline backend (GNU via stdlib
+  or gnureadline, or libedit), and the installed SDK versions. Include this
+  line in bug reports.
 
 ## Extended thinking
 

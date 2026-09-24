@@ -293,6 +293,11 @@ carry your IP address, a `sys_agent-update-check` User-Agent, and, in the
 second request, the local HEAD commit id. No host facts are sent. Disable with
 `SYS_UPDATE_CHECK=off`.
 
+[`/version`](advanced-usage.md#version-and-update-status) runs the same check
+on demand and prints every outcome, including the ones startup keeps quiet
+(up to date, ahead, local edits, and the reason a check failed). It runs even
+with `SYS_UPDATE_CHECK=off`, because the user asked for it.
+
 ## Safety model
 
 Execution controls:

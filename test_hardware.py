@@ -408,7 +408,7 @@ def check_readline() -> None:
          "import sys_agent as S\n"
          "S.init_readline()\n"
          "print('have', S._HAVE_READLINE, 'libedit', S._IS_LIBEDIT,\n"
-         "      'hist', S._history_path)"],
+         "      'hist', S._history_path, '|', S._readline_backend())"],
         capture_output=True, text=True)
     ok = "have True" in probe.stdout and "hist " in probe.stdout
     report("readline", ok, f"({probe.stdout.strip()})")
