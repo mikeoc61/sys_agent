@@ -29,8 +29,11 @@ out of the README; link to the page that owns it.
   provider-specific request quirks in the provider class.
 
 ## Targets and backend asymmetries
-- Raspberry Pi 5 (Debian, stdlib GNU readline) — primary, 24/7 server.
-- M3 Mac (macOS 26): gnureadline preferred, libedit stdlib fallback.
+- Raspberry Pi 5 (Debian) — primary, 24/7 server. Real sessions (`uv run
+  --python 3.13`) get **libedit**: uv's standalone CPython links it. The system
+  `python3` (3.11) has GNU readline 8.2.
+- M3 Mac (macOS 26): real sessions get GNU via gnureadline; the system
+  `python3` falls back to libedit.
 - EC2 Ubuntu (Xen and Nitro).
 - Changes touching readline, terminal, signals, or process management must be
   tested on (or reasoned about for) both GNU readline and libedit. Pi-only bugs
@@ -73,9 +76,11 @@ startup prior). E.g. battery SoH passes; SoC fails.
 ## Verification
 - Baseline: `python3 -m py_compile sys_agent.py && python3 test_consult_render.py`
   (offline, no keys; must print `RESULT: ALL PASS`).
-- Hardware harness: `python3 test_hardware.py` — offline and keyless, but needs
-  a pty and a real process table, so it is per-host and NOT part of the
-  baseline. Run it on the Pi and the Mac before tagging. Covers what the
+- Hardware harness: `test_hardware.py` — offline and keyless, but needs a pty
+  and a real process table, so it is per-host and NOT part of the baseline.
+  Run it on the Pi and the Mac before tagging, under BOTH interpreters:
+  `uv run --python 3.13 test_hardware.py` (the backend real sessions use) and
+  `python3 test_hardware.py` (the other one). Covers what the
   baseline structurally cannot: signal delivery and process-group teardown, the
   approval prompt under real readline, env-file resolution at real startup. It
   reports the live readline backend, so a run records which of the two paths

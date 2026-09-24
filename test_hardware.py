@@ -1,12 +1,29 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "gnureadline>=8.1; sys_platform == 'darwin'",
+# ]
+# ///
 """Host-behaviour verification for sys_agent. Offline (no API key), but needs a
 pty and a real process table, so it is NOT part of the standard baseline —
 run it on each target host before tagging.
 
+Run it under BOTH interpreters on each host; they exercise different readline
+backends, and the one real sessions use is not the system one:
+    uv run --python 3.13 test_hardware.py   same interpreter + readline dep as
+                                             the documented launch (Pi: libedit
+                                             from uv's standalone CPython; Mac:
+                                             GNU via gnureadline)
+    python3 test_hardware.py                 system interpreter (Pi: GNU 8.2;
+                                             Mac: libedit)
+The header above mirrors sys_agent.py's readline dependency only; the SDKs are
+not needed offline. The [readline] line records which backend a run covered.
+
 Covers what test_consult_render.py structurally cannot: signal delivery and
 process-group teardown, the approval prompt under real readline, and env-file
-resolution at real startup. These are the paths that differ between the Pi
-(stdlib GNU readline, Debian) and the Mac (gnureadline or libedit), so a pass
-here is per-host evidence, not a one-time result.
+resolution at real startup. These are the paths that differ between readline
+backends and between hosts, so a pass here is per-host, per-interpreter
+evidence, not a one-time result.
 
 The REPL checks drive the real run_repl() under a pty with a scripted fake
 provider, so readline, prompt_approval() and the tool loop all run for real.
@@ -19,7 +36,7 @@ have run. A mutation check must neutralise the payload in the same step that
 removes the guard; removing the guard is what makes the payload live. Do not
 restore the real execute() in a REPL check.
 
-Run: python3 test_hardware.py
+Run: see the two commands above.
 """
 from __future__ import annotations
 

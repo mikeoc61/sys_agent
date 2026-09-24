@@ -155,6 +155,9 @@ just-released Python, pip may fall back to a Rust source build of
 supported-version ceiling.
 
 On macOS, installation includes `gnureadline` for line editing and colored
-prompts; Linux uses the stdlib GNU readline. On Windows the stdlib lacks
+prompts. On Linux the stdlib readline is used, and its backend depends on the
+interpreter: the uv-managed Python from the quick start links libedit, while a
+distribution Python (the pip and venv path) links GNU readline. Both are
+supported; `/version` shows which one is live. On Windows the stdlib lacks
 `readline` entirely — the script still runs, but loses history persistence,
 Up/Down recall, and line-editing keystrokes.
