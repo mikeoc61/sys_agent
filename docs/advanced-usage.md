@@ -297,6 +297,10 @@ sys_agent inspects the response's stop reason (`stop_reason` on Anthropic,
   [reply truncated — hit the 32000-token output cap; raise SYS_THINKING_MAX_TOKENS or lower /effort, then resend]
   ```
 
+  The `/effort` part appears only on models that honor it (adaptive
+  thinking); on Haiku 4.5, where `/effort` is a no-op, the notice names
+  `SYS_THINKING_MAX_TOKENS` alone.
+
   OpenAI/DeepSeek are sent no cap, so `finish_reason=length` means the
   model's own output limit; ask for a shorter answer or fewer steps. A full
   context window (`model_context_window_exceeded`) is reported the same way

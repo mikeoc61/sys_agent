@@ -566,7 +566,9 @@ ok_ant_stop = (
     and f"{S.ANTHROPIC_THINKING_MAX_TOKENS}-token" in t_cut_think.stop_detail
     and "SYS_THINKING_MAX_TOKENS" in t_cut_think.stop_detail
     and "/thinking on" not in t_cut_think.stop_detail
+    and "/effort" not in t_cut_think.stop_detail     # Haiku 4.5: effort is a no-op there
     and f"{S.ANTHROPIC_THINKING_MAX_TOKENS}-token" in t_cut_always.stop_detail
+    and "lower /effort" in t_cut_always.stop_detail  # adaptive: effort is honored
     and t_ctx.stop == S.STOP_TRUNCATED and "/reset" in t_ctx.stop_detail
     and t_ok.stop == "" and t_ok.stop_detail == ""
     and "declined" in S.stop_notice(t_ref) and "/consult" in S.stop_notice(t_ref)

@@ -3122,8 +3122,7 @@ class AnthropicProvider(Provider):
             stop_detail=stop_detail,
         )
 
-    @staticmethod
-    def _classify_stop(resp: Any, max_tokens: int) -> tuple[str, str]:
+    def _classify_stop(self, resp: Any, max_tokens: int) -> tuple[str, str]:
         """Map Message.stop_reason to (ChatTurn.stop, detail).
 
         Documented values (anthropic SDK 1.8 StopReason): end_turn, tool_use,
@@ -3137,7 +3136,10 @@ class AnthropicProvider(Provider):
 
         `max_tokens` here is the cap this request actually sent — 4096 on a
         plain turn, ANTHROPIC_THINKING_MAX_TOKENS on a thinking or always-on
-        turn — so the remedy names the knob that would have helped.
+        turn — so the remedy names the knob that would have helped. /effort is
+        offered only where it is honored (adaptive-thinking models); on the
+        legacy budget path (Haiku 4.5) it is a no-op, and /effort itself says
+        so, so naming it there sends the user to a dead knob.
         """
         reason = getattr(resp, "stop_reason", None)
         if reason == "refusal":
@@ -3150,7 +3152,9 @@ class AnthropicProvider(Provider):
             return STOP_REFUSAL, detail
         if reason == "max_tokens":
             if max_tokens >= ANTHROPIC_THINKING_MAX_TOKENS:
-                remedy = "raise SYS_THINKING_MAX_TOKENS or lower /effort"
+                remedy = "raise SYS_THINKING_MAX_TOKENS"
+                if _thinking_mode(self.model) == "adaptive":
+                    remedy += " or lower /effort"
             else:
                 remedy = (f"/thinking on raises it to "
                           f"{ANTHROPIC_THINKING_MAX_TOKENS} "
