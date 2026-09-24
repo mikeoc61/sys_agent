@@ -479,6 +479,12 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/exit, /quit",    "End the session"),
 )
 
+# Startup banner shows only these, so the meta line fits ~80 columns without
+# wrapping; /help lists the full META_COMMANDS table.
+BANNER_META_COMMANDS: tuple[str, ...] = (
+    "/info", "/model", "/provider", "/thinking", "/consult", "/auto",
+)
+
 # Local hard-deny tables — these commands are never executed regardless of
 # provider or user approval. This is a backstop, not a security boundary: the
 # per-command approval prompt is the real gate. Matching is intent-based
@@ -4063,8 +4069,8 @@ def run_repl(provider: Provider) -> None:
         f"host={facts['node']} ({facts['system']}/{facts['machine']})"
         f"{thinking_note}"
     ))
-    print(dim("meta: " + "  ".join(cmd for cmd, _ in META_COMMANDS)
-              + "   — /help for details"))
+    print(dim("meta: " + "  ".join(BANNER_META_COMMANDS)
+              + "  …  /help for all"))
     if _update_check and (notice := _update_check.take(UPDATE_BANNER_WAIT)):
         print(warn(f"[{notice}]"))
     if SHOW_DISCLAIMER:
