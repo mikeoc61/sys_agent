@@ -29,11 +29,14 @@ out of the README; link to the page that owns it.
   provider-specific request quirks in the provider class.
 
 ## Targets and backend asymmetries
-- Raspberry Pi 5 (Debian) — primary, 24/7 server. Two real launch paths with
-  different interpreters: `uv run --python 3.13 sys_agent.py` gets **libedit**
-  (uv's standalone CPython links it); the `~/.local/bin/sys_agent` shortcut
-  (shebang `uv run --script`, no Python pin) gets system `python3` 3.11 with
-  GNU readline 8.2 and its own cached SDK versions. `/version` shows which.
+- Raspberry Pi 5 (Debian) — primary, 24/7 server. Both launch paths,
+  `uv run --python 3.13 sys_agent.py` and the `~/.local/bin/sys_agent`
+  shebang shortcut, run uv's managed CPython 3.13 (uv prefers managed over
+  system Pythons), which links **libedit**. System `python3` 3.11 has GNU
+  readline 8.2. uv reuses a script's cached environment until the PEP 723
+  dependency list changes: a stale one kept the shortcut on system 3.11 and
+  anthropic 0.103 until v1.24.x raised the SDK floors. `/version` shows what
+  a launch actually got.
 - M3 Mac (macOS 26): real sessions get GNU via gnureadline; the system
   `python3` falls back to libedit.
 - EC2 Ubuntu (Xen and Nitro).

@@ -2,8 +2,11 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "openai>=1.40",
-#     "anthropic>=0.40,<2.0",
+#     # Floors are the SDK versions validated on the Pi and Mac. uv reuses a
+#     # script's cached environment until this list changes, so the unpinned
+#     # shortcut shebang kept anthropic 0.103 while direct runs had 1.8.
+#     "openai>=3.19",
+#     "anthropic>=1.8,<2.0",
 #     "gnureadline>=8.1; sys_platform == 'darwin'",
 # ]
 # ///
