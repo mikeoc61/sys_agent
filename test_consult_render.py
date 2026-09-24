@@ -694,6 +694,74 @@ print(f"[consult] stopped turn shows notice, not its cut command: "
       f"{'OK' if ok_consult_stop else 'FAIL'}")
 if not ok_consult_stop: fails.append("consult-stop-notice")
 
+# 19) sudo probe. execute() gives commands no tty, so sudo can only work
+#     under NOPASSWD; the model kept proposing sudo commands that failed at
+#     once. The probe must reproduce execute()'s conditions (new session, no
+#     stdin), never be able to prompt (-n), and RUN a command: the tempting
+#     query forms answer a different question (`-n -v` fails under NOPASSWD,
+#     `-n -l true` succeeds where a password is required; both seen on real
+#     hosts). Real subprocess.run is stubbed here; test_hardware.py checks
+#     the probe against a real sudo through the real execute().
+import subprocess as _sp
+_probe_calls: list = []
+def _probe(euid=1000, which="/usr/bin/sudo", rc=0, exc=None):
+    def fake_run(argv, **kw):
+        _probe_calls.append((argv, kw))
+        if exc: raise exc
+        return _NS(returncode=rc)
+    saved = (S.os.geteuid, S.shutil.which, S.subprocess.run)
+    S.os.geteuid = lambda: euid
+    S.shutil.which = lambda name: which if name == "sudo" else saved[1](name)
+    S.subprocess.run = fake_run
+    try:
+        return S._sudo_mode()
+    finally:
+        S.os.geteuid, S.shutil.which, S.subprocess.run = saved
+_probe_calls.clear()
+m_pw_less = _probe(rc=0)
+_argv, _kw = _probe_calls[0]
+m_pw = _probe(rc=1)
+_n = len(_probe_calls)
+m_root = _probe(euid=0)
+m_none = _probe(which=None)
+_spawned_for_root_or_absent = len(_probe_calls) != _n
+m_to = _probe(exc=_sp.TimeoutExpired(["sudo"], 3))
+m_err = _probe(exc=OSError("exec failed"))
+_saved_mode = S._sudo_mode
+try:
+    S._sudo_mode = lambda: "password_required"
+    f_set = S.gather_host_facts()
+    S._sudo_mode = lambda: None
+    f_unset = S.gather_host_facts()
+finally:
+    S._sudo_mode = _saved_mode
+ok_sudo = (
+    m_pw_less == "passwordless" and m_pw == "password_required"
+    and m_root == "running_as_root" and m_none == "not_installed"
+    and not _spawned_for_root_or_absent
+    and m_to is None and m_err is None             # inconclusive: assert nothing
+    and _argv == ["sudo", "-n", "true"]            # runs, cannot prompt
+    and _kw.get("start_new_session") is True       # execute()'s no-tty session
+    and _kw.get("stdin") is _sp.DEVNULL
+    and _kw.get("timeout")
+    and f_set.get("sudo") == "password_required" and "sudo" not in f_unset)
+print(f"[sudo] probe mirrors execute(), classifies, omits when unknown: "
+      f"{'OK' if ok_sudo else f'FAIL {_argv} {_kw}'}")
+if not ok_sudo: fails.append("sudo-probe")
+
+# 20) Prompt rules for the two DeepSeek failures: sudo proposed where it
+#     cannot run, and a MAC address sent to an external OUI lookup. Model
+#     behaviour cannot be checked offline; this guards against the rules
+#     being dropped or losing the parts that carry the instruction.
+_p = S.build_system_prompt({"sudo": "password_required"})
+ok_rules = ("`password_required`" in _p and "plain text for the" in _p
+            and "sudo -S" in _p
+            and "Keep host data on the host" in _p
+            and "systemd-hwdb query OUI:" in _p
+            and "unless the user explicitly asked" in _p)
+print(f"[prompt] sudo and host-data rules present: {'OK' if ok_rules else 'FAIL'}")
+if not ok_rules: fails.append("prompt-rules")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)

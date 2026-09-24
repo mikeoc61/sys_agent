@@ -69,8 +69,6 @@ startup prior). E.g. battery SoH passes; SoC fails.
 - Negative capability claims require a verified probe; the agent must not
   assert a tool is absent without checking.
 - Defer new rules until a failure recurs; one occurrence is not enough.
-- Pending (not yet warranted): `sudo_noninteractive` probe (DeepSeek sudo
-  violations), exfiltration rule (DeepSeek MAC → external OUI lookup).
 
 ## Verification
 - Baseline: `python3 -m py_compile sys_agent.py && python3 test_consult_render.py`

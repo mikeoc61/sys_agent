@@ -2208,6 +2208,43 @@ def _gather_time_facts() -> dict[str, Any]:
     return out
 
 
+# Can an approved command use sudo? execute() runs each command in a new
+# session with no controlling tty, so sudo can never prompt: a plain `sudo x`
+# fails in ~0.1s with "a terminal is required to read the password". Only a
+# NOPASSWD rule works there, and a credential the user cached in their own
+# terminal does not carry over (the ticket is keyed to that tty). The probe
+# reproduces execute()'s conditions exactly (new session, no stdin), so a
+# sudoers `requiretty` default is caught too, and `-n` guarantees it cannot
+# prompt even if those conditions change. The command must be RUN, not
+# queried, verified on the Pi (NOPASSWD) and the Mac (password): `sudo -n -v`
+# fails under NOPASSWD, and `sudo -n -l true` succeeds where a password is
+# required, so only `sudo -n true` answers the question the model needs.
+# Cost: 5-50ms, plus three auth-log lines per startup or /facts refresh on a
+# NOPASSWD host (COMMAND=/usr/bin/true and a pam session open/close).
+# "password_required" also covers a user with no sudo rights at all: sudo -n
+# reports both as "a password is required", and from the agent both mean the
+# same thing, sudo cannot be used.
+SUDO_PROBE_TIMEOUT = 3.0
+
+
+def _sudo_mode() -> str | None:
+    """How sudo behaves for an approved command, or None when the probe was
+    inconclusive (timeout, spawn error) so nothing is asserted either way."""
+    if os.geteuid() == 0:
+        return "running_as_root"
+    if not shutil.which("sudo"):
+        return "not_installed"
+    try:
+        proc = subprocess.run(
+            ["sudo", "-n", "true"], stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=SUDO_PROBE_TIMEOUT,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return "passwordless" if proc.returncode == 0 else "password_required"
+
+
 def gather_host_facts() -> dict[str, Any]:
     uname = platform.uname()
     facts: dict[str, Any] = {
@@ -2269,6 +2306,12 @@ def gather_host_facts() -> dict[str, Any]:
     facts["init_tools"] = _which_many(["systemctl", "service", "launchctl", "rc-service"])
     facts["container_tools"] = _which_many(["docker", "podman", "kubectl"])
     facts["virtual_env"] = os.environ.get("VIRTUAL_ENV", "")
+
+    # Whether approved commands can use sudo (see _sudo_mode). Omitted when
+    # the probe was inconclusive rather than guessed.
+    sudo = _sudo_mode()
+    if sudo:
+        facts["sudo"] = sudo
 
     # Stable interface inventory (name -> kind). Answers "which interface is
     # Wi-Fi?" on turn one; IPs/MACs/link-state deliberately excluded.
@@ -3621,6 +3664,19 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           prints a CLI-stability warning when not on a tty); `dnf` is fine
           on Fedora/RHEL. Add `--no-progress`, `-q`, or equivalent flags
           when a tool offers them and the noise isn't useful.
+        - `sudo` (when present) says whether an approved command can use
+          sudo. With no tty, sudo can never prompt for a password.
+          `passwordless`: sudo works. `password_required`: any sudo command
+          fails at once ("a terminal is required to read the password"), so
+          do NOT propose one expecting it to run. Try the unprivileged form
+          first (many status and log reads need no root). If root is
+          genuinely required, give the exact command in plain text for the
+          user to run in their own terminal and ask them to paste back the
+          output. Never ask for the user's password or work around the prompt
+          (`sudo -S`, an askpass helper, a password piped or echoed in).
+          `running_as_root`: commands already run as root; omit sudo.
+          `not_installed`: there is no sudo here. Key absent: the startup
+          probe was inconclusive; a single attempt will show which case holds.
         - After receiving command output, summarize the findings and decide
           the next step. If the next step is another command, issue it as a
           run_command call in the same turn rather than describing it or
@@ -3748,6 +3804,19 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
           security mode (e.g. WPA3_SAE) in a single unprivileged read.
           Prefer it over chaining `route -n get default` / `netstat -rn` /
           `ifconfig` probes.
+        - Keep host data on the host. Do not propose a command that sends
+          anything read from this machine (MAC or IP addresses, serial
+          numbers, hostnames, usernames, file contents, logs, keys, command
+          output) to an external service such as a lookup API, paste site,
+          search URL, or webhook, unless the user explicitly asked for that
+          transfer. Look it up locally instead. A MAC vendor (OUI) resolves
+          offline on systemd hosts with `systemd-hwdb query OUI:XXXXXX` (the
+          first six hex digits, uppercase, no separators), and from nmap's
+          `nmap-mac-prefixes` or `ieee-data`'s `oui.txt` when installed. If no
+          local source exists, say so and let the user decide whether to look
+          it up externally. Requests that carry nothing from the host
+          (package-index updates, a connectivity check against a public URL,
+          fetching documentation) are unaffected.
         - Never propose commands that wipe disks, format filesystems, or
           irrecoverably destroy data. If such a step is genuinely required,
           flag it in plain text and ask the user to run it manually.

@@ -168,6 +168,40 @@ away. `swap_gb` rounds out the memory picture: a value of `0` means no swap is
 configured, so on a low-RAM host memory pressure ends in OOM-kills rather than
 swapping — context the model weighs when diagnosing killed processes.
 
+## Sudo availability
+
+Each approved command runs in a new session with no terminal, so sudo cannot
+ask for a password there. A plain `sudo <cmd>` fails immediately with "a
+terminal is required to read the password" unless the account has a
+passwordless (`NOPASSWD`) rule. A password you typed into sudo in your own
+terminal does not help, because sudo ties that cached credential to the
+terminal it was entered on.
+
+Startup probes this once with `sudo -n true`, spawned the same way as an
+approved command, and injects the result as `sudo`:
+
+| Value | Meaning |
+|---|---|
+| `passwordless` | sudo works from the agent |
+| `password_required` | sudo fails from the agent, including when the user has no sudo rights |
+| `running_as_root` | sys_agent itself runs as root; sudo is unnecessary |
+| `not_installed` | no `sudo` on the host |
+
+If the probe times out or cannot spawn, the key is omitted rather than
+guessed. The system prompt tells the model not to propose sudo commands under
+`password_required`. It should try an unprivileged command first. If root is
+genuinely needed, it gives you the command as text to run yourself and asks
+you to paste back the output. It must never ask for your password or work
+around the prompt with `sudo -S` or an askpass helper.
+
+Only running a command gives the right answer. Checking a cached credential
+(`sudo -n -v`) fails on a passwordless Pi, and asking whether a command is
+permitted (`sudo -n -l true`) succeeds on a Mac that needs a password. The
+probe takes 5 to 50 ms. On a passwordless host it adds three lines to the
+system auth log per startup or `/facts refresh`: the `/usr/bin/true` command
+and a root session opening and closing. `test_hardware.py` checks the fact
+against a real `sudo true` run through `execute()`.
+
 ## SMART over USB bridges
 
 The injected host facts include a mount-first disk topology under `disks`
@@ -271,6 +305,21 @@ A dimmed startup notice restates the premise of layer 1: model-proposed
 commands can be confidently wrong (hallucinated flags, paths, unit names;
 stale syntax), and the approval prompt is where you catch that. Suppress it
 with `SYS_DISCLAIMER=off`.
+
+Two system-prompt rules cover what the model proposes rather than how it
+runs. Neither is enforced in code; the approval prompt is where a violation is
+caught.
+
+- **Sudo.** The rule keys on the `sudo` fact described in
+  [Sudo availability](#sudo-availability).
+- **Host data stays on the host.** The model must not send anything read from
+  the machine, such as MAC or IP addresses, serial numbers, hostnames, file
+  contents, logs or keys, to an external service unless you asked for that
+  transfer. A MAC vendor lookup is the standard case. It resolves offline
+  on systemd hosts with `systemd-hwdb query OUI:XXXXXX`, and from nmap's or
+  `ieee-data`'s OUI files where installed. When no local source exists, the
+  model says so and leaves the choice to you. Requests that carry nothing
+  from the host, such as package updates, are unaffected.
 
 The deny list is intentionally short and pattern-matched. It is **not** a
 substitute for paying attention to the approval prompt. Sandbox the agent

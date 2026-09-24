@@ -51,9 +51,12 @@ Commands run on the computer where you start sys_agent, with your user
 account's permissions. There is no sandbox separating them from your files.
 
 Your questions, collected system information, and command results are sent to
-the selected AI provider. System information includes hardware, disks, and
-running services. Command output can contain sensitive information, so consider
-what a proposed command will read before approving it.
+the selected AI provider. System information includes hardware, disks,
+running services, and whether sudo works without a password. Command output
+can contain sensitive information, so consider what a proposed command will
+read before approving it. The assistant is told not to send information from
+your computer to other websites unless you ask, but check any command that
+contacts the internet before approving it.
 
 ### You control execution
 

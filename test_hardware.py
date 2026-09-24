@@ -364,6 +364,33 @@ def check_readline() -> None:
     report("readline", ok, f"({probe.stdout.strip()})")
 
 
+def check_sudo_probe() -> None:
+    """The startup `sudo` fact must predict what an approved sudo command
+    actually gets. Runs a plain `sudo true` (the shape a model proposes, no
+    -n) through the real execute(), outside any REPL, so the no-tty session
+    is real. A harmless payload by construction; it cannot hang because
+    execute() gives sudo no terminal to prompt on (it fails in ~0.1s), and
+    the timeout bounds it regardless."""
+    mode = S._sudo_mode()
+    saved = S.COMMAND_TIMEOUT
+    S.COMMAND_TIMEOUT = 10
+    try:
+        result = S.execute("sudo true")
+    finally:
+        S.COMMAND_TIMEOUT = saved
+    ran = result.returncode == 0
+    if mode == "passwordless" or mode == "running_as_root":
+        ok = ran
+    elif mode == "password_required":
+        ok = not ran
+    elif mode == "not_installed":
+        ok = not ran and S.shutil.which("sudo") is None
+    else:
+        ok = False                      # inconclusive on a healthy host
+    report("sudo-probe", ok,
+           f"(fact={mode}, real sudo via execute() rc={result.returncode})")
+
+
 def main() -> int:
     print(f"host: {os.uname().nodename} ({os.uname().sysname}/{os.uname().machine})")
     check_ctrl_c()
@@ -374,6 +401,7 @@ def main() -> int:
     check_paste_block()
     check_config()
     check_readline()
+    check_sudo_probe()
     print()
     print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
     return 1 if fails else 0
