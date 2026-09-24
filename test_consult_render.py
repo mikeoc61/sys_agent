@@ -945,6 +945,109 @@ print(f"[version] /version in the REPL; Ctrl-C cancels, session survives: "
       f"{'OK' if ok_vrepl else f'FAIL escaped={_v_escaped!r} calls={_vcalls[0]}'}")
 if not ok_vrepl: fails.append("version-repl")
 
+# 23) Ctrl-C during a meta-command that does real work cancels that command
+#     and leaves the session and its state intact (CLAUDE.md: Ctrl-C is
+#     non-destructive everywhere). Before this, only the idle prompt, paste
+#     reader, and model turn caught it, so a Ctrl-C in /facts refresh,
+#     /consult, /provider, or /history ended the session. One real_repl()
+#     run; each command is interrupted mid-work, and later inputs prove the
+#     session continued with the PREVIOUS state: facts, verbose flag,
+#     provider, and conversation history. /consult gets a real SIGINT while
+#     the main thread waits on its workers, so signal delivery into the
+#     queue wait is exercised, not simulated.
+import signal as _sig, threading as _th2, time as _t2
+_cc_inputs = iter([
+    "what is uptime?",        # a question for /consult to re-pose
+    "/consult",               # real SIGINT while workers are blocked
+    "/facts refresh",         # probe raises KeyboardInterrupt
+    "/facts",                 # must still print the OLD facts
+    "second q",               # history must still hold the first question
+    "/facts verbose on",      # verbose probe raises KeyboardInterrupt
+    "/facts refresh",         # must use the NON-verbose probe (flag untouched)
+    "/provider anthropic",    # client construction raises KeyboardInterrupt
+    "/provider",              # still openai
+    "/history all",           # log rendering raises KeyboardInterrupt
+])
+def _cc_input(prompt):
+    try: return next(_cc_inputs)
+    except StopIteration: raise EOFError
+_cc_facts_calls = []
+def _cc_facts():
+    _cc_facts_calls.append("plain")
+    n = len(_cc_facts_calls)
+    if n == 2: raise KeyboardInterrupt
+    return {"node": "old" if n == 1 else "new", "system": "T", "machine": "m"}
+def _cc_vfacts():
+    _cc_facts_calls.append("verbose"); raise KeyboardInterrupt
+_cc_release = _th2.Event()
+_cc_signalled = _th2.Event()
+_cc_seen: list = []
+def _cc_chat(messages, system, thinking=False, effort="high"):
+    _cc_seen.append([m.get("content") for m in messages if m.get("role") == "user"])
+    return _turn("an answer")
+def _cc_make(name, model=None):
+    if _th2.current_thread() is _th2.main_thread():
+        raise KeyboardInterrupt           # /provider: Ctrl-C during SDK import
+    p = _mk(S.AnthropicProvider, "anthropic", "claude-haiku-4-5-20251001")
+    def blocked(*a, **k):
+        # First worker in sends the real SIGINT: the main thread is then
+        # necessarily inside /consult's wait, whatever the host's speed.
+        if not _cc_signalled.is_set():
+            _cc_signalled.set()
+            os.kill(os.getpid(), _sig.SIGINT)
+        _cc_release.wait(10); return _turn("late")
+    p.chat = blocked
+    return p
+def _cc_hist(path, limit):
+    raise KeyboardInterrupt
+_cc_saved = (S.gather_host_facts, S.gather_verbose_host_facts,
+             S.build_system_prompt, S.colored_input, S.SHOW_DISCLAIMER,
+             S._audit_path, S._update_check, S.available_provider_names,
+             S.make_provider, S.render_history)
+S.gather_host_facts, S.gather_verbose_host_facts = _cc_facts, _cc_vfacts
+S.build_system_prompt = lambda facts: SYS
+S.colored_input = _cc_input
+S.SHOW_DISCLAIMER = False; S._audit_path = None; S._update_check = None
+S.available_provider_names = lambda: ["openai", "anthropic"]
+S.make_provider = _cc_make
+S.render_history = _cc_hist
+_cc_rp = _mk(S.OpenAIProvider, "openai", "gpt-5.4-mini")
+_cc_rp.chat = _cc_chat
+_cc_buf = io.StringIO()
+_cc_escaped = None
+_cc_t0 = _t2.monotonic()
+try:
+    with contextlib.redirect_stdout(_cc_buf):
+        S.run_repl(_cc_rp)
+except KeyboardInterrupt as e:
+    _cc_escaped = e
+finally:
+    (S.gather_host_facts, S.gather_verbose_host_facts,
+     S.build_system_prompt, S.colored_input, S.SHOW_DISCLAIMER,
+     S._audit_path, S._update_check, S.available_provider_names,
+     S.make_provider, S.render_history) = _cc_saved
+_cc_elapsed = _t2.monotonic() - _cc_t0
+_cc_workers = [t for t in _th2.enumerate() if t.name.startswith("consult-")]
+_cc_daemon = bool(_cc_workers) and all(t.daemon for t in _cc_workers)
+_cc_release.set()
+_cc_out = _cc_buf.getvalue()
+ok_cc = (
+    _cc_escaped is None
+    and "[consult cancelled; in-flight requests abandoned]" in _cc_out
+    and _cc_daemon                                  # abandoned workers never hold exit
+    and _cc_elapsed < 5                             # did not wait out the 10s workers
+    and "[facts refresh cancelled; previous facts kept]" in _cc_out
+    and '"node": "old"' in _cc_out                  # /facts after cancel: old facts
+    and _cc_seen[-1] == ["what is uptime?", "second q"]   # history not reset
+    and _cc_facts_calls == ["plain", "plain", "verbose", "plain"]  # flag untouched
+    and _cc_out.count("[host facts refreshed; conversation/token counters reset]") == 1
+    and "[provider switch cancelled]" in _cc_out
+    and '"current_provider": "openai"' in _cc_out
+    and "[history cancelled]" in _cc_out)
+print(f"[ctrl-c] meta-commands cancel in place, session and state survive: "
+      f"{'OK' if ok_cc else f'FAIL escaped={_cc_escaped!r} daemon={_cc_daemon} t={_cc_elapsed:.1f}s facts={_cc_facts_calls} seen={_cc_seen}'}")
+if not ok_cc: fails.append("meta-ctrl-c")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)

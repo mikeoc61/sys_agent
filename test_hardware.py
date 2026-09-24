@@ -197,6 +197,7 @@ def chat(messages, system, thinking=False, effort="high"):
                       usage=S.Usage(input_tokens=1, output_tokens=1))
 
 PROVIDER.chat = chat
+@EXTRA@
 S.run_repl(PROVIDER)
 print("REPL-EXITED-CLEANLY")
 '''
@@ -204,10 +205,12 @@ print("REPL-EXITED-CLEANLY")
 
 def run_repl_pty(script_turns: list[dict],
                  steps: list[tuple[str, str]],
-                 timeout: float = 60.0) -> tuple[str, str]:
+                 timeout: float = 60.0, extra: str = "") -> tuple[str, str]:
     """Drive run_repl() on a pty. `steps` are (expect_substring, keys) pairs
     sent in order, each only once its substring has appeared — blind timed
-    writes race the prompt. Returns (terminal_output, commands_recorded)."""
+    writes race the prompt. `extra` is driver code run just before
+    run_repl(), for a check that needs a stub of its own (never execute()).
+    Returns (terminal_output, commands_recorded)."""
     workdir = tempfile.mkdtemp()
     spawn_log = os.path.join(workdir, "spawned")
     driver_path = os.path.join(workdir, "drv.py")
@@ -215,7 +218,8 @@ def run_repl_pty(script_turns: list[dict],
               .replace("@HERE@", HERE)
               .replace("@AUDIT@", os.path.join(workdir, "audit.log"))
               .replace("@SPAWN@", spawn_log)
-              .replace("@SCRIPT@", json.dumps(script_turns)))
+              .replace("@SCRIPT@", json.dumps(script_turns))
+              .replace("@EXTRA@", extra))
     with open(driver_path, "w") as fh:
         fh.write(source)
 
@@ -311,6 +315,37 @@ def check_paste_block() -> None:
           and "[multi-line input cancelled]" in out
           and "REPL-EXITED-CLEANLY" in out and "Traceback" not in out)
     report("paste-block", ok, f"(model received {sent!r})")
+
+
+def check_meta_ctrl_c() -> None:
+    """A real Ctrl-C keystroke during a running meta-command (/facts refresh)
+    cancels that command and returns to the prompt under the live readline
+    backend; before, only the idle prompt caught it and the session ended.
+    The refresh probe is stubbed to announce itself and sleep, so the ^C
+    lands mid-probe deterministically; the first (startup) probe is real."""
+    extra = (
+        "_real_facts = S.gather_host_facts\n"
+        "_n = [0]\n"
+        "def _slow_facts():\n"
+        "    _n[0] += 1\n"
+        "    if _n[0] > 1:\n"
+        "        print('@PROBING@', flush=True)\n"
+        "        import time; time.sleep(30)\n"
+        "    return _real_facts()\n"
+        "S.gather_host_facts = _slow_facts\n")
+    t0 = time.monotonic()
+    out, _ = run_repl_pty([], [
+        ("you@", "/facts refresh\n"),
+        ("@PROBING@", "\x03"),
+        ("previous facts kept]", "/exit\n"),
+    ], extra=extra)
+    elapsed = time.monotonic() - t0
+    ok = ("[facts refresh cancelled; previous facts kept]" in out
+          and "REPL-EXITED-CLEANLY" in out and "Traceback" not in out
+          and elapsed < 25)
+    report("meta-ctrl-c", ok,
+           f"(cancelled={'previous facts kept]' in out}, "
+           f"session continued={'REPL-EXITED-CLEANLY' in out}, {elapsed:.1f}s)")
 
 
 # -----------------------------------------------------------------------------
@@ -449,6 +484,7 @@ def main() -> int:
     check_deny_edit()
     check_tool_args()
     check_paste_block()
+    check_meta_ctrl_c()
     check_config()
     check_update_check_exit()
     check_readline()

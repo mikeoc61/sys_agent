@@ -10,6 +10,10 @@ the [terminal shortcut](configuration.md#install-a-terminal-shortcut).
 
 ## Meta-commands
 
+Ctrl-C while a meta-command is working (`/consult`, `/facts refresh`,
+`/provider`, `/history`, `/version`) cancels that command and returns to the
+prompt with the session unchanged.
+
 | Command | Effect |
 |---|---|
 | `/exit`, `/quit` | End the session (these and Ctrl-D are the only ways to quit) |
@@ -152,6 +156,10 @@ provider is built fresh and runs its own configured default model, since a
 model name is provider-specific. The active provider's first move is shown as
 the reference.
 
+Ctrl-C cancels a consult and returns to the prompt at once. Requests already
+sent cannot be recalled: they finish in the background, may still be billed,
+and their answers are discarded.
+
 ## Refreshable host facts
 
 ```text
@@ -166,7 +174,8 @@ re-probes the machine and rebuilds the system prompt. Verbose mode adds
 additional environment details such as CPU count, PATH, basic container
 detection, and network-tool availability. Refreshing host facts resets the
 active conversation and token counters so the model receives a clean, current
-system prompt.
+system prompt. Ctrl-C during a refresh cancels it and keeps the previous facts,
+conversation, and verbose setting.
 
 ## Version and update status
 

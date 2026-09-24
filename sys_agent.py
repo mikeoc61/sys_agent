@@ -67,6 +67,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import queue
 import re
 import shlex
 import shutil
@@ -82,7 +83,6 @@ import urllib.request
 import itertools
 import atexit
 import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -4212,10 +4212,17 @@ def run_repl(provider: Provider) -> None:
             ):
                 print(dim("usage: /provider openai|anthropic|deepseek"))
                 continue
+            # make_provider() imports the SDK on first use of a provider, which
+            # takes long enough on the Pi to catch a Ctrl-C. `provider` is only
+            # rebound on success, so a cancel leaves the session untouched.
             try:
                 provider = make_provider(parts[1])
             except ValueError as e:
                 print(err_bold(f"[provider switch failed] {e}"))
+                continue
+            except KeyboardInterrupt:
+                print()
+                print(dim("[provider switch cancelled]"))
                 continue
             # Provider message formats differ, so reset conversation on switch.
             # Host facts and toggles are preserved.
@@ -4259,24 +4266,30 @@ def run_repl(provider: Provider) -> None:
             if len(parts) == 1:
                 print(json.dumps(facts, indent=2))
                 continue
-            if len(parts) == 2 and parts[1] == "refresh":
-                facts = gather_verbose_host_facts() if facts_verbose else gather_host_facts()
-                system = build_system_prompt(facts)
-                messages = provider.initial_messages(system)
-                session_in = session_out = 0
-                last_usage = Usage()
-                print(dim("[host facts refreshed; conversation/token counters reset]"))
-                continue
-            if len(parts) == 3 and parts[1] == "verbose" and parts[2] in ("on", "off"):
-                facts_verbose = parts[2] == "on"
-                facts = gather_verbose_host_facts() if facts_verbose else gather_host_facts()
-                system = build_system_prompt(facts)
+            refresh = len(parts) == 2 and parts[1] == "refresh"
+            verbose = (len(parts) == 3 and parts[1] == "verbose"
+                       and parts[2] in ("on", "off"))
+            if refresh or verbose:
+                want_verbose = parts[2] == "on" if verbose else facts_verbose
+                # Probe into locals and commit nothing until it completes: a
+                # Ctrl-C mid-probe keeps the previous facts, prompt, history,
+                # and verbose setting intact rather than half-updated.
+                try:
+                    new_facts = (gather_verbose_host_facts() if want_verbose
+                                 else gather_host_facts())
+                    new_system = build_system_prompt(new_facts)
+                except KeyboardInterrupt:
+                    print()
+                    print(dim("[facts refresh cancelled; previous facts kept]"))
+                    continue
+                facts_verbose, facts, system = want_verbose, new_facts, new_system
                 messages = provider.initial_messages(system)
                 session_in = session_out = 0
                 last_usage = Usage()
                 print(dim(
                     f"[facts verbose = {facts_verbose}; host facts refreshed; "
-                    "conversation/token counters reset]"
+                    "conversation/token counters reset]" if verbose else
+                    "[host facts refreshed; conversation/token counters reset]"
                 ))
                 continue
             print(dim("usage: /facts | /facts refresh | /facts verbose on|off"))
@@ -4375,11 +4388,18 @@ def run_repl(provider: Provider) -> None:
                 print(dim("usage: /history | /history N | /history all"))
                 continue
             hist_path = _audit_path or os.path.expanduser(AUDIT_LOG_DEFAULT)
-            text = render_history(hist_path, limit)
-            if text is None:
-                print(dim("[no audit history yet]"))
-            else:
-                page_text(text)
+            # render_history() reads and formats the whole log (`all` on a
+            # long-lived Pi log is slow); page_text() handles a Ctrl-C inside
+            # the pager, but not one during its reap wait. Read-only either way.
+            try:
+                text = render_history(hist_path, limit)
+                if text is None:
+                    print(dim("[no audit history yet]"))
+                else:
+                    page_text(text)
+            except KeyboardInterrupt:
+                print()
+                print(dim("[history cancelled]"))
             continue
         if meta.startswith("/consult"):
             targets = [n for n in available_provider_names() if n != provider.name]
@@ -4448,18 +4468,36 @@ def run_repl(provider: Provider) -> None:
                               thinking=thinking_enabled, effort=effort)
                 return name, p.model, turn
 
+            # Daemon threads + a queue, not a ThreadPoolExecutor: Ctrl-C must
+            # return to the prompt at once, and an executor cannot give that.
+            # Its `with` exit joins the workers, and shutdown(wait=False,
+            # cancel_futures=True) cancels nothing here (every call is already
+            # running, one worker per target) while interpreter exit still
+            # joins the non-daemon workers, so /exit after a cancelled consult
+            # would hang for an SDK timeout times its retries. A cancelled
+            # consult abandons its requests; they finish (and bill) in the
+            # background and their results are dropped.
+            results_q: queue.Queue[tuple[str, str, Any]] = queue.Queue()
+
+            def consult_worker(name: str) -> None:
+                try:
+                    results_q.put(consult_one(name))
+                except Exception as e:                  # noqa: BLE001
+                    results_q.put((name, DEFAULT_MODELS.get(name, "?"),
+                                   explain_api_error(e)))
+
             consult_results: list[tuple[str, str, Any]] = []
-            with Activity(f"consulting {len(targets)} provider(s)"):
-                with ThreadPoolExecutor(max_workers=len(targets)) as ex:
-                    futs = {ex.submit(consult_one, n): n for n in targets}
-                    for fut in as_completed(futs):
-                        nm = futs[fut]
-                        try:
-                            consult_results.append(fut.result())
-                        except Exception as e:          # noqa: BLE001
-                            consult_results.append(
-                                (nm, DEFAULT_MODELS.get(nm, "?"),
-                                 explain_api_error(e)))
+            try:
+                with Activity(f"consulting {len(targets)} provider(s)"):
+                    for n in targets:
+                        threading.Thread(target=consult_worker, args=(n,),
+                                         name=f"consult-{n}", daemon=True).start()
+                    for _ in targets:
+                        consult_results.append(results_q.get())
+            except KeyboardInterrupt:
+                print()
+                print(dim("[consult cancelled; in-flight requests abandoned]"))
+                continue
             # Stable display order matching available_provider_names().
             order = {n: i for i, n in enumerate(available_provider_names())}
             consult_results.sort(key=lambda r: order.get(r[0], 99))
