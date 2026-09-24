@@ -88,6 +88,13 @@ list on 2026-09-23. Each costs the same as or more than a GPT-6 replacement.
 A `SYS_OPENAI_MODEL` setting or `/model` switch that names one of them still
 works, with an unlisted-model warning.
 
+On the Anthropic side, `claude-opus-5-5` ($4/$20) replaced `claude-opus-5` and
+`claude-opus-4-8` (both $5/$25) in the model list on 2026-09-24. Opus 5.5 can't
+turn thinking off (see [extended thinking](#extended-thinking)). Existing
+`SYS_ANTHROPIC_MODEL` settings that name the older models keep working with the
+same warning. `claude-fable-5-1` is recorded but not listed: at $10/$50 it is
+priced for harder work than this tool needs.
+
 ## Multi-provider consult
 
 `/consult` asks the *other* configured providers how they would approach the
@@ -167,7 +174,7 @@ It is **off by default**: thinking tokens are billed as output (expensive on
 Opus), and routine commands don't need it.
 
 ```text
-/model claude-opus-5
+/model claude-opus-5-5
 /thinking on
 /effort xhigh
 ```
@@ -194,6 +201,15 @@ automatically:
   effort `xhigh`/`max`); with thinking disabled Opus 5 may occasionally phrase a
   proposed command as text rather than a tool call, so use `/thinking on` if you
   hit that.
+- **Anthropic always-on** (Opus 5.5, Fable 5 / 5.1): these models cannot turn
+  thinking off; the API rejects `disabled` with a 400. `/thinking off` therefore
+  can't be honored. It only stops sys_agent from sending an effort level, so
+  the server default applies (`medium` on Opus 5.5). Displays say so: the state
+  reads `on (always on for claude-opus-5-5)` instead of `off`. Because the model
+  may still think, sys_agent uses the thinking-turn output cap and streaming for
+  these models even when thinking is off. `/thinking on` sends your `/effort`
+  level as usual, so on Opus 5.5 `/thinking on` with `/effort low` can cost
+  *less* than "off", which runs at `medium`.
 - **Anthropic legacy** (Haiku 4.5 and older): use a fixed `budget_tokens` budget
   (`SYS_THINKING_BUDGET`) plus the interleaved-thinking beta header so reasoning
   can span tool calls. Effort does not apply here.
@@ -230,8 +246,8 @@ Behavior, all paths:
 
 Anthropic-specific:
 
-- On a thinking turn the output cap is raised to `SYS_THINKING_MAX_TOKENS`
-  (default 32K) so the model has room to reason and act without truncation —
+- On a thinking turn, and on every turn for the always-on models, the output
+  cap is raised to `SYS_THINKING_MAX_TOKENS` (default 32K) so the model has room to reason and act without truncation —
   you are only billed for tokens actually produced. (DeepSeek needs no such
   raise.)
 - Thinking turns are streamed internally (required by the SDK once the token

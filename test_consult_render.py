@@ -428,6 +428,67 @@ print(f"[openai] effort=none routing (luna/sol yes, astra no), list: "
       f"{'OK' if ok_eff else f'FAIL {_eff}'}")
 if not ok_eff: fails.append("effort-none-routing")
 
+# 16) Anthropic thinking routing through the real AnthropicProvider.chat().
+#     Opus 5.5 / Fable 5.x 400 on thinking=disabled (probe 2026-09-24), so the
+#     thinking-off path must never send it to them; it must instead give them
+#     the thinking-sized cap on the streaming path (a 4096 cap can truncate a
+#     turn that thinks anyway). Sonnet 5 / Opus 5 still need the explicit
+#     disabled to honor /thinking off; Haiku sends nothing. Status must never
+#     read "off" for a model that cannot stop thinking.
+class _FakeMessages:
+    def __init__(self) -> None:
+        self.kwargs: dict = {}; self.streamed = False
+    def _resp(self):
+        blk = _NS(type="text", text="ok",
+                  model_dump=lambda **_: {"type": "text", "text": "ok"})
+        return _NS(content=[blk], usage=_NS(
+            input_tokens=1, output_tokens=1, cache_read_input_tokens=0,
+            cache_creation_input_tokens=0))
+    def create(self, **kw):
+        self.kwargs = kw; return self._resp()
+    def stream(self, **kw):
+        self.kwargs = kw; self.streamed = True; outer = self
+        class _S:
+            def __enter__(self): return _NS(get_final_message=outer._resp)
+            def __exit__(self, *a): return False
+        return _S()
+def _ant_req(model: str, thinking: bool) -> tuple[object, int, bool]:
+    p = _mk(S.AnthropicProvider, "anthropic", model)
+    fm = _FakeMessages()
+    p.client = _NS(messages=fm)
+    p.chat([{"role": "user", "content": "hi"}], SYS, thinking=thinking,
+           effort="high")
+    th = (fm.kwargs.get("extra_body", {}).get("thinking")
+          or fm.kwargs.get("thinking"))
+    return th, fm.kwargs["max_tokens"], fm.streamed
+_BIG, _SMALL = S.ANTHROPIC_THINKING_MAX_TOKENS, S.ANTHROPIC_MAX_TOKENS
+_ant_want = {
+    ("claude-opus-5-5", False): (None, _BIG, True),
+    ("claude-fable-5-1", False): (None, _BIG, True),
+    ("claude-opus-5-5", True): ({"type": "adaptive"}, _BIG, True),
+    ("claude-opus-5", False): ({"type": "disabled"}, _SMALL, False),
+    ("claude-sonnet-5", False): ({"type": "disabled"}, _SMALL, False),
+    ("claude-haiku-4-5-20251001", False): (None, _SMALL, False),
+}
+_ant_got = {k: _ant_req(*k) for k in _ant_want}
+_prov = lambda m: _mk(S.AnthropicProvider, "anthropic", m)
+ok_ant = (_ant_got == _ant_want
+          and S.thinking_status(_prov("claude-opus-5-5"), False)
+              == "on (always on for claude-opus-5-5)"
+          and S.thinking_active(_prov("claude-opus-5-5"), False)
+          and S.thinking_status(_prov("claude-haiku-4-5-20251001"), False) == "off"
+          and not S.thinking_active(_prov("claude-haiku-4-5-20251001"), False)
+          and not (S._THINKING_ALWAYS_ON_MODELS & S._ADAPTIVE_DEFAULT_ON_MODELS)
+          and S.PROVIDER_MODELS["anthropic"] == (
+              "claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5-5")
+          and all(m in S.CONTEXT_WINDOWS for m in
+                  ("claude-opus-5-5", "claude-fable-5-1", "claude-opus-5",
+                   "claude-opus-4-8")))
+_ant_bad = {k: v for k, v in _ant_got.items() if v != _ant_want[k]}
+print(f"[anthropic] thinking routing (always-on / default-on / off), list: "
+      f"{'OK' if ok_ant else f'FAIL {_ant_bad}'}")
+if not ok_ant: fails.append("anthropic-thinking-routing")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)
