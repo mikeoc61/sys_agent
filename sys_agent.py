@@ -201,10 +201,20 @@ DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"   # override: SYS_ANTHROPI
 #                        out $0.60/$1.20. Peak = 01-04 & 06-10 UTC Mon-Fri.
 #                        Unversioned alias: tracks DeepSeek's current Flash.
 #                        Default.
-#   deepseek-v4-pro    — Being retired: from 2026-09-14 04:00 UTC routed to
-#                        V4.1-Flash at Flash rates until V4.1-Pro ships. Dropped
-#                        from PROVIDER_MODELS (the picker would offer a name that
-#                        serves Flash); CONTEXT_WINDOWS entry kept.
+#   deepseek-v4-pro    — DeepSeek-V4-Pro-0813 (GA 2026-08-13). Per 1M tok,
+#                        off-peak/peak: in $0.66/$1.32 (cache hit $0.022/
+#                        $0.044), out $1.98/$3.96. 1M context, 384K max output,
+#                        thinking default on, effort low|high|max (default high).
+#                        The stronger DeepSeek option, though older than Flash.
+#                        NOT retired: the 2026-09-10 release notice announced
+#                        routing it to V4.1-Flash from 09-14, but the changelog
+#                        reversed that the same day ("in response to user
+#                        demand": service continues, billing unchanged). The
+#                        news page still shows the routing notice; the API is
+#                        authoritative — probe 2026-09-24: response `model` is
+#                        deepseek-v4-pro, and a 4-turn tool session replays
+#                        reasoning_content cleanly with thinking on and off.
+#                        Expect this name to move again when V4.1-Pro ships.
 #   deepseek-v4-flash  — Retired; server-routed to V4.1-Flash (probe: response
 #                        `model` reports deepseek-flash). Window entry kept for
 #                        existing SYS_DEEPSEEK_MODEL pins.
@@ -261,9 +271,9 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "claude-opus-5-5":         1_000_000,
     "claude-fable-5":          1_000_000,
     "claude-fable-5-1":        1_000_000,
-    # DeepSeek — V4.1 Flash ships the native 1M window. v4-* entries kept for
-    # existing pins; both names are server-routed to V4.1 Flash (v4-pro from
-    # 2026-09-14).
+    # DeepSeek — V4.1 Flash and V4 Pro both ship a 1M window (Models API
+    # context_window 1048576). deepseek-v4-flash is a legacy name the server
+    # routes to V4.1 Flash; entry kept for existing pins.
     "deepseek-flash":          1_000_000,
     "deepseek-v4-flash":       1_000_000,
     "deepseek-v4-pro":         1_000_000,
@@ -288,6 +298,7 @@ PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
     ),
     "deepseek": (
         "deepseek-flash",
+        "deepseek-v4-pro",
     ),
 }
 

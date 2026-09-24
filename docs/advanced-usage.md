@@ -213,15 +213,18 @@ automatically:
 - **Anthropic legacy** (Haiku 4.5 and older): use a fixed `budget_tokens` budget
   (`SYS_THINKING_BUDGET`) plus the interleaved-thinking beta header so reasoning
   can span tool calls. Effort does not apply here.
-- **DeepSeek** (`deepseek-flash` = V4.1 Flash): thinking is set per turn via the
-  request body. **DeepSeek thinks by default** when no thinking field is sent,
-  so with `/thinking off` sys_agent sends an explicit `disabled` (same rationale
-  as Sonnet 5 / Opus 5). Depth maps from **effort** to DeepSeek's three grades:
-  `low` → `low`, `medium`/`high` → `high`, `xhigh`/`max` → `max` (levels without
+- **DeepSeek** (`deepseek-flash` = V4.1 Flash, `deepseek-v4-pro` = V4 Pro):
+  thinking is set per turn via the request body. **DeepSeek thinks by default**
+  when no thinking field is sent, so with `/thinking off` sys_agent sends an
+  explicit `disabled` (same rationale as Sonnet 5 / Opus 5). Depth maps from
+  **effort** to DeepSeek's three grades: `low` → `low`, `medium`/`high` → `high`, `xhigh`/`max` → `max` (levels without
   a native grade round up; DeepSeek's own server table maps `xhigh` → `high`).
   No token budget or max-tokens raise applies. The legacy `deepseek-v4-flash`
-  and `deepseek-v4-pro` names are accepted but server-routed to V4.1 Flash
-  (`v4-pro` from 2026-09-14, until V4.1 Pro ships).
+  name is accepted but served by V4.1 Flash. `deepseek-v4-pro` is still its own
+  model: DeepSeek announced it would be served by Flash from 2026-09-14, then
+  reversed that. It is the stronger, pricier DeepSeek option ($0.66/$1.98 per
+  million input/output tokens off-peak, against Flash's $0.15/$0.60), and older
+  than Flash. The name is likely to change meaning when DeepSeek ships V4.1 Pro.
   DeepSeek imposes a strict replay contract: once a thinking turn makes a tool
   call, the reasoning scratchpad must be echoed back on every subsequent
   assistant message or the next request 400s. sys_agent handles this internally

@@ -489,6 +489,34 @@ print(f"[anthropic] thinking routing (always-on / default-on / off), list: "
       f"{'OK' if ok_ant else f'FAIL {_ant_bad}'}")
 if not ok_ant: fails.append("anthropic-thinking-routing")
 
+# 17) DeepSeek: deepseek-v4-pro is listed again (DeepSeek reversed its
+#     2026-09-14 routing to Flash). Both listed models think by default, so
+#     /thinking off must send an explicit disabled to each; /thinking on sends
+#     enabled + the mapped effort grade. Drives the real DeepSeekProvider.chat().
+def _ds_req(model: str, thinking: bool) -> dict:
+    p = _mk(S.DeepSeekProvider, "deepseek", model)
+    fc = _FakeCompletions()
+    p.client = _NS(chat=_NS(completions=fc))
+    p.chat([{"role": "user", "content": "hi"}], SYS, thinking=thinking,
+           effort="xhigh")
+    return fc.kwargs.get("extra_body", {})
+_ds_want = {
+    ("deepseek-flash", False): {"thinking": {"type": "disabled"}},
+    ("deepseek-v4-pro", False): {"thinking": {"type": "disabled"}},
+    ("deepseek-v4-pro", True): {"thinking": {"type": "enabled"},
+                                "reasoning_effort": "max"},
+}
+_ds_got = {k: _ds_req(*k) for k in _ds_want}
+ok_ds = (_ds_got == _ds_want
+         and S.PROVIDER_MODELS["deepseek"] == ("deepseek-flash",
+                                               "deepseek-v4-pro")
+         and S.DEFAULT_DEEPSEEK_MODEL == "deepseek-flash"
+         and all(m in S.CONTEXT_WINDOWS for m in
+                 ("deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash")))
+print(f"[deepseek] v4-pro listed, thinking off/on routing: "
+      f"{'OK' if ok_ds else f'FAIL {_ds_got}'}")
+if not ok_ds: fails.append("deepseek-v4-pro")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)
