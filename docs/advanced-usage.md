@@ -58,6 +58,22 @@ call). Host facts and REPL toggles are preserved.
 Changing the model keeps the same provider and session state. Unknown context
 windows are allowed; token display falls back to absolute token counts.
 
+### Unsupported: OpenAI GPT-6 Astra
+
+`gpt-6-astra` cannot be used with sys_agent (checked 2026-09-23). sys_agent
+talks to OpenAI through the Chat Completions endpoint, and there Astra rejects
+function tools, which is how every command is proposed. The error message tells
+you to set `reasoning_effort` to `none`, but Astra rejects `none` too. Only
+`low`, `medium`, `high`, and `xhigh` are accepted, and all of them hit the same
+tools error. Leaving the field out hits it as well. Astra with tools works only
+on OpenAI's Responses API, which sys_agent does not use.
+
+`/model gpt-6-astra` is still accepted (it matches the `gpt-` prefix), but the
+first question fails with a 400 error and no command is run. Switch back with
+`/model gpt-5.4-mini`. Astra is also priced at $10/$50 per million input/output
+tokens, the same tier as `claude-fable-5`, which sys_agent leaves out of its
+model list as too expensive for this workload.
+
 ## Multi-provider consult
 
 `/consult` asks the *other* configured providers how they would approach the

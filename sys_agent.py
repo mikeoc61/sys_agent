@@ -128,6 +128,18 @@ from typing import Any
 # For a cost floor, gpt-4o-mini ($0.15/$0.60) is still marginally cheapest;
 # gpt-5.6-luna is the better-quality-per-dollar pick now. Switch via /model or
 # SYS_OPENAI_MODEL.
+# gpt-6-astra — NOT USABLE HERE (probed 2026-09-23). Flagship, $10/$50 (2x in /
+# 1.5x out above 272K input), 1.05M context / 128K max output. Chat Completions
+# rejects function tools with any reasoning effort, and unlike GPT-5.6 the
+# "none" escape hatch is gone: the tools error says "set reasoning_effort to
+# 'none'", but sending "none" 400s with unsupported_value (only low|medium|
+# high|xhigh are accepted). Omitting the field hits the tools error too. So no
+# Chat Completions request with tools succeeds: Astra + function tools is
+# Responses-API-only. Left out of PROVIDER_MODELS. /model gpt-6-astra still
+# passes the "gpt-" prefix fallback and then 400s on the first turn. Adopting
+# it means a Responses-API path in OpenAIProvider (function_call /
+# function_call_output items, reasoning-item replay), which would also give
+# GPT-5.6 reasoning with tools. Price alone puts it in the Fable-5/Sol tier.
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"          # override: SYS_OPENAI_MODEL
 
 # Anthropic options (verified Jul 2026):
@@ -221,6 +233,9 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-5.6-luna":  1_050_000,
     "gpt-5.6-terra": 1_050_000,
     "gpt-5.6-sol":   1_050_000,
+    # GPT-6 Astra — window recorded for completeness; unusable on Chat
+    # Completions with tools (see the OpenAI options note above).
+    "gpt-6-astra":   1_050_000,
     # Anthropic — Opus 4.6/4.7/4.8/5, Sonnet 4.6/5, and Fable 5 all ship the
     # full 1M window at standard pricing; Haiku 4.5 remains 200K. Entries kept
     # for models dropped from PROVIDER_MODELS below (sonnet-4-6, opus-4-7,
