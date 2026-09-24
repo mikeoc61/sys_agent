@@ -194,7 +194,9 @@ python 3.13.5   readline: GNU 8.2 (stdlib)   anthropic 1.8.0   openai 3.19.2
   shows `unversioned copy (blob <hash>)`, which still identifies the exact
   file.
 - **Path** is the file actually running, which matters when a shortcut, a
-  checkout, and a stray copy exist on one machine.
+  checkout, and a stray copy exist on one machine. Started through the
+  [terminal shortcut](configuration.md#install-a-terminal-shortcut), it shows
+  the checkout the link points to, then `via` and the link.
 - **github main** runs the [update check](technical-reference.md#update-check)
   fresh. Unlike at startup, it also reports the quiet outcomes: `up to date`,
   `ahead of GitHub main`, `local edits`, and `could not check GitHub: <reason>`.

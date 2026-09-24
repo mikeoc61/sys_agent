@@ -29,9 +29,11 @@ out of the README; link to the page that owns it.
   provider-specific request quirks in the provider class.
 
 ## Targets and backend asymmetries
-- Raspberry Pi 5 (Debian) — primary, 24/7 server. Real sessions (`uv run
-  --python 3.13`) get **libedit**: uv's standalone CPython links it. The system
-  `python3` (3.11) has GNU readline 8.2.
+- Raspberry Pi 5 (Debian) — primary, 24/7 server. Two real launch paths with
+  different interpreters: `uv run --python 3.13 sys_agent.py` gets **libedit**
+  (uv's standalone CPython links it); the `~/.local/bin/sys_agent` shortcut
+  (shebang `uv run --script`, no Python pin) gets system `python3` 3.11 with
+  GNU readline 8.2 and its own cached SDK versions. `/version` shows which.
 - M3 Mac (macOS 26): real sessions get GNU via gnureadline; the system
   `python3` falls back to libedit.
 - EC2 Ubuntu (Xen and Nitro).
@@ -114,6 +116,8 @@ startup prior). E.g. battery SoH passes; SoC fails.
 - Commit freely; **tag only after Pi validation** — both harnesses green on the
   Pi (display-only changes may skip hardware re-test). Never force-update a published tag. Push tags explicitly:
   `git push origin <tag>`. Check `git describe --tags` before choosing a number.
+  Tags come after the Pi sync, so then run `git fetch --tags` on pibot, or its
+  `/version` reports the previous tag.
 - Do not tag or push without explicit instruction.
 
 ## Style

@@ -1048,6 +1048,35 @@ print(f"[ctrl-c] meta-commands cancel in place, session and state survive: "
       f"{'OK' if ok_cc else f'FAIL escaped={_cc_escaped!r} daemon={_cc_daemon} t={_cc_elapsed:.1f}s facts={_cc_facts_calls} seen={_cc_seen}'}")
 if not ok_cc: fails.append("meta-ctrl-c")
 
+# 24) Run through the documented shortcut (a symlink in ~/.local/bin), the
+#     git lookups must see the checkout the link points to, not the link's
+#     directory: from pibot, /version said "unversioned copy" and a behind
+#     install would get the vague "differs" notice instead of "N behind".
+_ln_dir = _tf.mkdtemp()
+_ln = os.path.join(_ln_dir, "sys_agent")
+os.symlink(os.path.realpath(S.__file__), _ln)
+_real_dir = os.path.dirname(os.path.realpath(S.__file__))
+_ln_seen: list = []
+_saved_ln = (S._git_describe, S._git_head, S._github_json)
+S._git_describe = lambda d: (_ln_seen.append(("describe", d)), "v9.9.9")[1]
+S._git_head = lambda d: (_ln_seen.append(("head", d)), "a" * 40)[1]
+S._github_json = lambda p: ({"sha": "f" * 40} if p.startswith("/contents/")
+                            else {"status": "ahead", "ahead_by": 2, "behind_by": 0})
+try:
+    _ln_report = S.version_report(_ln)
+    _ln_notice = S.check_for_update(_ln)
+finally:
+    S._git_describe, S._git_head, S._github_json = _saved_ln
+    os.unlink(_ln); os.rmdir(_ln_dir)
+ok_link = (
+    _ln_seen and all(d == _real_dir for _, d in _ln_seen)
+    and _ln_report[0] == f"sys_agent v9.9.9   ({os.path.realpath(S.__file__)} via {_ln})"
+    and _ln_notice and "2 commits behind" in _ln_notice
+    and f"git -C {_real_dir} pull" in _ln_notice)
+print(f"[version] symlinked launch resolves to the checkout: "
+      f"{'OK' if ok_link else f'FAIL seen={_ln_seen} report={_ln_report[0]!r}'}")
+if not ok_link: fails.append("version-symlink")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)

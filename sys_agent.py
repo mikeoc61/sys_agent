@@ -4768,7 +4768,11 @@ def update_status(path: str | None = None) -> tuple[bool, str]:
     always set, so /version can report the silent outcomes too (current,
     ahead, local edits, or why the check failed). Never raises Exception."""
     try:
-        path = path or os.path.abspath(__file__)
+        # realpath, not abspath: the documented shortcut is a symlink in
+        # ~/.local/bin, and its directory is not the checkout, so the git
+        # lookup below would miss and "N commits behind" would degrade to
+        # the vague "differs" notice.
+        path = os.path.realpath(path or __file__)
         with open(path, "rb") as fh:
             local = _git_blob_sha(fh.read())
         remote = _github_json(f"/contents/sys_agent.py?ref={UPDATE_BRANCH}")
@@ -4859,7 +4863,9 @@ def version_report(path: str | None = None) -> list[str]:
     matches GitHub main, and the runtime a bug report needs. The GitHub part
     is checked fresh and, unlike the startup check, says so when current and
     reports failures instead of hiding them."""
-    path = path or os.path.abspath(__file__)
+    invoked = os.path.abspath(path or __file__)
+    path = os.path.realpath(invoked)       # through the ~/.local/bin symlink
+    via = f" via {invoked}" if invoked != path else ""
     version = _git_describe(os.path.dirname(path))
     if version is None:
         try:
@@ -4869,7 +4875,7 @@ def version_report(path: str | None = None) -> list[str]:
             version = f"unreadable ({e.strerror})"
     _, status = update_status(path)
     return [
-        f"sys_agent {version}   ({path})",
+        f"sys_agent {version}   ({path}{via})",
         f"github {UPDATE_BRANCH}: {status}",
         f"python {platform.python_version()}   readline: {_readline_backend()}   "
         f"anthropic {_dist_version('anthropic')}   openai {_dist_version('openai')}",
