@@ -1,13 +1,18 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.10"
+# # The <3.14 cap is what makes the unpinned shebang deterministic: uv
+# # otherwise runs whichever Python it finds first (Homebrew 3.14 on the Mac,
+# # managed 3.13 on the Pi). Raise it once a newer Python is validated.
+# requires-python = ">=3.10,<3.14"
 # dependencies = [
 #     # Floors are the SDK versions validated on the Pi and Mac. uv reuses a
 #     # script's cached environment until this list changes, so the unpinned
 #     # shortcut shebang kept anthropic 0.103 while direct runs had 1.8.
 #     "openai>=3.19",
 #     "anthropic>=1.8,<2.0",
-#     "gnureadline>=8.1; sys_platform == 'darwin'",
+#     # GNU readline on every POSIX host. Without it, uv's standalone CPython
+#     # on Linux links libedit and macOS stdlib is libedit.
+#     "gnureadline>=8.1; sys_platform != 'win32'",
 # ]
 # ///
 """
@@ -45,9 +50,10 @@ from __future__ import annotations
 
 # readline must be imported before any SSL-using library (openai, anthropic)
 # on macOS to avoid a segfault-on-exit quirk. Prefer gnureadline (proper GNU
-# readline as a drop-in for libedit, fixing colored prompts and history
-# redraw on macOS). Falls back to stdlib readline (GNU on Linux, libedit on
-# macOS without gnureadline). Falls back further to no readline (Windows).
+# readline, fixing colored prompts and history redraw that libedit gets
+# wrong), declared for every POSIX host. Falls back to stdlib readline, whose
+# backend depends on the interpreter (libedit on macOS and in uv's standalone
+# Linux CPython, GNU in distribution Pythons), then to none (Windows).
 try:
     import gnureadline as readline     # noqa: F401 — preferred backend
     _HAVE_READLINE = True

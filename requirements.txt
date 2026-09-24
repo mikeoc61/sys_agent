@@ -4,7 +4,8 @@
 openai>=3.19
 anthropic>=1.8,<2.0
 
-# macOS-only: real GNU readline replaces libedit so colored prompts render
-# correctly and Up/Down history navigation doesn't overwrite the prompt prefix.
-# PEP 508 env marker makes this a no-op on Linux/Windows.
-gnureadline>=8.1; sys_platform == 'darwin'
+# Real GNU readline on every POSIX host, replacing libedit where the
+# interpreter links it, so colored prompts render correctly and Up/Down
+# history navigation doesn't overwrite the prompt prefix. The PEP 508 marker
+# skips Windows, which has no readline to replace.
+gnureadline>=8.1; sys_platform != 'win32'

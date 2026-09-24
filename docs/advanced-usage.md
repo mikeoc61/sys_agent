@@ -359,8 +359,8 @@ the convergence check.
 
 ## Line editing and history
 
-Line editing is provided by readline (or gnureadline on macOS, installed
-automatically).
+Line editing is provided by gnureadline (GNU readline, installed
+automatically on macOS and Linux), or by the stdlib readline if it is missing.
 
 | Key | Action |
 |---|---|

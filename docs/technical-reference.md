@@ -461,7 +461,7 @@ Everything lives in one file. `sys_agent.py` declares its dependencies in a
 PEP 723 inline metadata block, so `uv` builds and caches the environment on
 first run with nothing installed system-wide; `requirements.txt` mirrors the
 same set for the pip path. Dependencies are the provider SDKs plus
-`gnureadline` on macOS — no agent framework.
+`gnureadline` on macOS and Linux — no agent framework.
 
 ### Runtime state
 

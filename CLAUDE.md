@@ -16,7 +16,7 @@ out of the README; link to the page that owns it.
 
 ## Hard constraints
 - **Single file.** Do not split `sys_agent.py` into modules or add deps beyond
-  the API SDKs (+ gnureadline on Darwin) without explicit discussion.
+  the API SDKs (+ gnureadline, all POSIX hosts) without explicit discussion.
 - **Approval prompt is the security gate.** The deny-list is a backstop, not a
   boundary.
 - **Ctrl-C is non-destructive everywhere** in the REPL (cancels the current
@@ -29,16 +29,19 @@ out of the README; link to the page that owns it.
   provider-specific request quirks in the provider class.
 
 ## Targets and backend asymmetries
-- Raspberry Pi 5 (Debian) — primary, 24/7 server. Both launch paths,
-  `uv run --python 3.13 sys_agent.py` and the `~/.local/bin/sys_agent`
-  shebang shortcut, run uv's managed CPython 3.13 (uv prefers managed over
-  system Pythons), which links **libedit**. System `python3` 3.11 has GNU
-  readline 8.2. uv reuses a script's cached environment until the PEP 723
-  dependency list changes: a stale one kept the shortcut on system 3.11 and
-  anthropic 0.103 until v1.24.x raised the SDK floors. `/version` shows what
-  a launch actually got.
-- M3 Mac (macOS 26): real sessions get GNU via gnureadline; the system
-  `python3` falls back to libedit.
+- Real sessions launch through the `~/.local/bin/sys_agent` symlink (shebang
+  `uv run --script`, no Python pin) or `uv run --python 3.13 sys_agent.py`.
+  The header's `requires-python <3.14` makes both pick 3.13 on every host
+  (uv otherwise runs the first Python it finds: Homebrew 3.14 on the Mac),
+  and gnureadline gives GNU readline on every POSIX host. uv reuses a
+  script's cached environment until the PEP 723 block changes: a stale one
+  kept the Pi shortcut on system 3.11 and anthropic 0.103 until v1.24.1.
+  `/version` shows what a launch actually got.
+- Raspberry Pi 5 (Debian) — primary, 24/7 server. uv's standalone CPython
+  links libedit, so without gnureadline Pi sessions ran libedit. System
+  `python3` 3.11 has stdlib GNU 8.2.
+- M3 Mac (macOS 26): system `python3` is libedit, the one libedit path still
+  exercised (by the second harness run).
 - EC2 Ubuntu (Xen and Nitro).
 - Changes touching readline, terminal, signals, or process management must be
   tested on (or reasoned about for) both GNU readline and libedit. Pi-only bugs
@@ -84,8 +87,8 @@ startup prior). E.g. battery SoH passes; SoC fails.
 - Hardware harness: `test_hardware.py` — offline and keyless, but needs a pty
   and a real process table, so it is per-host and NOT part of the baseline.
   Run it on the Pi and the Mac before tagging, under BOTH interpreters:
-  `uv run --python 3.13 test_hardware.py` (the backend real sessions use) and
-  `python3 test_hardware.py` (the other one). Covers what the
+  `uv run test_hardware.py` (what real sessions use) and `python3
+  test_hardware.py` (system readline; libedit on the Mac). Covers what the
   baseline structurally cannot: signal delivery and process-group teardown, the
   approval prompt under real readline, env-file resolution at real startup. It
   reports the live readline backend, so a run records which of the two paths

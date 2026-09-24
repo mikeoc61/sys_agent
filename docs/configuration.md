@@ -118,8 +118,8 @@ pip install -r requirements.txt
 python3 sys_agent.py
 ```
 
-`requirements.txt` carries the same `gnureadline` macOS-only marker as
-the inline block.
+`requirements.txt` carries the same `gnureadline` dependency (every platform
+except Windows) as the inline block.
 
 > Invoke with `python3 sys_agent.py`, not `./sys_agent.py` — the shebang
 > is `#!/usr/bin/env -S uv run --script`, which routes execution through
@@ -148,16 +148,18 @@ for commands). If `sys_agent` is not found, continue using
 
 ## Python and terminal compatibility
 
-Python 3.10–3.13 is the recommended range for this project. The quick start
-selects 3.13 to avoid dependency build problems on newer interpreters: on a
-just-released Python, pip may fall back to a Rust source build of
-`pydantic-core` (pulled in by both SDKs) that fails against PyO3's
-supported-version ceiling.
+Python 3.10–3.13 is the supported range for this project. The script header
+declares `requires-python = ">=3.10,<3.14"`, so `uv` picks a 3.13 or older
+interpreter even when a newer one is installed; the terminal shortcut and
+`uv run --python 3.13` therefore run the same Python. Newer versions are
+excluded until validated: on a just-released Python, pip may fall back to a
+Rust source build of `pydantic-core` (pulled in by both SDKs) that fails
+against PyO3's supported-version ceiling.
 
-On macOS, installation includes `gnureadline` for line editing and colored
-prompts. On Linux the stdlib readline is used, and its backend depends on the
-interpreter: the uv-managed Python from the quick start links libedit, while a
-distribution Python (the pip and venv path) links GNU readline. Both are
-supported; `/version` shows which one is live. On Windows the stdlib lacks
+Installation includes `gnureadline` on macOS and Linux, giving GNU readline
+line editing and colored prompts on every host. Without it, the stdlib
+readline is used, and its backend depends on the interpreter: libedit on
+macOS and in uv-managed Linux Pythons, GNU in distribution Pythons. Both work;
+`/version` shows which one is live. On Windows the stdlib lacks
 `readline` entirely — the script still runs, but loses history persistence,
 Up/Down recall, and line-editing keystrokes.
