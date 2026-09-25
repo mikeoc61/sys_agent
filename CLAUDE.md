@@ -31,12 +31,12 @@ out of the README; link to the page that owns it.
 ## Targets and backend asymmetries
 - Real sessions launch through the `~/.local/bin/sys_agent` symlink (shebang
   `uv run --script`, no Python pin) or `uv run --python 3.13 sys_agent.py`.
-  The header's `requires-python <3.14` makes both pick 3.13 on every host
-  (uv otherwise runs the first Python it finds: Homebrew 3.14 on the Mac),
-  and gnureadline gives GNU readline on every POSIX host. uv reuses a
-  script's cached environment until the PEP 723 block changes: a stale one
-  kept the Pi shortcut on system 3.11 and anthropic 0.103 until v1.24.1.
-  `/version` shows what a launch actually got.
+  The header pins `requires-python = ">=3.13,<3.14"` so both run 3.13 on
+  every host, and gnureadline gives GNU readline on every POSIX host. uv
+  keeps one environment per script path, re-syncs its packages when the
+  PEP 723 block changes, and keeps its interpreter while that satisfies the
+  range: a range (not a single version) left the Pi shortcut on system 3.11
+  while the Mac got Homebrew 3.14. `/version` shows what a launch got.
 - Raspberry Pi 5 (Debian) — primary, 24/7 server. uv's standalone CPython
   links libedit, so without gnureadline Pi sessions ran libedit. System
   `python3` 3.11 has stdlib GNU 8.2.

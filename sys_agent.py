@@ -1,13 +1,17 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# # The <3.14 cap is what makes the unpinned shebang deterministic: uv
-# # otherwise runs whichever Python it finds first (Homebrew 3.14 on the Mac,
-# # managed 3.13 on the Pi). Raise it once a newer Python is validated.
-# requires-python = ">=3.10,<3.14"
+# # Exactly 3.13 for every uv launch, including the unpinned shebang
+# # shortcut. uv keeps one environment per script path and reuses its
+# # interpreter while that still satisfies this range: under ">=3.10,<3.14"
+# # the Pi's May environment stayed on system 3.11 while the Mac moved from
+# # Homebrew 3.14 to 3.13. A single-version range forces every host onto the
+# # validated Python; uv downloads it where missing. Move both bounds
+# # together once a newer Python is validated. The pip path ignores this.
+# requires-python = ">=3.13,<3.14"
 # dependencies = [
-#     # Floors are the SDK versions validated on the Pi and Mac. uv reuses a
-#     # script's cached environment until this list changes, so the unpinned
-#     # shortcut shebang kept anthropic 0.103 while direct runs had 1.8.
+#     # Floors are the SDK versions validated on the Pi and Mac. uv re-syncs
+#     # an existing script environment when this list changes; before these
+#     # floors, the shortcut kept anthropic 0.103 while direct runs had 1.8.
 #     "openai>=3.19",
 #     "anthropic>=1.8,<2.0",
 #     # GNU readline on every POSIX host. Without it, uv's standalone CPython

@@ -148,13 +148,14 @@ for commands). If `sys_agent` is not found, continue using
 
 ## Python and terminal compatibility
 
-Python 3.10–3.13 is the supported range for this project. The script header
-declares `requires-python = ">=3.10,<3.14"`, so `uv` picks a 3.13 or older
-interpreter even when a newer one is installed; the terminal shortcut and
-`uv run --python 3.13` therefore run the same Python. Newer versions are
-excluded until validated: on a just-released Python, pip may fall back to a
-Rust source build of `pydantic-core` (pulled in by both SDKs) that fails
-against PyO3's supported-version ceiling.
+Python 3.10–3.13 is the supported range for the pip path. Runs through `uv`
+use exactly 3.13: the script header declares
+`requires-python = ">=3.13,<3.14"`, so the terminal shortcut and
+`uv run --python 3.13` run the same Python on every machine, and `uv`
+downloads 3.13 if it is missing. Newer versions are excluded until validated:
+on a just-released Python, pip may fall back to a Rust source build of
+`pydantic-core` (pulled in by both SDKs) that fails against PyO3's
+supported-version ceiling.
 
 Installation includes `gnureadline` on macOS and Linux, giving GNU readline
 line editing and colored prompts on every host. Without it, the stdlib

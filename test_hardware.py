@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.10,<3.14"
+# requires-python = ">=3.13,<3.14"
 # dependencies = [
 #     "gnureadline>=8.1; sys_platform != 'win32'",
 # ]
