@@ -52,6 +52,27 @@ Shell-exported vars always override file values.
 
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
+
+# gnureadline's manylinux wheel bundles its own ncurses, compiled to search
+# only /etc/terminfo:/usr/share/terminfo. Debian and Ubuntu keep common
+# entries (xterm-256color, xterm, screen) in /lib/terminfo, so on the Pi the
+# terminal went unrecognised and readline fell back to dumb-terminal output:
+# Backspace echoed a space and the cursor moved right, although the edited
+# line was correct. Readline loads the entry at import, so this runs first.
+# Every standard directory that exists is listed, which matches the system
+# ncurses defaults for the commands that inherit it. A user's own TERMINFO
+# or TERMINFO_DIRS is left alone.
+if (_sys.platform.startswith("linux")
+        and "TERMINFO" not in _os.environ
+        and "TERMINFO_DIRS" not in _os.environ):
+    _terminfo_dirs = [d for d in ("/etc/terminfo", "/lib/terminfo",
+                                  "/usr/lib/terminfo", "/usr/share/terminfo")
+                      if _os.path.isdir(d)]
+    if _terminfo_dirs:
+        _os.environ["TERMINFO_DIRS"] = ":".join(_terminfo_dirs)
+
 # readline must be imported before any SSL-using library (openai, anthropic)
 # on macOS to avoid a segfault-on-exit quirk. Prefer gnureadline (proper GNU
 # readline, fixing colored prompts and history redraw that libedit gets

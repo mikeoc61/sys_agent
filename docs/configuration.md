@@ -158,7 +158,11 @@ on a just-released Python, pip may fall back to a Rust source build of
 supported-version ceiling.
 
 Installation includes `gnureadline` on macOS and Linux, giving GNU readline
-line editing and colored prompts on every host. Without it, the stdlib
+line editing and colored prompts on every host. On Linux, sys_agent sets
+`TERMINFO_DIRS` to the standard terminal-definition folders when neither it
+nor `TERMINFO` is already set, because the terminal library bundled with
+`gnureadline` does not search `/lib/terminfo`, where Debian and Ubuntu keep
+common entries. Without it, Backspace moved the cursor right. Without it, the stdlib
 readline is used, and its backend depends on the interpreter: libedit on
 macOS and in uv-managed Linux Pythons, GNU in distribution Pythons. Both work;
 `/version` shows which one is live. On Windows the stdlib lacks

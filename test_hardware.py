@@ -452,6 +452,50 @@ def check_update_check_exit() -> None:
            f"(request in flight={connected}, exit after {elapsed:.1f}s)")
 
 
+def check_backspace_echo() -> None:
+    """Backspace must redraw as a cursor move left, not a space. gnureadline's
+    Linux wheel bundles an ncurses that does not search /lib/terminfo, where
+    Debian keeps xterm-256color; the terminal went unrecognised and Backspace
+    echoed b' ' (cursor moved right) on the Pi. The edited line was still
+    right, so only the echoed bytes show it. Imports sys_agent, which sets
+    TERMINFO_DIRS before loading readline, under a pty with that TERM."""
+    code = (f"import sys; sys.path.insert(0, {HERE!r})\n"
+            "import sys_agent as S\n"
+            "print('RESULT=' + repr(input('> ')), flush=True)\n")
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("TERMINFO", "TERMINFO_DIRS")}
+    env["TERM"] = "xterm-256color"
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execve(sys.executable, [sys.executable, "-c", code], env)
+
+    def read_for(t: float) -> bytes:
+        got, end = b"", time.monotonic() + t
+        while time.monotonic() < end:
+            if select.select([fd], [], [], 0.05)[0]:
+                try:
+                    got += os.read(fd, 4096)
+                except OSError:
+                    break
+        return got
+
+    read_for(2.0)
+    os.write(fd, b"abc")
+    read_for(0.4)
+    os.write(fd, b"\x7f")
+    echo = read_for(0.5)
+    os.write(fd, b"d\r")
+    tail = read_for(1.0)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    # A correct redraw moves left (BS or CSI D) or rewrites the line (CR).
+    moved_left = any(m in echo for m in (b"\x08", b"\x1b[D", b"\r"))
+    ok = moved_left and b"RESULT='abd'" in tail
+    report("backspace", ok, f"(echo={echo!r}, TERM=xterm-256color)")
+
+
 def check_readline() -> None:
     """Which backend is live, and that a history path was bound. Pi-only
     readline bugs are real (the v1.4.1 history fix), so record the backend."""
@@ -506,6 +550,7 @@ def main() -> int:
     check_config()
     check_update_check_exit()
     check_readline()
+    check_backspace_echo()
     check_sudo_probe()
     print()
     print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")

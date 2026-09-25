@@ -23,7 +23,9 @@ out of the README; link to the page that owns it.
   operation, never ends the session). Quit is explicit: /exit, /quit, Ctrl-D.
 - **Import order:** readline must be imported before any SSL-using library
   (openai, anthropic) — macOS segfault-on-exit quirk. Don't reorder the top of
-  file.
+  file. The Linux `TERMINFO_DIRS` block must stay above the readline import:
+  gnureadline's bundled ncurses skips `/lib/terminfo` and reads the terminal
+  entry at import (without it, Backspace echoed a space on the Pi).
 - **Model changes touch PROVIDER & MODEL CONFIG only** (`DEFAULT_*_MODEL`,
   `CONTEXT_WINDOWS`, `PROVIDER_MODELS`, `PROVIDER_MODEL_PREFIXES`) plus
   provider-specific request quirks in the provider class.
