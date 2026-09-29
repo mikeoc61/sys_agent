@@ -266,6 +266,8 @@ for their names and settings.
   second opinions, thinking settings, and command history.
 - **[Technical reference](docs/technical-reference.md):** collected host information,
   disk-health detection, execution controls, audit format, and architecture.
+- **[Model monitoring](docs/model-monitoring.md):** check provider inventories and
+  give a monitoring agent evidence for model-update suggestions.
 
 sys_agent is designed for interactive system administration. It is not a coding
 agent — use a tool built for authoring code for that — and it is not
