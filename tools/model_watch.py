@@ -185,15 +185,24 @@ def run(path: Path, *, write_state: bool = True) -> dict[str, Any]:
     old_catalogue = old.get("catalogue", {})
     if not isinstance(old_catalogue, dict):
         raise ValueError(f"invalid catalogue snapshot: {path}")
+    old_health = old.get("health", {})
+    if not isinstance(old_health, dict):
+        raise ValueError(f"invalid provider health snapshot: {path}")
     saved_catalogue = dict(old_catalogue)
+    saved_health = dict(old_health)
     now = datetime.now(timezone.utc).isoformat()
     new_inventories = dict(old_inventories)
     results: dict[str, Any] = {}
+    attempted = False
     for provider, env_name in KEYS.items():
         key = os.environ.get(env_name)
         if not key:
             results[provider] = {"status": "unchecked", "reason": f"{env_name} unavailable"}
             continue
+        attempted = True
+        previous_health = old_health.get(provider, {})
+        if not isinstance(previous_health, dict):
+            raise ValueError("invalid provider health snapshot")
         try:
             current = inventory(provider, key)
             previous = old_inventories.get(provider)
@@ -201,22 +210,54 @@ def run(path: Path, *, write_state: bool = True) -> dict[str, Any]:
                 raise ValueError("invalid provider snapshot")
             results[provider] = {
                 "status": "baseline" if previous is None else "checked",
+                "consecutive_failures": 0,
+                "last_success_at": now,
+                "last_error_at": previous_health.get("last_error_at"),
                 **compare(provider, current, previous,
                           catalogue_changed=(old_catalogue.get(provider)
                                              != catalogue[provider])),
             }
             new_inventories[provider] = current
             saved_catalogue[provider] = catalogue[provider]
+            saved_health[provider] = {
+                "consecutive_failures": 0,
+                "last_success_at": now,
+                "last_error_at": previous_health.get("last_error_at"),
+            }
         except urllib.error.HTTPError as exc:
-            results[provider] = {"status": "error", "reason": f"HTTP {exc.code}"}
+            failures = previous_health.get("consecutive_failures", 0) + 1
+            results[provider] = {
+                "status": "error", "reason": f"HTTP {exc.code}",
+                "consecutive_failures": failures,
+                "persistent_failure": failures >= 2,
+                "last_success_at": previous_health.get("last_success_at"),
+                "last_error_at": now,
+            }
+            saved_health[provider] = {
+                "consecutive_failures": failures,
+                "last_success_at": previous_health.get("last_success_at"),
+                "last_error_at": now,
+            }
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             # Never print response bodies, request headers, or credentials.
-            results[provider] = {"status": "error", "reason": type(exc).__name__}
-    if write_state and any(item["status"] in ("baseline", "checked")
-                           for item in results.values()):
+            failures = previous_health.get("consecutive_failures", 0) + 1
+            results[provider] = {
+                "status": "error", "reason": type(exc).__name__,
+                "consecutive_failures": failures,
+                "persistent_failure": failures >= 2,
+                "last_success_at": previous_health.get("last_success_at"),
+                "last_error_at": now,
+            }
+            saved_health[provider] = {
+                "consecutive_failures": failures,
+                "last_success_at": previous_health.get("last_success_at"),
+                "last_error_at": now,
+            }
+    if write_state and attempted:
         save_state(path, {"version": 1, "checked_at": now,
                           "inventories": new_inventories,
-                          "catalogue": saved_catalogue})
+                          "catalogue": saved_catalogue,
+                          "health": saved_health})
     return {
         "schema_version": 1,
         "checked_at": now,
@@ -228,6 +269,8 @@ def run(path: Path, *, write_state: bool = True) -> dict[str, Any]:
                           for item in results.values()),
         "coverage_incomplete": any(item["status"] in ("unchecked", "error")
                                    for item in results.values()),
+        "coverage_needs_repair": any(item.get("persistent_failure", False)
+                                     for item in results.values()),
         "checked_providers": sum(item["status"] in ("baseline", "checked")
                                  for item in results.values()),
         "interpretation": (

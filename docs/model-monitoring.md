@@ -25,7 +25,9 @@ with sys_agent's curated list. `needs_review` describes any current discrepancy;
 trigger for a notification. `coverage_incomplete` means at least one provider
 could not be checked; this is expected for providers whose keys you have not
 configured. A failed request leaves that provider's prior inventory intact,
-so the next successful run can still detect the change.
+so the next successful run can still detect the change. Provider health is
+stored alongside the inventory: `consecutive_failures` resets after a successful
+check, and `coverage_needs_repair` becomes true after two consecutive failures.
 
 The checker uses the same API-key lookup as sys_agent: shell variables first,
 then `SYS_ENV_FILE` or its normal `.env` search. Run from the checkout if you
@@ -43,8 +45,8 @@ choose the existing agent and delivery route on that Pi. The monitor's task
 should say:
 
 > Run `python3 /absolute/path/to/sys_agent/tools/model_watch.py`. Read the JSON
-> report. If `new_signal` is false, stay quiet unless a configured provider
-> has failed repeatedly or `checked_providers` is zero. For a new model,
+> report. If `new_signal` and `coverage_needs_repair` are false, stay quiet
+> unless `checked_providers` is zero. For a new model,
 > changed metadata, or a missing curated model,
 > inspect official provider model documentation, release notes, pricing, and
 > the relevant sys_agent request path. Explain what changed, whether it affects

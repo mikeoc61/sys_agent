@@ -65,16 +65,23 @@ class ModelWatchTests(unittest.TestCase):
                                       "DEEPSEEK_API_KEY": "secret",
                                       "SYS_ENV_FILE": "/does/not/exist"}), \
                  patch.object(model_watch, "inventory", side_effect=[
-                     visible, TimeoutError(), dict(visible, **{"deepseek-new": {}})]):
+                     visible, TimeoutError(), TimeoutError(),
+                     dict(visible, **{"deepseek-new": {}})]):
                 model_watch.run(state)
-                before = state.read_text()
                 failed = model_watch.run(state)
-                self.assertEqual(state.read_text(), before)
+                failed_again = model_watch.run(state)
                 resumed = model_watch.run(state)
             self.assertEqual(failed["providers"]["deepseek"]["status"], "error")
+            self.assertEqual(failed["providers"]["deepseek"]["consecutive_failures"], 1)
+            self.assertFalse(failed["providers"]["deepseek"]["persistent_failure"])
+            self.assertEqual(failed_again["providers"]["deepseek"]["consecutive_failures"], 2)
+            self.assertTrue(failed_again["providers"]["deepseek"]["persistent_failure"])
+            self.assertTrue(failed_again["coverage_needs_repair"])
             self.assertTrue(failed["coverage_incomplete"])
             self.assertEqual(resumed["providers"]["deepseek"]["new_models"][0]["id"],
                              "deepseek-new")
+            self.assertEqual(resumed["providers"]["deepseek"]["consecutive_failures"], 0)
+            self.assertFalse(resumed["coverage_needs_repair"])
 
 
 if __name__ == "__main__":
