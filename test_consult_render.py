@@ -1048,6 +1048,50 @@ print(f"[ctrl-c] meta-commands cancel in place, session and state survive: "
       f"{'OK' if ok_cc else f'FAIL escaped={_cc_escaped!r} daemon={_cc_daemon} t={_cc_elapsed:.1f}s facts={_cc_facts_calls} seen={_cc_seen}'}")
 if not ok_cc: fails.append("meta-ctrl-c")
 
+# 23b) /reset must drop the aborted turn: its question belongs to the
+#      conversation just discarded. Ctrl-C mid-turn stashes the turn for
+#      /consult; before the fix /reset left it, so a later /consult re-posed
+#      the pre-reset question to other providers (real spend, stale context).
+_rs_inputs = iter(["stale question", "/reset", "/consult"])
+def _rs_input(prompt):
+    try: return next(_rs_inputs)
+    except StopIteration: raise EOFError
+def _rs_chat(messages, system, thinking=False, effort="high"):
+    raise KeyboardInterrupt                 # Ctrl-C during the API call
+_rs_consulted: list = []
+def _rs_make(name, model=None):
+    p = _mk(S.AnthropicProvider, "anthropic", "claude-haiku-4-5-20251001")
+    def chat(messages, system, thinking=False, effort="high"):
+        _rs_consulted.append(messages)
+        return _turn("x")
+    p.chat = chat
+    return p
+_rs_saved = (S.gather_host_facts, S.build_system_prompt, S.colored_input,
+             S.SHOW_DISCLAIMER, S._audit_path, S._update_check,
+             S.available_provider_names, S.make_provider)
+S.gather_host_facts = lambda: {"node": "t", "system": "T", "machine": "m"}
+S.build_system_prompt = lambda facts: SYS
+S.colored_input = _rs_input
+S.SHOW_DISCLAIMER = False; S._audit_path = None; S._update_check = None
+S.available_provider_names = lambda: ["openai", "anthropic"]
+S.make_provider = _rs_make
+_rs_rp = _mk(S.OpenAIProvider, "openai", "gpt-5.4-mini")
+_rs_rp.chat = _rs_chat
+_rs_buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(_rs_buf):
+        S.run_repl(_rs_rp)
+finally:
+    (S.gather_host_facts, S.build_system_prompt, S.colored_input,
+     S.SHOW_DISCLAIMER, S._audit_path, S._update_check,
+     S.available_provider_names, S.make_provider) = _rs_saved
+_rs_out = _rs_buf.getvalue()
+ok_rs = (not _rs_consulted and "no conversation yet" in _rs_out
+         and "aborted" not in _rs_out.split("[conversation reset")[-1])
+print(f"[reset→consult] /reset discards the aborted question: "
+      f"{'OK' if ok_rs else f'FAIL consulted={len(_rs_consulted)}'}")
+if not ok_rs: fails.append("reset-clears-aborted")
+
 # 24) Run through the documented shortcut (a symlink in ~/.local/bin), the
 #     git lookups must see the checkout the link points to, not the link's
 #     directory: from pibot, /version said "unversioned copy" and a behind

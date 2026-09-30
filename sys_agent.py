@@ -4181,6 +4181,9 @@ def run_repl(provider: Provider) -> None:
             messages = provider.initial_messages(system)
             session_in = session_out = 0
             last_usage = Usage()
+            # An aborted turn's question belongs to the conversation just
+            # discarded; /consult must not resurrect it.
+            aborted_turn_events = None
             print(dim("[conversation reset, token counters cleared]"))
             continue
         if meta == "/version":
