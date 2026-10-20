@@ -63,7 +63,7 @@ DEEPSEEK_API_KEY=sk-...
 # Optional overrides
 SYS_PROVIDER=anthropic
 SYS_OPENAI_MODEL=gpt-6-luna
-SYS_ANTHROPIC_MODEL=claude-sonnet-5
+SYS_ANTHROPIC_MODEL=claude-sonnet-5-5
 SYS_DEEPSEEK_MODEL=deepseek-flash
 ```
 

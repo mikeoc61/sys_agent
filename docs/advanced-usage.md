@@ -51,7 +51,7 @@ Provider and model selection are no longer startup-only. During a session:
 /provider deepseek
 /model
 /model gpt-5.4-mini
-/model claude-sonnet-5
+/model claude-sonnet-5-5
 /model deepseek-flash
 ```
 
@@ -95,7 +95,11 @@ works, with an unlisted-model warning.
 
 On the Anthropic side, `claude-opus-5-5` ($4/$20) replaced `claude-opus-5` and
 `claude-opus-4-8` (both $5/$25) in the model list on 2026-09-24. Opus 5.5 can't
-turn thinking off (see [extended thinking](#extended-thinking)). Existing
+turn thinking off (see [extended thinking](#extended-thinking)). On 2026-10-20,
+`claude-sonnet-5-5` replaced `claude-sonnet-5` (same $2/$10 price, half the
+cache-read rate), and `claude-haiku-5-5` was added ($0.10/$0.50 for prompts up
+to 100K tokens, $0.50/$2.50 above). The default stays
+`claude-haiku-4-5-20251001` until Haiku 5.5 passes acceptance testing. Existing
 `SYS_ANTHROPIC_MODEL` settings that name the older models keep working with the
 same warning. `claude-fable-5-1` is recorded but not listed: at $10/$50 it is
 priced for harder work than this tool needs.
@@ -228,17 +232,23 @@ SYS_THINKING=on SYS_THINKING_EFFORT=xhigh sys_agent
 The thinking API differs by model/provider, and sys_agent picks the right one
 automatically:
 
-- **Anthropic adaptive** (Opus 5 / 4.8 / 4.7, Sonnet 5 / 4.6, Opus 4.6): the
-  model decides per turn whether and how much to think. Depth is controlled by
+- **Anthropic adaptive** (Opus 5 / 4.8 / 4.7 / 4.6, Sonnet 5.5 / 5 / 4.6,
+  Haiku 5.5): the model decides per turn whether and how much to think. Depth is controlled by
   **effort** (`/effort`), not a token budget. Interleaved thinking is automatic.
   Manual budgets are rejected with a 400 on Opus 4.7/4.8 — sys_agent never sends
-  them for these models. **Sonnet 5 and Opus 5 think by default** even when no
-  thinking field is sent, so with `/thinking off` sys_agent sends an explicit
-  `disabled` to keep the off-by-default cost rationale intact. On Opus 5 that
-  `disabled` is sent without an effort field (the API rejects `disabled` at
-  effort `xhigh`/`max`); with thinking disabled Opus 5 may occasionally phrase a
-  proposed command as text rather than a tool call, so use `/thinking on` if you
-  hit that.
+  them for these models. **Sonnet 5.5, Sonnet 5, Haiku 5.5, and Opus 5 think by
+  default** even when no thinking field is sent, so with `/thinking off`
+  sys_agent sends each model's explicit off form to keep the off-by-default cost
+  rationale intact: `disabled` on Sonnet 5, Haiku 5.5, and Opus 5, and
+  `between_tools` on Sonnet 5.5, which rejects `disabled`. `between_tools` drops
+  the up-front reasoning pass, but short notes the model writes between tool
+  calls still come back as thinking blocks and are shown dimmed; the state reads
+  `off (between_tools: ...)` to say so. The off form is always sent without an
+  effort field, because every one of them is rejected at effort `xhigh`/`max`;
+  the server default (`high`, or `medium` on Haiku 5.5) applies instead. On
+  Opus 5, with thinking disabled the model may occasionally phrase a proposed
+  command as text rather than a tool call, so use `/thinking on` if you hit
+  that.
 - **Anthropic always-on** (Opus 5.5, Fable 5 / 5.1): these models cannot turn
   thinking off; the API rejects `disabled` with a 400. `/thinking off` therefore
   can't be honored. It only stops sys_agent from sending an effort level, so

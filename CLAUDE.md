@@ -65,9 +65,13 @@ out of the README; link to the page that owns it.
 - `DeepSeekProvider` subclasses `OpenAIProvider` (OpenAI-compatible endpoint).
   **Replay contract:** with `tools` present, `reasoning_content` must be on
   every replayed assistant message or the next call 400s.
-- **Default-on thinking:** Sonnet 5, Opus 5, and DeepSeek think when no field is
-  sent. The `/thinking off` path must send an explicit disabled. Verify any new
-  model's default before assuming off means off.
+- **Default-on thinking:** Sonnet 5/5.5, Opus 5, Haiku 5.5, and DeepSeek think
+  when no field is sent. The `/thinking off` path must send the model's explicit
+  off form, and that form is per model (`_THINKING_OFF_PAYLOAD`): `disabled` on
+  most, `between_tools` on Sonnet 5.5, which rejects `disabled`. Off forms are
+  sent without effort (all 400 at xhigh|max). Verify any new model's default
+  and off form (Models API `capabilities.thinking.types`, then
+  `tools/live_probe.py`) before assuming off means off.
 - Anthropic caching: `input_tokens` excludes cached tokens. True context =
   input + cache_read + cache_write. Display logic depends on this.
 - GPT-5.6 on Chat Completions requires `reasoning_effort: "none"` (via

@@ -468,8 +468,23 @@ _ant_want = {
     ("claude-opus-5-5", True): ({"type": "adaptive"}, _BIG, True),
     ("claude-opus-5", False): ({"type": "disabled"}, _SMALL, False),
     ("claude-sonnet-5", False): ({"type": "disabled"}, _SMALL, False),
+    ("claude-haiku-5-5", False): ({"type": "disabled"}, _SMALL, False),
+    ("claude-haiku-5-5", True): ({"type": "adaptive"}, _BIG, True),
+    ("claude-sonnet-5-5", False): ({"type": "between_tools"}, _SMALL, False),
+    ("claude-sonnet-5-5", True): ({"type": "adaptive"}, _BIG, True),
     ("claude-haiku-4-5-20251001", False): (None, _SMALL, False),
 }
+def _ant_off_kwargs(model: str) -> dict:
+    p = _mk(S.AnthropicProvider, "anthropic", model)
+    fm = _FakeMessages()
+    p.client = _NS(messages=fm)
+    p.chat([{"role": "user", "content": "hi"}], SYS, thinking=False,
+           effort="xhigh")
+    return fm.kwargs
+_bt_kw = _ant_off_kwargs("claude-sonnet-5-5")
+ok_bt = (_bt_kw.get("extra_body") == {"thinking": {"type": "between_tools"}}
+         and "output_config" not in _bt_kw
+         and "thinking" not in _bt_kw)
 _ant_got = {k: _ant_req(*k) for k in _ant_want}
 _prov = lambda m: _mk(S.AnthropicProvider, "anthropic", m)
 ok_ant = (_ant_got == _ant_want
@@ -478,12 +493,20 @@ ok_ant = (_ant_got == _ant_want
           and S.thinking_active(_prov("claude-opus-5-5"), False)
           and S.thinking_status(_prov("claude-haiku-4-5-20251001"), False) == "off"
           and not S.thinking_active(_prov("claude-haiku-4-5-20251001"), False)
-          and not (S._THINKING_ALWAYS_ON_MODELS & S._ADAPTIVE_DEFAULT_ON_MODELS)
+          and S.thinking_status(_prov("claude-sonnet-5-5"), False)
+              .startswith("off (between_tools")
+          and not S.thinking_active(_prov("claude-sonnet-5-5"), False)
+          and S.thinking_status(_prov("claude-haiku-5-5"), False) == "off"
+          and ok_bt
+          and not (S._THINKING_ALWAYS_ON_MODELS & set(S._THINKING_OFF_PAYLOAD))
+          and all(v.get("type") in ("disabled", "between_tools") and len(v) == 1
+                  for v in S._THINKING_OFF_PAYLOAD.values())
           and S.PROVIDER_MODELS["anthropic"] == (
-              "claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5-5")
+              "claude-haiku-4-5-20251001", "claude-haiku-5-5",
+              "claude-sonnet-5-5", "claude-opus-5-5")
           and all(m in S.CONTEXT_WINDOWS for m in
-                  ("claude-opus-5-5", "claude-fable-5-1", "claude-opus-5",
-                   "claude-opus-4-8")))
+                  S.PROVIDER_MODELS["anthropic"] + tuple(S._THINKING_OFF_PAYLOAD)
+                  + tuple(S._THINKING_ALWAYS_ON_MODELS) + ("claude-opus-4-8",)))
 _ant_bad = {k: v for k, v in _ant_got.items() if v != _ant_want[k]}
 print(f"[anthropic] thinking routing (always-on / default-on / off), list: "
       f"{'OK' if ok_ant else f'FAIL {_ant_bad}'}")

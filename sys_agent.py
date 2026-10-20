@@ -184,22 +184,39 @@ from typing import Any
 # with tools. Price alone puts it in the claude-fable-5 tier.
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"          # override: SYS_OPENAI_MODEL
 
-# Anthropic options (verified Sep 2026; prices per 1M tok, in/out):
+# Anthropic options (verified Oct 2026; prices per 1M tok, in/out):
 #   claude-haiku-4-5-20251001  — $1/$5, fast/cheap, solid tool use, legacy
 #                                enabled+budget_tokens thinking. Default.
-#   claude-sonnet-5            — $2/$10 (the launch price, made permanent: the
-#                                scheduled Sep 1 2026 rise to $3/$15 was
-#                                cancelled). Adaptive thinking runs by DEFAULT
-#                                absent the thinking field (see
-#                                _ADAPTIVE_DEFAULT_ON_MODELS). New tokenizer
-#                                produces ~30% more tokens than Sonnet 4.6 for
-#                                the same text (see CONTEXT_WINDOWS note below).
+#   claude-haiku-5-5           — $0.10/$0.50, cache reads $0.01, for prompts
+#                                up to 100K tokens; $0.50/$2.50 above (whole
+#                                request, cache tokens counted). API 2026-10-07.
+#                                Adaptive thinking runs by DEFAULT absent the
+#                                thinking field; {"type":"disabled"} accepted at
+#                                effort high or below (thinking docs, Oct 2026),
+#                                so it is in _THINKING_OFF_PAYLOAD. Server
+#                                default effort is medium. Accepts forced
+#                                tool_choice; rejects prefill and sampling
+#                                params (neither used here). Not yet the
+#                                default: pending acceptance testing.
+#   claude-sonnet-5-5          — $2/$10, cache reads $0.10 (0.05x; Sonnet 5:
+#                                $0.20). API 2026-09-28. Adaptive thinking runs
+#                                by DEFAULT; {"type":"disabled"} 400s. Its
+#                                lowest setting is {"type":"between_tools"}: no
+#                                up-front thinking, but notes written between
+#                                tool calls still return as thinking blocks
+#                                with summary text (shown dimmed like any
+#                                thinking). Accepted at effort high or below and
+#                                takes no other field; the off branch sends no
+#                                effort, so the server default (high) applies.
+#                                Models API capabilities.thinking.types
+#                                .between_tools (2026-10-15): true only here.
+#                                Rejects forced tool_choice (unused here: auto).
 #   claude-opus-5-5            — $4/$20, cache reads $0.20 (0.05x). Current
 #                                Opus (API 2026-09-21). THINKING ALWAYS ON:
 #                                thinking={"type":"disabled"} 400s at every
 #                                effort (probe 2026-09-24), so it is in
 #                                _THINKING_ALWAYS_ON_MODELS, never in
-#                                _ADAPTIVE_DEFAULT_ON_MODELS. Server default
+#                                _THINKING_OFF_PAYLOAD. Server default
 #                                effort is medium (Opus 5: high). Probe with
 #                                sys_agent's thinking-off request shape (no
 #                                thinking field): clean run_command calls,
@@ -210,9 +227,13 @@ DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"          # override: SYS_OPENAI_MODEL
 # Dropped from PROVIDER_MODELS (CONTEXT_WINDOWS entries and thinking-set
 # membership kept, so SYS_ANTHROPIC_MODEL pins and /model still work via the
 # prefix fallback):
+#   claude-sonnet-5            — $2/$10; Sonnet 5.5 has the same price and
+#                                half the cache-read rate (dropped 2026-10-20).
+#                                Thinking on by default; off is
+#                                {"type":"disabled"} (_THINKING_OFF_PAYLOAD).
 #   claude-opus-5              — $5/$25; Opus 5.5 is cheaper and newer.
 #                                Thinking on by default but can be disabled, so
-#                                it stays in _ADAPTIVE_DEFAULT_ON_MODELS for
+#                                it stays in _THINKING_OFF_PAYLOAD for
 #                                pins. Opus 5 400s on disabled at effort
 #                                xhigh|max; not hit here (the disabled branch
 #                                sends no effort, so the server default, high,
@@ -221,7 +242,7 @@ DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"          # override: SYS_OPENAI_MODEL
 #   claude-opus-4-8            — $5/$25, thinking off by default; dominated by
 #                                Opus 5.5 on price.
 #   claude-opus-4-7            — $5/$25, two generations old.
-#   claude-sonnet-4-6          — $3/$15; Sonnet 5 is cheaper. Active upstream,
+#   claude-sonnet-4-6          — $3/$15; Sonnet 5.5 is cheaper. Active upstream,
 #                                retirement not before Feb 17, 2027.
 # Never listed (wrong tier for this tool, cf. gpt-6-astra):
 #   claude-fable-5, claude-fable-5-1 — $10/$50, thinking ALWAYS ON (in
@@ -295,12 +316,16 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-6-astra":   1_050_000,
     "gpt-6-luna":    1_050_000,
     "gpt-6-sol":     1_050_000,
-    # Anthropic — Opus 4.6 through 5.5, Sonnet 4.6/5, and Fable 5/5.1 all ship
-    # the full 1M window at standard pricing (Models API max_input_tokens,
-    # 2026-09-24); Haiku 4.5 remains 200K. Entries kept for models not in
-    # PROVIDER_MODELS below (sonnet-4-6, opus-4-7/4-8/5, fable-5/5-1) so
-    # /model still shows correct context-% on a manual switch.
+    # Anthropic — Opus 4.6 through 5.5, Sonnet 4.6/5/5.5, Haiku 5.5, and
+    # Fable 5/5.1 all ship a 1M window (Models API max_input_tokens,
+    # 2026-09-24; Sonnet/Haiku 5.5 per launch notes). Haiku 5.5 bills prompts
+    # over 100K at a higher tier; the window itself is 1M. Haiku 4.5 remains
+    # 200K. Entries kept for models not in PROVIDER_MODELS below (sonnet-5,
+    # sonnet-4-6, opus-4-7/4-8/5, fable-5/5-1) so /model still shows correct
+    # context-% on a manual switch.
     "claude-haiku-4-5-20251001": 200_000,
+    "claude-haiku-5-5":        1_000_000,
+    "claude-sonnet-5-5":       1_000_000,
     "claude-sonnet-5":         1_000_000,
     "claude-sonnet-4-6":       1_000_000,
     "claude-opus-4-7":         1_000_000,
@@ -331,7 +356,8 @@ PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
     ),
     "anthropic": (
         "claude-haiku-4-5-20251001",
-        "claude-sonnet-5",
+        "claude-haiku-5-5",
+        "claude-sonnet-5-5",
         "claude-opus-5-5",
     ),
     "deepseek": (
@@ -435,21 +461,32 @@ def _thinking_mode(model: str) -> str:
     return "adaptive"
 
 # Models where adaptive thinking runs by default when no `thinking` field is
-# sent at all. Started with Sonnet 5; Opus 5 has the same behavior (Sonnet 4.6
-# and Opus 4.6/4.7/4.8 still run without thinking absent the field). Omitting
-# the field on these models would silently defeat ANTHROPIC_THINKING_DEFAULT=off
-# and its whole rationale (thinking tokens are output-billed and unwanted for
-# routine commands), so chat() sends an explicit thinking:{"type":"disabled"}
-# for these models when the session has thinking turned off. That disabled form
-# is rejected on Opus 5 at effort xhigh|max, but the disabled branch in chat()
-# sends no effort field, so the server default (high) applies and it is accepted.
-_ADAPTIVE_DEFAULT_ON_MODELS = frozenset({"claude-sonnet-5", "claude-opus-5"})
+# sent, mapped to the payload that turns it off. Started with Sonnet 5; Opus 5,
+# Haiku 5.5, and Sonnet 5.5 behave the same (Sonnet 4.6 and Opus 4.6/4.7/4.8
+# still run without thinking absent the field). Omitting the field on these
+# models would silently defeat ANTHROPIC_THINKING_DEFAULT=off and its whole
+# rationale (thinking tokens are output-billed and unwanted for routine
+# commands), so chat() sends this payload when the session has thinking off.
+#
+# The off form is per model, not per generation: Sonnet 5.5 rejects "disabled"
+# and its lowest setting is "between_tools" (no up-front thinking; short notes
+# between tool calls still arrive as thinking blocks). Every off form here is
+# rejected at effort xhigh|max (Opus 5, Haiku 5.5, Sonnet 5.5), but the off
+# branch in chat() sends no effort field, so the server default (high, or
+# medium on Haiku 5.5) applies and it is accepted. A new model goes here only
+# once its Models API capabilities.thinking.types confirms the off form.
+_THINKING_OFF_PAYLOAD: dict[str, dict[str, str]] = {
+    "claude-sonnet-5": {"type": "disabled"},
+    "claude-opus-5": {"type": "disabled"},
+    "claude-haiku-5-5": {"type": "disabled"},
+    "claude-sonnet-5-5": {"type": "between_tools"},
+}
 
-def _thinking_default_on(model: str) -> bool:
-    return model in _ADAPTIVE_DEFAULT_ON_MODELS
+def _thinking_off_payload(model: str) -> dict[str, str] | None:
+    return _THINKING_OFF_PAYLOAD.get(model)
 
 # Models whose thinking cannot be turned off: {"type":"disabled"} 400s, so
-# they must never be in _ADAPTIVE_DEFAULT_ON_MODELS (the two sets are
+# they must never be in _THINKING_OFF_PAYLOAD (the two are
 # disjoint by construction and by test). /thinking off cannot be honored on
 # them; it only stops sys_agent sending an effort, leaving the server default
 # (medium on Opus 5.5). Because the model may still think on an "off" turn,
@@ -3165,11 +3202,13 @@ class AnthropicProvider(Provider):
             # but size and stream the turn for thinking — see
             # _THINKING_ALWAYS_ON_MODELS.
             kwargs["max_tokens"] = ANTHROPIC_THINKING_MAX_TOKENS
-        elif _thinking_default_on(self.model):
-            # Sonnet 5 runs adaptive thinking by default when no `thinking`
-            # field is present. Say so explicitly to honor /thinking off and
-            # the off-by-default cost rationale above.
-            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        elif (off := _thinking_off_payload(self.model)) is not None:
+            # Sonnet 5 / Opus 5 / Haiku 5.5 / Sonnet 5.5 think by default when
+            # no `thinking` field is present. Send the model's off form
+            # explicitly to honor /thinking off and the off-by-default cost
+            # rationale above. No effort is sent: every off form 400s at
+            # xhigh|max, and the server default is high or below.
+            kwargs["extra_body"] = {"thinking": dict(off)}
         if thinking or _thinking_always_on(self.model):
             # A thinking turn raises max_tokens high enough that the SDK's
             # non-streaming guard refuses the request (it estimates worst-case
@@ -3595,6 +3634,10 @@ def thinking_status(provider: Provider, flag: bool) -> str:
             and _thinking_always_on(provider.model)):
         return f"on (always on for {provider.model})"
     if not flag:
+        off = (_thinking_off_payload(provider.model)
+               if provider.name == "anthropic" else None)
+        if off and off.get("type") == "between_tools":
+            return "off (between_tools: notes between tool calls still shown)"
         return "off"
     if provider.name in ("anthropic", "deepseek"):
         return "on"

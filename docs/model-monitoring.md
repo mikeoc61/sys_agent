@@ -65,3 +65,33 @@ The provider endpoints used by the checker are documented by
 [OpenAI](https://platform.openai.com/docs/api-reference/models/list),
 [Anthropic](https://platform.claude.com/docs/en/api/models/list), and
 [DeepSeek](https://api-docs.deepseek.com/api/list-models/).
+
+## Live contract probe
+
+`tools/live_probe.py` closes the gap the inventory check leaves: it confirms
+that sys_agent's own request shapes are accepted by a model before that model
+is listed or made the default. It drives the real `AnthropicProvider.chat()`
+tool loop through three prompts per check and records each request's thinking
+payload, effort, token cap and streaming path, plus stop reasons, thinking
+blocks and token usage per call.
+
+```bash
+uv run tools/live_probe.py
+uv run tools/live_probe.py sonnet55_off sonnet55_toggle
+```
+
+It spends real tokens (about $0.13 for all five checks, mostly Sonnet 5.5) but
+never executes a command: every `run_command` call is answered with canned
+output, so nothing runs on the host and the approval gate is not involved. It
+reads the API key the same way sys_agent does. Results go to
+`~/.local/state/sys_agent/live_probe_results.json` (or under
+`$XDG_STATE_HOME`); the exit status is 0 only if every check passes.
+
+The checks cover the thinking-off forms that differ per model: `between_tools`
+on Sonnet 5.5, `disabled` on Haiku 5.5, a Sonnet 5.5 on→off→on toggle over one
+history (thinking-block replay across mode switches), Haiku 5.5 adaptive
+thinking, and a Haiku 4.5 baseline for token comparison. When a new model
+ships, add a check for its off form before adding it to `PROVIDER_MODELS`.
+The first run (2026-10-20, Pi, anthropic SDK 1.16.0) passed all five; Haiku
+5.5 cost about one seventh of Haiku 4.5 per session at similar latency,
+despite about 26% more tokens for the same system prompt.
