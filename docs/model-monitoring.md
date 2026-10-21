@@ -70,8 +70,8 @@ The provider endpoints used by the checker are documented by
 
 `tools/live_probe.py` closes the gap the inventory check leaves: it confirms
 that sys_agent's own request shapes are accepted by a model before that model
-is listed or made the default. It drives the real `AnthropicProvider.chat()`
-tool loop through three prompts per check and records each request's thinking
+is listed or made the default. It drives the real `AnthropicProvider.chat()` (or
+`DeepSeekProvider.chat()`) tool loop through three prompts per check and records each request's thinking
 payload, effort, token cap and streaming path, plus stop reasons, thinking
 blocks and token usage per call.
 
@@ -80,7 +80,7 @@ uv run tools/live_probe.py
 uv run tools/live_probe.py sonnet55_off sonnet55_toggle
 ```
 
-It spends real tokens (about $0.13 for all five checks, mostly Sonnet 5.5) but
+It spends real tokens (about $0.13 for the five Anthropic checks, mostly Sonnet 5.5; the four DeepSeek checks are cents) but
 never executes a command: every `run_command` call is answered with canned
 output, so nothing runs on the host and the approval gate is not involved. It
 reads the API key the same way sys_agent does. Results go to
@@ -95,3 +95,13 @@ ships, add a check for its off form before adding it to `PROVIDER_MODELS`.
 The first run (2026-10-20, Pi, anthropic SDK 1.16.0) passed all five; Haiku
 5.5 cost about one seventh of Haiku 4.5 per session at similar latency,
 despite about 26% more tokens for the same system prompt.
+
+Four `ds_*` checks cover DeepSeek and need `DEEPSEEK_API_KEY`: `deepseek-flash`
+thinking on, off, and an on(max)→off→on(low) toggle, plus the retired
+`deepseek-v4-flash` name on the same toggle. They assert `enabled` plus a
+`low|high|max` effort when on, `disabled` with no effort when off,
+`reasoning_content` replay with no 400, and that the response `model` is
+`deepseek-flash`. The API reports only that alias, never the snapshot behind
+it, so a silent snapshot change (V4.1-Flash-1017 on 2026-10-20, per DeepSeek's
+docs) shows up here only as a failed contract check. All four passed on the Pi
+that day.
