@@ -23,6 +23,16 @@ Checks:
   haiku55_off      claude-haiku-5-5, /thinking off: thinking=disabled, no effort.
   haiku55_on       claude-haiku-5-5, /thinking on (high): adaptive, streamed.
   haiku45_off      claude-haiku-4-5-20251001 baseline for token comparison.
+  ds_flash_on      deepseek-flash, /thinking on (high): enabled+reasoning_effort
+                   on every request; reasoning_content replays with no 400.
+  ds_flash_off     deepseek-flash, /thinking off: thinking=disabled on every
+                   request, no reasoning_effort.
+  ds_flash_toggle  deepseek-flash on(max) -> off -> on(low) over one history.
+  ds_legacy_toggle deepseek-v4-flash (retired name): same toggle; response
+                   `model` must show the server-routed deepseek-flash.
+DeepSeek checks need DEEPSEEK_API_KEY and record each response's `model`:
+DeepSeek's docs say deepseek-flash is served by V4.1-Flash-1017 but the API
+reports only the alias, so the snapshot itself cannot be verified here.
 
 Usage: `uv run tools/live_probe.py [check ...]` from the repo root.
 Writes ~/.local/state/sys_agent/live_probe_results.json (or under $XDG_STATE_HOME). Exit 0 only if every check passes.
@@ -42,7 +52,7 @@ REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 import sys_agent as S
 
-MAX_ITER = 6
+MAX_ITER = 10
 
 PROMPTS = [
     "Check how full the root filesystem is and how long the system has been up, then summarize in two sentences.",
@@ -63,7 +73,7 @@ def canned_result(command: str) -> str:
     for key, out in CANNED.items():
         if key in command:
             return S.CmdResult(command, 0, out, "").as_tool_payload()
-    return S.CmdResult(command, 0, "(probe: no canned output for this command)\n", "").as_tool_payload()
+    return S.CmdResult(command, 0, "(probe: no canned output for this command; answer from the output you already have)\n", "").as_tool_payload()
 
 
 class Spy:
@@ -96,14 +106,42 @@ class Spy:
         })
 
 
-def run_prompt(provider: S.AnthropicProvider, messages: list[dict], system: str,
+class DSSpy:
+    """Wrap client.chat.completions.create to record extra_body and response model."""
+
+    def __init__(self, provider: S.DeepSeekProvider) -> None:
+        self.requests: list[dict[str, Any]] = []
+        self.models: list[str] = []
+        comp = provider.client.chat.completions
+        real = comp.create
+
+        def create(**kw: Any) -> Any:
+            eb = kw.get("extra_body") or {}
+            self.requests.append({
+                "thinking": eb.get("thinking"),
+                "reasoning_effort": eb.get("reasoning_effort"),
+                "n_messages": len(kw.get("messages", [])),
+            })
+            resp = real(**kw)
+            self.models.append(resp.model)
+            return resp
+
+        comp.create = create
+
+
+def run_prompt(provider: S.Provider, messages: list[dict], system: str,
                prompt: str, thinking: bool, effort: str, log: list[dict]) -> None:
     messages.append({"role": "user", "content": prompt})
     for _ in range(MAX_ITER):
         t0 = time.monotonic()
         turn = provider.chat(messages, system, thinking=thinking, effort=effort)
         dt = time.monotonic() - t0
-        thinking_blocks = [b for b in turn.raw_message["content"] if b.get("type") == "thinking"]
+        if provider.name == "deepseek":
+            # content is a string; the scratchpad rides in reasoning_content
+            thinking_blocks = [{"thinking": turn.raw_message.get("reasoning_content", "")}] \
+                if "reasoning_content" in turn.raw_message else []
+        else:
+            thinking_blocks = [b for b in turn.raw_message["content"] if b.get("type") == "thinking"]
         log.append({
             "thinking_flag": thinking,
             "effort": effort,
@@ -134,9 +172,10 @@ def run_prompt(provider: S.AnthropicProvider, messages: list[dict], system: str,
 
 
 def session(model: str, phases: list[tuple[bool, str]], system: str) -> dict[str, Any]:
-    provider = S.AnthropicProvider(model)
-    spy = Spy(provider)
-    messages: list[dict] = []
+    provider: S.Provider = S.DeepSeekProvider(model) if model.startswith("deepseek") \
+        else S.AnthropicProvider(model)
+    spy: Spy | DSSpy = DSSpy(provider) if model.startswith("deepseek") else Spy(provider)
+    messages: list[dict] = provider.initial_messages(system)
     log: list[dict] = []
     error = None
     try:
@@ -146,6 +185,7 @@ def session(model: str, phases: list[tuple[bool, str]], system: str) -> dict[str
         error = f"{type(e).__name__}: {S.explain_api_error(e) if hasattr(S, 'explain_api_error') else e}"
         error += "\n" + traceback.format_exc(limit=3)
     return {"model": model, "turns": log, "requests": spy.requests, "error": error,
+            "response_models": getattr(spy, "models", []),
             "tool_rounds": sum(1 for t in log if t["tool_calls"])}
 
 
@@ -158,6 +198,29 @@ def expect_off(res: dict, payload: dict) -> list[str]:
             bad.append(f"req{i} output_config={r['output_config']}")
         if r["streamed"] or r["max_tokens"] != S.ANTHROPIC_MAX_TOKENS:
             bad.append(f"req{i} streamed={r['streamed']} max_tokens={r['max_tokens']}")
+    return bad
+
+
+def expect_ds(res: dict, modes: list[str]) -> list[str]:
+    """modes: 'on' | 'off' per turn-phase, in request order is not 1:1 with phases,
+    so assert on the set of request shapes actually sent."""
+    bad = []
+    kinds = set()
+    for i, r in enumerate(res["requests"]):
+        t = (r["thinking"] or {}).get("type")
+        kinds.add(t)
+        if t == "disabled" and r["reasoning_effort"] is not None:
+            bad.append(f"req{i} disabled but reasoning_effort={r['reasoning_effort']}")
+        if t == "enabled" and r["reasoning_effort"] not in ("low", "high", "max"):
+            bad.append(f"req{i} enabled with reasoning_effort={r['reasoning_effort']}")
+        if t not in ("enabled", "disabled"):
+            bad.append(f"req{i} thinking={r['thinking']}")
+    want = {"on": {"enabled"}, "off": {"disabled"}, "toggle": {"enabled", "disabled"}}
+    for m in modes:
+        if kinds != want[m]:
+            bad.append(f"request thinking kinds {sorted(k or 'none' for k in kinds)} != {sorted(want[m])}")
+    bad += [f"response model {m!r} != 'deepseek-flash'" for m in set(res["response_models"])
+            if m != "deepseek-flash"]
     return bad
 
 
@@ -174,9 +237,6 @@ def main() -> int:
     env_file = S.find_env_file(None)
     if env_file:
         S.load_env_file(env_file)
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("ANTHROPIC_API_KEY not set (environment or sys_agent env file)")
-        return 2
     import anthropic
     system = S.build_system_prompt(S.gather_host_facts())
     off = (False, "high")
@@ -186,8 +246,20 @@ def main() -> int:
         "haiku55_off": ("claude-haiku-5-5", [off, off, off]),
         "haiku55_on": ("claude-haiku-5-5", [(True, "high"), (True, "high"), (True, "high")]),
         "haiku45_off": ("claude-haiku-4-5-20251001", [off, off, off]),
+        "ds_flash_on": ("deepseek-flash", [(True, "high")] * 3),
+        "ds_flash_off": ("deepseek-flash", [off, off, off]),
+        "ds_flash_toggle": ("deepseek-flash", [(True, "max"), off, (True, "low")]),
+        "ds_legacy_toggle": ("deepseek-v4-flash", [(True, "high"), off, (True, "high")]),
     }
     wanted = sys.argv[1:] or list(checks)
+    for name in wanted:
+        if name not in checks:
+            print(f"unknown check {name!r}; choices: {', '.join(checks)}")
+            return 2
+        key = "DEEPSEEK_API_KEY" if checks[name][0].startswith("deepseek") else "ANTHROPIC_API_KEY"
+        if not os.environ.get(key):
+            print(f"{key} not set (environment or sys_agent env file); needed by {name}")
+            return 2
     results: dict[str, Any] = {
         "host": os.uname().nodename,
         "python": sys.version.split()[0],
@@ -215,6 +287,12 @@ def main() -> int:
         elif name == "haiku55_on":
             bad += [f"req{i} not adaptive+streamed" for i, r in enumerate(res["requests"])
                     if (r["thinking"] or {}).get("type") != "adaptive" or not r["streamed"]]
+        elif name == "ds_flash_on":
+            bad += expect_ds(res, ["on"])
+        elif name == "ds_flash_off":
+            bad += expect_ds(res, ["off"])
+        elif name in ("ds_flash_toggle", "ds_legacy_toggle"):
+            bad += expect_ds(res, ["toggle"])
         res["pass"] = not bad
         res["problems"] = bad
         results["checks"][name] = res

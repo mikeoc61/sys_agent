@@ -251,7 +251,7 @@ DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"          # override: SYS_OPENAI_MODEL
 #                                CONTEXT_WINDOWS entries only.
 DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"   # override: SYS_ANTHROPIC_MODEL
 
-# DeepSeek options (verified Sep 2026):
+# DeepSeek options (verified Oct 2026):
 #   deepseek-flash     — DeepSeek-V4.1-Flash (released 2026-09-10), new causal
 #                        encoder-decoder arch, 8B/16B active (input/output).
 #                        1M context, 384K max output, thinking + non-thinking,
@@ -259,6 +259,12 @@ DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"   # override: SYS_ANTHROPI
 #                        off-peak/peak: in $0.15/$0.30 (cache hit $0.003/$0.006),
 #                        out $0.60/$1.20. Peak = 01-04 & 06-10 UTC Mon-Fri.
 #                        Unversioned alias: tracks DeepSeek's current Flash.
+#                        Now served by DeepSeek-V4.1-Flash-1017 (open-weights
+#                        minor update; per DeepSeek's docs, calling method
+#                        unchanged, 2026-10-20). The API reports only the
+#                        alias, so the snapshot is docs-asserted, not
+#                        probe-verifiable. Replay + thinking on/off/toggle
+#                        verified on the Pi via tools/live_probe.py ds_* checks.
 #                        Default.
 #   deepseek-v4-pro    — DeepSeek-V4-Pro-0813 (GA 2026-08-13). Per 1M tok,
 #                        off-peak/peak: in $0.66/$1.32 (cache hit $0.022/
@@ -274,8 +280,9 @@ DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"   # override: SYS_ANTHROPI
 #                        deepseek-v4-pro, and a 4-turn tool session replays
 #                        reasoning_content cleanly with thinking on and off.
 #                        Expect this name to move again when V4.1-Pro ships.
-#   deepseek-v4-flash  — Retired; server-routed to V4.1-Flash (probe: response
-#                        `model` reports deepseek-flash). Window entry kept for
+#   deepseek-v4-flash  — Retired; server-routed to V4.1-Flash-1017, billed at
+#                        the Flash price (probe 2026-10-20: response `model`
+#                        reports deepseek-flash). Window entry kept for
 #                        existing SYS_DEEPSEEK_MODEL pins.
 # Thinking is ON by default server-side (probe 2026-09-10: no thinking field ->
 # reasoning_content + reasoning_tokens returned), so DeepSeekProvider sends an
