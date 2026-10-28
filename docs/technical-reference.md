@@ -135,6 +135,16 @@ The default facts also enumerate `/sys/class/hwmon/*/name` on Linux as
 from sysfs, not a curated map — so the sensor channels that exist on the
 host are listed in context rather than guessed.
 
+**Performance history (`sar`).** The tool probe also detects `sar`, `sadf`,
+`iostat`, and `mpstat` (the `sysstat` package). Because installing `sysstat`
+puts `sar` on `PATH` while collection stays off until `ENABLED="true"` in
+`/etc/default/sysstat` on Debian and Raspberry Pi OS, a `sar_history` fact is
+added whenever `sar` is present: `data_dir` (`/var/log/sysstat` or
+`/var/log/sa`, omitted if neither exists) and `daily_files`, the count of
+`saDD` / `saYYYYMMDD` data files. `daily_files: 0` means installed but never
+collected. It is a directory listing only; the metrics themselves stay a
+`sar` command away.
+
 **Cloud classification.** When DMI identifies a recognized cloud platform, the
 hardware block carries a `cloud` label (`aws | gcp | azure | oci |
 digitalocean`). It is a *classification*, not identity — it says "an EC2

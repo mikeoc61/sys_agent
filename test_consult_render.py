@@ -1144,6 +1144,31 @@ print(f"[version] symlinked launch resolves to the checkout: "
       f"{'OK' if ok_link else f'FAIL seen={_ln_seen} report={_ln_report[0]!r}'}")
 if not ok_link: fails.append("version-symlink")
 
+# 21) sar_history: installed-with-data, installed-never-collected, absent.
+#     Drives the real _gather_sar_history with a faked which() and data dir.
+_sd = _tf.mkdtemp()
+for _n in ("sa01", "sa02", "sa20261028", "sar01", "sa", "saXX"):
+    open(os.path.join(_sd, _n), "w").close()
+_saved_sar = (S.shutil.which, S._SAR_DATA_DIRS)
+try:
+    S.shutil.which = lambda c: "/usr/bin/sar" if c == "sar" else None
+    S._SAR_DATA_DIRS = ("/nonexistent/sysstat", _sd)
+    r_data = S._gather_sar_history()
+    S._SAR_DATA_DIRS = ("/nonexistent/sysstat",)
+    r_none = S._gather_sar_history()
+    S.shutil.which = lambda c: None
+    r_absent = S._gather_sar_history()
+finally:
+    S.shutil.which, S._SAR_DATA_DIRS = _saved_sar
+    for _n in os.listdir(_sd): os.unlink(os.path.join(_sd, _n))
+    os.rmdir(_sd)
+ok_sar = (r_data == {"data_dir": _sd, "daily_files": 3}   # sar01/sa/saXX ignored
+          and r_none == {"daily_files": 0} and r_absent == {}
+          and "sar" in inspect.getsource(S.gather_host_facts))
+print(f"[sar] history fact: counts data files only, 0 when never collected, "
+      f"empty when absent: {'OK' if ok_sar else f'FAIL {r_data} {r_none} {r_absent}'}")
+if not ok_sar: fails.append("sar-history")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)

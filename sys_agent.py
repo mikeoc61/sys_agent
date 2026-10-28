@@ -1200,6 +1200,32 @@ def _which_many(cmds: list[str]) -> list[str]:
     return [c for c in cmds if shutil.which(c)]
 
 
+# sysstat's daily data files: Debian keeps them in /var/log/sysstat, RHEL in
+# /var/log/sa. Binary data files are saDD (day of month) or saYYYYMMDD (sadc
+# -D); the sarDD text reports written by sa2 are deliberately not counted.
+_SAR_DATA_DIRS = ("/var/log/sysstat", "/var/log/sa")
+_SAR_DATA_FILE = re.compile(r"^sa(\d{2}|\d{8})$")
+
+
+def _gather_sar_history() -> dict[str, Any]:
+    """Whether `sar` is installed AND has collected history. Installing the
+    package puts `sar` on PATH but, on Debian/Pi OS, collection stays off
+    until ENABLED="true" in /etc/default/sysstat; a bare `which` therefore
+    cannot tell a usable `sar -u` from "Cannot open /var/log/sysstat/saDD".
+    Empty when sar is absent (available_tools already says so); otherwise
+    `daily_files` of 0 means installed but never collected. Stat-only, no
+    subprocess; the data itself is live and left to commands."""
+    if not shutil.which("sar"):
+        return {}
+    for d in _SAR_DATA_DIRS:
+        try:
+            n = sum(1 for f in os.listdir(d) if _SAR_DATA_FILE.match(f))
+        except OSError:
+            continue
+        return {"data_dir": d, "daily_files": n}
+    return {"daily_files": 0}
+
+
 # Pseudo / virtual filesystems and device classes we never want to surface.
 # Mirrors disk_smart.NO_SMART_PREFIXES plus filesystem-level pseudos.
 _DISK_SKIP_DEV_PREFIXES = ("loop", "ram", "zram", "dm-", "sr", "fd")
@@ -2390,6 +2416,8 @@ def gather_host_facts() -> dict[str, Any]:
         "python3", "pip", "pip3", "uv", "poetry", "pipx",
         # disk / filesystem inspection
         "lsblk", "findmnt", "df", "du", "blkid", "smartctl",
+        # performance history (sysstat package)
+        "sar", "sadf", "iostat", "mpstat",
         # hardware / power / sensor telemetry
         "vcgencmd", "sensors", "upower", "dmidecode", "ipmitool",
     ]
@@ -2434,6 +2462,10 @@ def gather_host_facts() -> dict[str, Any]:
         hwmon = _hwmon_sensors_linux()
         if hwmon:
             facts["hwmon_sensors"] = hwmon
+
+    sar = _gather_sar_history()
+    if sar:
+        facts["sar_history"] = sar
 
     try:
         usage = shutil.disk_usage(os.getcwd())
