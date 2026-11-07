@@ -145,6 +145,50 @@ added whenever `sar` is present: `data_dir` (`/var/log/sysstat` or
 collected. It is a directory listing only; the metrics themselves stay a
 `sar` command away.
 
+**Memory policy (Linux).** A `memory_policy` block records the memory
+settings the kernel is actually using, read from `/sys` and `/proc` rather
+than from config files, because the two can disagree:
+
+```json
+"memory_policy": {
+  "cgroup": "v2",
+  "cgroup_memory": true,
+  "psi": true,
+  "swappiness": 25,
+  "swap_kinds": ["file"],
+  "zswap": true
+}
+```
+
+| Field | Source | Meaning |
+|---|---|---|
+| `cgroup` | `/sys/fs/cgroup/cgroup.controllers` (or `unified/`) | `v2`, `hybrid`, or `v1` |
+| `cgroup_memory` | v2: root `cgroup.controllers`; v1/hybrid: `/proc/cgroups` `enabled` | memory controller active |
+| `psi` | `/proc/pressure/memory` readable | pressure-stall telemetry available |
+| `swappiness` | `/proc/sys/vm/swappiness` | live value |
+| `swap_kinds` | `/proc/swaps` (`/dev/zram*` reported as `zram`) | what backs swap; omitted with no swap |
+| `zswap` | `/sys/module/zswap/parameters/enabled` | compressed swap cache; omitted if not built |
+
+`cgroup_memory` is the field that matters most. Raspberry Pi firmware adds
+`cgroup_disable=memory` to the kernel command line, so on a stock Pi OS
+install systemd's `MemoryHigh=` and `MemoryMax=` limits do nothing, although
+`systemctl show` still prints them. When the field is `false` the system prompt
+tells the model not to count those limits as protection. Turning the controller
+on takes `cgroup_enable=memory` in `/boot/firmware/cmdline.txt` and a reboot.
+The Pi kernel also ships with PSI off until `psi=1` is added there. On a 6.12 Pi
+kernel `/proc/cgroups` has no `memory` row even with the v2 controller active,
+so on v2 the root `cgroup.controllers` is the only source checked.
+
+`swappiness` is read live because the persisted setting may not be the one in
+effect. On Debian, `/etc/sysctl.conf` is linked as
+`/etc/sysctl.d/99-sysctl.conf` and loads after files such as `99-memory.conf`,
+so a value set in `/etc/sysctl.conf` wins.
+
+The raw `/proc/cmdline` is not read. It can list a setting and its opposite,
+and it carries identifiers such as `root=PARTUUID`. Pressure averages,
+per-cgroup `memory.events` counters, and swap in use change constantly, so they
+are left to commands.
+
 **Cloud classification.** When DMI identifies a recognized cloud platform, the
 hardware block carries a `cloud` label (`aws | gcp | azure | oci |
 digitalocean`). It is a *classification*, not identity — it says "an EC2

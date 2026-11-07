@@ -1226,6 +1226,77 @@ def _gather_sar_history() -> dict[str, Any]:
     return {"daily_files": 0}
 
 
+# Memory-policy sources (module constants so tests can point them at fixtures).
+_CGROUP_ROOT = "/sys/fs/cgroup"
+_PROC_CGROUPS = "/proc/cgroups"
+_PSI_MEMORY = "/proc/pressure/memory"
+_SWAPPINESS = "/proc/sys/vm/swappiness"
+_PROC_SWAPS = "/proc/swaps"
+_ZSWAP_ENABLED = "/sys/module/zswap/parameters/enabled"
+
+
+def _cgroup_memory_v1_enabled() -> bool:
+    """`enabled` column of the memory row in /proc/cgroups. v1/hybrid only:
+    on v2 the file is not authoritative (6.12 Pi kernels omit the memory row
+    entirely when CONFIG_MEMCG_V1 is off, though v2 memcg is live)."""
+    for line in _safe_read(_PROC_CGROUPS, limit=4096).splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[0] == "memory":
+            return f[3] == "1"
+    return False
+
+
+def _gather_memory_policy_linux() -> dict[str, Any]:
+    """Effective kernel memory policy — what the kernel resolved, not what
+    config requests. Config and effect diverge in practice: Raspberry Pi
+    firmware prepends `cgroup_disable=memory`, leaving systemd MemoryHigh=/
+    MemoryMax= inert while `systemctl show` still prints them; and on Debian
+    /etc/sysctl.conf (linked as 99-sysctl.conf) loads after most
+    /etc/sysctl.d files and silently overrides them. Raw /proc/cmdline is
+    deliberately not read: it holds both requests (pibot carries
+    cgroup_disable= AND cgroup_enable=) plus root=PARTUUID identifiers.
+
+      cgroup         v2 | hybrid | v1
+      cgroup_memory  memory controller active (v2: root cgroup.controllers)
+      psi            /proc/pressure/memory readable (Pi kernels need psi=1)
+      swappiness     live vm.swappiness
+      swap_kinds     sorted kinds from /proc/swaps: file | partition | zram
+      zswap          compressed swap cache on; absent when not built
+
+    Keys attached only when resolved. Pressure averages, memory.events
+    counters, and swap used are live and stay commands."""
+    mp: dict[str, Any] = {}
+    root = _CGROUP_ROOT
+    if os.path.exists(os.path.join(root, "cgroup.controllers")):
+        mp["cgroup"] = "v2"
+        mp["cgroup_memory"] = "memory" in _safe_read(
+            os.path.join(root, "cgroup.controllers")).split()
+    elif os.path.exists(os.path.join(root, "unified", "cgroup.controllers")):
+        mp["cgroup"] = "hybrid"
+        mp["cgroup_memory"] = _cgroup_memory_v1_enabled()
+    elif os.path.isdir(root) and _safe_read(_PROC_CGROUPS, limit=64):
+        mp["cgroup"] = "v1"
+        mp["cgroup_memory"] = _cgroup_memory_v1_enabled()
+    # PSI disabled at boot: /proc/pressure is absent or reads fail
+    # (EOPNOTSUPP); either way _safe_read yields "".
+    mp["psi"] = _safe_read(_PSI_MEMORY, limit=256).startswith("some")
+    sw = _safe_read(_SWAPPINESS, limit=16)
+    if sw.isdigit():
+        mp["swappiness"] = int(sw)
+    kinds: set[str] = set()
+    for line in _safe_read(_PROC_SWAPS, limit=4096).splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 2:
+            # zram registers as type "partition"; the device name tells.
+            kinds.add("zram" if f[0].startswith("/dev/zram") else f[1])
+    if kinds:
+        mp["swap_kinds"] = sorted(kinds)
+    zs = _safe_read(_ZSWAP_ENABLED, limit=8)
+    if zs in ("Y", "N"):
+        mp["zswap"] = zs == "Y"
+    return mp
+
+
 # Pseudo / virtual filesystems and device classes we never want to surface.
 # Mirrors disk_smart.NO_SMART_PREFIXES plus filesystem-level pseudos.
 _DISK_SKIP_DEV_PREFIXES = ("loop", "ram", "zram", "dm-", "sr", "fd")
@@ -2462,6 +2533,11 @@ def gather_host_facts() -> dict[str, Any]:
         hwmon = _hwmon_sensors_linux()
         if hwmon:
             facts["hwmon_sensors"] = hwmon
+        # Effective memory policy: whether unit memory limits are enforced,
+        # PSI availability, live swappiness, what backs swap.
+        memory_policy = _gather_memory_policy_linux()
+        if memory_policy:
+            facts["memory_policy"] = memory_policy
 
     sar = _gather_sar_history()
     if sar:
@@ -3843,6 +3919,26 @@ def build_system_prompt(facts: dict[str, Any]) -> str:
         - `hardware.swap_gb` is configured swap; `0` means none. On a low-RAM
           host, zero swap means memory pressure ends in OOM-kills rather than
           swapping — weigh that when diagnosing killed or restarting processes.
+        - `memory_policy` (Linux) is effective kernel state read at startup,
+          not configuration. `cgroup_memory: false` means the memory
+          controller is off: systemd `MemoryHigh=`/`MemoryMax=` and container
+          memory limits are NOT enforced, even though `systemctl show` still
+          prints the configured values — never cite them as protection then.
+          (Raspberry Pi firmware passes `cgroup_disable=memory`; re-enabling
+          takes `cgroup_enable=memory` in `/boot/firmware/cmdline.txt` plus a
+          reboot — a state change, only when asked.) When it is true, check a
+          capped unit with `systemctl [--user] show -p
+          MemoryCurrent,MemoryHigh,MemoryMax <unit>` and its counters in
+          `/sys/fs/cgroup$(systemctl [--user] show -p ControlGroup --value
+          <unit>)/memory.events` (`high` = reclaim throttling, `max`/`oom_kill`
+          = hard-limit hits). `psi: true` makes `/proc/pressure/memory` (and a
+          cgroup's `memory.pressure`) the first measure of memory pressure:
+          stall time, which free memory alone does not show; `psi: false`
+          means those files are unavailable, so do not propose them.
+          `swappiness` is the live value and wins over whatever a file under
+          `/etc/sysctl.d` says (on Debian, `/etc/sysctl.conf` loads as
+          `99-sysctl.conf`, after most of them). `swap_kinds` and `zswap` say
+          what backs swap.
         - `hardware.cloud` (when present, e.g. aws|gcp|azure|oci) classifies the
           cloud platform from DMI — a platform fact, not identity. Use it to
           pick strategy: cloud VMs have network-attached storage (a full root

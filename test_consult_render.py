@@ -1169,6 +1169,77 @@ print(f"[sar] history fact: counts data files only, 0 when never collected, "
       f"empty when absent: {'OK' if ok_sar else f'FAIL {r_data} {r_none} {r_absent}'}")
 if not ok_sar: fails.append("sar-history")
 
+# 22) memory_policy: drives the real _gather_memory_policy_linux over fixture
+#     trees shaped like pibot's raw /sys and /proc. The Pi-OS-default case is
+#     the one that matters: limits configured, memory controller off.
+def _mp_fixture(files: dict[str, str]) -> tuple[str, dict[str, str]]:
+    base = _tf.mkdtemp()
+    for rel, body in files.items():
+        p = os.path.join(base, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(body)
+    paths = {k: os.path.join(base, k) for k in
+             ("cgroup", "proc/cgroups", "proc/pressure/memory",
+              "proc/sys/vm/swappiness", "proc/swaps", "zswap/enabled")}
+    os.makedirs(paths["cgroup"], exist_ok=True)
+    return base, paths
+
+_SWAPS_HDR = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"
+_mp_cases = {
+    # pibot after cgroup_enable=memory psi=1 (6.12: no memory row in /proc/cgroups)
+    "pibot": ({"cgroup/cgroup.controllers": "cpuset cpu io memory pids\n",
+               "proc/cgroups": "#subsys_name\thierarchy\tnum_cgroups\tenabled\n"
+                               "cpuset\t0\t116\t1\npids\t0\t116\t1\n",
+               "proc/pressure/memory": "some avg10=0.00 avg60=0.01 avg300=0.04 total=1\n"
+                                       "full avg10=0.00 avg60=0.01 avg300=0.04 total=1\n",
+               "proc/sys/vm/swappiness": "25\n",
+               "proc/swaps": _SWAPS_HDR
+                   + "/swapfile                               file\t\t4194288\t\t840704\t\t20\n"
+                   + "/dev/zram0                              partition\t2097148\t\t0\t\t100\n",
+               "zswap/enabled": "Y\n"},
+              {"cgroup": "v2", "cgroup_memory": True, "psi": True,
+               "swappiness": 25, "swap_kinds": ["file", "zram"], "zswap": True}),
+    # Raspberry Pi OS default: cgroup_disable=memory, PSI off, no swap
+    "pi-default": ({"cgroup/cgroup.controllers": "cpuset cpu io pids\n",
+                    "proc/swaps": _SWAPS_HDR},
+                   {"cgroup": "v2", "cgroup_memory": False, "psi": False}),
+    "hybrid": ({"cgroup/unified/cgroup.controllers": "\n",
+                "proc/cgroups": "#subsys_name\thierarchy\tnum_cgroups\tenabled\n"
+                                "memory\t4\t90\t1\n",
+                "zswap/enabled": "N\n"},
+               {"cgroup": "hybrid", "cgroup_memory": True, "psi": False,
+                "zswap": False}),
+    "v1-disabled": ({"proc/cgroups": "#subsys_name\thierarchy\tnum_cgroups\tenabled\n"
+                                     "memory\t0\t1\t0\n"},
+                    {"cgroup": "v1", "cgroup_memory": False, "psi": False}),
+}
+_mp_names = ("_CGROUP_ROOT", "_PROC_CGROUPS", "_PSI_MEMORY", "_SWAPPINESS",
+             "_PROC_SWAPS", "_ZSWAP_ENABLED")
+_mp_saved = {n: getattr(S, n) for n in _mp_names}
+_mp_bad: list = []
+try:
+    for _name, (_files, _want) in _mp_cases.items():
+        _base, _p = _mp_fixture(_files)
+        S._CGROUP_ROOT, S._PROC_CGROUPS = _p["cgroup"], _p["proc/cgroups"]
+        S._PSI_MEMORY, S._SWAPPINESS = _p["proc/pressure/memory"], _p["proc/sys/vm/swappiness"]
+        S._PROC_SWAPS, S._ZSWAP_ENABLED = _p["proc/swaps"], _p["zswap/enabled"]
+        _got = S._gather_memory_policy_linux()
+        if _got != _want:
+            _mp_bad.append((_name, _got))
+        __import__("shutil").rmtree(_base)
+finally:
+    for n, v in _mp_saved.items():
+        setattr(S, n, v)
+_mp_src = inspect.getsource(S.gather_host_facts)
+_mp_prompt = S.build_system_prompt({})
+ok_mp = (not _mp_bad and "_gather_memory_policy_linux" in _mp_src
+         and "memory_policy" in _mp_prompt
+         and "cgroup_memory: false" in _mp_prompt)
+print(f"[memory_policy] effective cgroup/PSI/swap state, limits-off case "
+      f"flagged: {'OK' if ok_mp else f'FAIL {_mp_bad}'}")
+if not ok_mp: fails.append("memory-policy")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)
