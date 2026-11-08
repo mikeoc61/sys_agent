@@ -613,6 +613,7 @@ class _ANSI:
     RED       = "\033[31m"
     GREEN     = "\033[32m"
     YELLOW    = "\033[33m"
+    MAGENTA   = "\033[35m"
     CYAN      = "\033[36m"
     BR_YELLOW = "\033[93m"
 
@@ -660,14 +661,15 @@ def cmd_label(t: str) -> str:  return _wrap(t, _ANSI.BOLD, _ANSI.BR_YELLOW)
 def banner(t: str) -> str:     return _wrap(t, _ANSI.BOLD, _ANSI.CYAN)
 def ask(t: str) -> str:        return _wrap(t, _ANSI.BOLD, _ANSI.CYAN)
 def user_tag(t: str) -> str:   return _wrap(t, _ANSI.BOLD, _ANSI.CYAN)
+def host_tag(t: str) -> str:   return _wrap(t, _ANSI.BOLD, _ANSI.MAGENTA)
 def agent_tag(t: str) -> str:  return _wrap(t, _ANSI.BOLD, _ANSI.GREEN)
 
 
 def short_model(model: str) -> str:
-    """Compact model label for the REPL prompt: strip a trailing -YYYYMMDD pin
+    """Compact model label for the agent> line: strip a trailing -YYYYMMDD pin
     (claude-haiku-4-5-20251001 -> claude-haiku-4-5). Current dateless IDs pass
     through unchanged. The startup banner keeps the full pinned ID; this only
-    keeps the per-line prompt tight."""
+    keeps the per-answer label tight."""
     return re.sub(r"-\d{8}$", "", model)
 
 
@@ -4333,17 +4335,16 @@ def run_repl(provider: Provider) -> None:
         if _update_check and (notice := _update_check.take()):
             print(warn(f"[{notice}]"))
         try:
-            # Prompt carries the active model (dim, bracketed) ahead of the
-            # bold-cyan you@host tag: it makes the current model visible at a
-            # glance, reflects a mid-session /model switch on the next turn
-            # (provider.model is read fresh here), and visually distinguishes
-            # the sys_agent prompt from a plain shell. Composed from colored
-            # segments and passed whole to colored_input(), which handles the
+            # SYS_AGENT@host> tag: SYS_AGENT and > bold cyan, @host bold
+            # magenta. The uppercase literal is what separates it from a
+            # shell's user@host prompt; neither color is the Debian/Pi PS1's
+            # bold green, cyan matches the approval prompt (cyan = waiting on
+            # you), and magenta is used nowhere else, so the host stands out.
+            # The model moved to the agent> line, where it labels who
+            # answered. Passed whole to colored_input(), which handles the
             # \001/\002 width markers (GNU readline) or prefix-print (libedit).
-            prompt = (
-                dim(f"[{short_model(provider.model)}] ")
-                + user_tag(f"you@{facts['node']}>") + " "
-            )
+            prompt = (user_tag("SYS_AGENT") + host_tag(f"@{facts['node']}")
+                      + user_tag(">") + " ")
             user_in = colored_input(prompt).strip()
         except EOFError:            
             print()
@@ -4860,8 +4861,11 @@ def run_repl(provider: Provider) -> None:
 
             if not turn.tool_calls:
                 if turn.text:
-                    # Prefix colored, body plain (per preference)
-                    print(f"\n{agent_tag('agent>')} {turn.text}\n")
+                    # Prefix colored, body plain (per preference). The dim
+                    # [model] names who answered; provider.model is read fresh
+                    # so a /model switch shows on the next answer.
+                    print(f"\n{dim(f'[{short_model(provider.model)}]')} "
+                          f"{agent_tag('agent>')} {turn.text}\n")
                 if turn.stop == STOP_TRUNCATED:
                     # Text-only answer cut at the cap: what arrived is shown
                     # and kept (valid history), flagged so the cut-off is

@@ -284,10 +284,10 @@ def check_deny_edit() -> None:
     turns = [{"text": "", "calls": [{"id": "c1", "args": {
         "command": "df -h", "explanation": "check disk"}}]}]
     out, recorded = run_repl_pty(turns, [
-        ("you@", "check disk\n"),
+        ("SYS_AGENT", "check disk\n"),
         ("Run? [y]es", "e\n"),
         ("edit>", "\x15rm -rf /\n"),              # C-u clears the prefill
-        ("you@", "/exit\n"),
+        ("SYS_AGENT", "/exit\n"),
     ])
     # The gate held only if the denied string never reached the spawn point.
     ok = ("[blocked]" in out and "REPL-EXITED-CLEANLY" in out
@@ -305,7 +305,7 @@ def check_tool_args() -> None:
         {"text": "", "calls": [{"id": "d1", "args": ["not", "a", "dict"]}]},
         {"text": "", "calls": [{"id": "d2", "args": {"command": 5}}]},
     ]
-    out, _ = run_repl_pty(turns, [("you@", "probe\n"), ("you@", "/exit\n")])
+    out, _ = run_repl_pty(turns, [("SYS_AGENT", "probe\n"), ("SYS_AGENT", "/exit\n")])
     ok = ("REPL-EXITED-CLEANLY" in out and "Traceback" not in out
           and "AttributeError" not in out and "api error" not in out)
     report("toolargs", ok, "(non-dict args + non-string command survived)")
@@ -320,7 +320,7 @@ def check_paste_block() -> None:
     the block that looks like a meta-command ("/exit") is content."""
     q = '"""'
     out, _ = run_repl_pty([], [
-        ("you@", f"{q}\npartial draft\n"),
+        ("SYS_AGENT", f"{q}\npartial draft\n"),
         ("... ", "\x03"),
         ("cancelled]", f"{q}\nline one\n  line two\n/exit\n{q}\n"),
         ('@USER@"line one', f"{q}hi there{q}\n"),
@@ -353,7 +353,7 @@ def check_meta_ctrl_c() -> None:
         "S.gather_host_facts = _slow_facts\n")
     t0 = time.monotonic()
     out, _ = run_repl_pty([], [
-        ("you@", "/facts refresh\n"),
+        ("SYS_AGENT", "/facts refresh\n"),
         ("@PROBING@", "\x03"),
         ("previous facts kept]", "/exit\n"),
     ], extra=extra)

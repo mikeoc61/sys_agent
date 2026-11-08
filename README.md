@@ -175,7 +175,9 @@ Other questions to try:
 - "How long has this computer been running?"
 - "Help me understand why this service keeps restarting."
 
-The prompt shows the AI model and the computer you are working on. When the AI
+You type at the `SYS_AGENT@<computer>>` prompt, which names the computer you
+are working on; it is not your normal shell prompt. Each answer starts with
+`[<AI model>] agent>`, so you can see which model replied. When the AI
 suggests a command, sys_agent shows the command, its reason, and the folder
 where it will run (`CWD`).
 
