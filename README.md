@@ -8,7 +8,7 @@ Use it to investigate problems, check disk space, understand running services,
 and maintain a Mac, Linux computer, or Raspberry Pi.
 
 <!-- BEGIN EXAMPLE -->
-![Example sys_agent session showing a question and a proposed command](assets/example-session.svg)
+![Example sys_agent session on a Raspberry Pi. At the SYS_AGENT@raspberrypi> prompt the user asks how much disk space is left. sys_agent shows the proposed command (df -h), its reason, and the folder it will run in, then asks "Run? [y]es / [n]o / [e]dit / [q]uit-workflow". After approval it shows the command output, and the answer, labelled "[claude-sonnet-5-5] agent>", summarizes the free space on each drive.](assets/example-session.png)
 <!-- END EXAMPLE -->
 
 [Why sys_agent](#why-sys_agent) · [Get started](#get-started) ·
