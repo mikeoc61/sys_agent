@@ -130,6 +130,23 @@ except Windows) as the inline block.
 > to building `pydantic-core` from source, and fails against PyO3's
 > supported-version ceiling.
 
+## API connection errors
+
+When an API connection fails after retries, sys_agent includes the underlying
+exception chain in the error message. The `Cause:` line can distinguish a DNS
+lookup failure, TLS certificate problem, connection reset, or timeout. A generic
+connection error alone does not establish a Wi-Fi power-saving problem.
+
+An `Invalid API request header` error can mean an exported key contains a
+newline or other invalid characters. Correct its shell export, or unset that
+variable so sys_agent can load the key from its env file. When extracting a key
+with `grep`, match `^OPENAI_API_KEY=` so comments mentioning the variable are
+excluded. Credential values are redacted from API error messages.
+
+If only one provider fails, save that error and the output of `/version` from
+the affected session. Another provider working confirms access to that provider,
+but does not rule out an endpoint-specific connection problem.
+
 ## Install a terminal shortcut
 
 The getting-started instructions run the script from its downloaded folder. To

@@ -261,7 +261,8 @@ for their names and settings.
 ## More help
 
 - **[Configuration reference](docs/configuration.md):** all settings, alternative
-  installation, file locations, and the optional terminal shortcut.
+  installation, file locations, API connection troubleshooting, and the optional
+  terminal shortcut.
 - **[Advanced usage](docs/advanced-usage.md):** all slash commands, choosing models,
   second opinions, thinking settings, and command history.
 - **[Technical reference](docs/technical-reference.md):** collected host information,

@@ -3672,13 +3672,37 @@ def select_provider() -> Provider:
 # REPL
 # -----------------------------------------------------------------------------
 
+def _redact_api_error(text: str) -> str:
+    """Transport errors can embed Authorization header bytes, including keys."""
+    for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY"):
+        value = os.environ.get(name, "")
+        if value:
+            for form in (value, repr(value)[1:-1]):
+                text = text.replace(form, "<redacted>")
+    text = re.sub(r"(?i)\bBearer\s+\S+", "Bearer <redacted>", text)
+    return re.sub(r"\bsk-[A-Za-z0-9_-]+", "<redacted>", text)
+
+
 def explain_api_error(e: Exception) -> str:
     """
     Turn a raw SDK exception into a short, actionable message. The SDK has
     already exhausted API_MAX_RETRIES by the time this is called, so these
     are persistent failures, not transient blips.
     """
-    s = str(e)
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    cause: BaseException | None = e
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        chain.append(cause)
+        cause = (cause.__cause__ if cause.__cause__ is not None else
+                 None if cause.__suppress_context__ else cause.__context__)
+    if any("illegal header value" in str(cause).lower() for cause in chain):
+        return ("Invalid API request header — check for newlines or other "
+                "invalid characters in API keys and custom headers. "
+                "Shell-exported variables override the env file; correct the "
+                "export or unset the malformed variable, then restart sys_agent.")
+    s = _redact_api_error(str(e))
     # status_code attribute is present on both SDKs' APIStatusError subclasses
     code = getattr(e, "status_code", None)
     # OpenAI's tools+reasoning 400 says "set reasoning_effort to 'none'", but
@@ -3708,9 +3732,22 @@ def explain_api_error(e: Exception) -> str:
     if code in (500, 502, 503, 504):
         return (f"Provider server error ({code}) — transient on their end. "
                 "Retries were exhausted; resend shortly.")
-    if "connection" in s.lower() or "timeout" in s.lower():
-        return ("Network error reaching the API — check connectivity "
-                "(the Pi's wlan0 power-save quirk can cause this).")
+    if (any(cls.__name__ in ("APIConnectionError", "APITimeoutError")
+            for cls in type(e).__mro__)
+            or any(word in s.lower() for word in
+                   ("connection", "timeout", "timed out"))):
+        # Both SDKs wrap transport exceptions. Keep the underlying DNS/TLS/
+        # socket error: the generic SDK message cannot identify the cause.
+        # Follow normal traceback chaining, guarding against exception cycles.
+        details: list[str] = []
+        for cause in chain:
+            detail = _redact_api_error(
+                f"{type(cause).__name__}: {cause}".rstrip(": "))
+            if not details or detail != details[-1]:
+                details.append(detail)
+        return ("Network error reaching the API — check DNS, TLS certificates, "
+                "proxy settings, and connectivity.\n"
+                "  Cause: " + " -> ".join(details))
     return s          # fall back to the raw message for anything unrecognized
 
 

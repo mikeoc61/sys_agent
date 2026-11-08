@@ -392,6 +392,49 @@ print(f"[apierr] unlisted-model warning hedges only on unknown window: "
 if not ok_x: fails.append("apierr-astra")
 if not ok_w: fails.append("unlisted-warning")
 
+# SDKs hide DNS/TLS/socket failures behind a generic connection error. These
+# stand-ins exercise traceback chaining without requiring either SDK.
+class APIConnectionError(Exception):
+    pass
+
+class APITimeoutError(APIConnectionError):
+    pass
+
+_net = APIConnectionError("Connection error.")
+_transport = RuntimeError("TLS connection failed")
+_tls = OSError("certificate verify failed")
+_net.__cause__ = _transport
+_transport.__cause__ = _tls
+_diagnostic = S.explain_api_error(_net)
+assert "certificate verify failed" in _diagnostic
+assert "wlan0" not in _diagnostic
+_transport.__cause__ = _net
+assert "TLS connection failed" in S.explain_api_error(_net)
+_timeout = APITimeoutError("Request timed out.")
+assert "Network error" in S.explain_api_error(_timeout)
+assert "APITimeoutError" in S.explain_api_error(_timeout)
+_net.__cause__ = None
+_net.__suppress_context__ = False
+_net.__context__ = OSError("Temporary failure in name resolution")
+assert "name resolution" in S.explain_api_error(_net)
+_net.__suppress_context__ = True
+assert "name resolution" not in S.explain_api_error(_net)
+assert "Authentication failed" in S.explain_api_error(_FakeAPIError("invalid", 401))
+assert "Rate limited" in S.explain_api_error(_FakeAPIError("limit", 429))
+print("[apierr] transport causes, timeouts, cycles, suppressed context: OK")
+
+_bad_key = "sk-proj-test-secret\n\"$OPENAI_API_KEY\""
+_net = APIConnectionError("Connection error.")
+_net.__cause__ = RuntimeError(f"Illegal header value {('Bearer ' + _bad_key).encode()!r}")
+_diagnostic = S.explain_api_error(_net)
+assert "Invalid API request header" in _diagnostic
+assert "Shell-exported" in _diagnostic
+assert "test-secret" not in _diagnostic
+_net.__cause__ = RuntimeError("Failed sending Bearer sk-proj-test-secret")
+assert "test-secret" not in S.explain_api_error(_net)
+assert "test-secret" not in S.explain_api_error(Exception("sk-proj-test-secret"))
+print("[apierr] malformed credential headers identified, credentials redacted: OK")
+
 # 15) reasoning_effort="none" routing through the real OpenAIProvider.chat().
 #     gpt-6-luna needs it or every tools turn 400s; gpt-6-astra must NOT get
 #     it (a bare "gpt-6" prefix would send it, turning Astra's translated
