@@ -117,6 +117,21 @@ startup prior). E.g. battery SoH passes; SoC fails.
   docs. Provider defaults change without notice.
 - Compiling is not proof; a behavioral test is.
 
+## Pi deploy
+Read by the personal `/pi-sync` skill (`~/.claude/skills/pi-sync`).
+- Checkout `~/projects/sys_agent` on pibot. `git pull` is the whole deploy:
+  sessions run the checkout through the uv symlink, and no service runs it.
+- Local and Pi checks: the Verification baseline. Then, on every deploy, the
+  hardware harness on pibot under both interpreters, reporting each RESULT
+  line and `[readline]` backend:
+  `cd ~/projects/sys_agent && ~/.local/bin/uv run --quiet test_hardware.py; python3 test_hardware.py`.
+- Then derive interactive checks from
+  `git diff $(git describe --tags --abbrev=0)..HEAD` and script them on
+  pibot (`test_hardware.run_repl_pty`, or a stdlib pty driver under
+  `uv run --python 3.13 sys_agent.py`). Never approve a command: answer any
+  approval prompt with `q`, point SYS_AUDIT_LOG at a temp copy, confirm no
+  audit record has a `returncode`, clean up /tmp.
+
 ## Git and release
 - Semver `vX.Y.Z`, annotated tags. Minor: new model support, new facts blocks.
   Patch: probe-list gaps, prompt-only, docs-only.
