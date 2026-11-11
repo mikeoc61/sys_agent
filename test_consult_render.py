@@ -457,13 +457,12 @@ def _sent_effort(model: str) -> object:
 #     Models dropped from the list (gpt-4o-mini, GPT-5.6) keep their window
 #     and, for GPT-5.6, the forced "none", so existing pins keep working.
 _want = {"gpt-6-luna": "none", "gpt-6-sol": "none", "gpt-5.6-luna": "none",
-         "gpt-5.6-terra": "none", "gpt-6-astra": None, "gpt-5.4-mini": None,
-         "gpt-4.1-nano": None}
+         "gpt-5.6-terra": "none", "gpt-6-astra": None, "gpt-5.4-mini": None}
 _eff = {m: _sent_effort(m) for m in _want}
 _listed = S.PROVIDER_MODELS["openai"]
 ok_eff = (_eff == _want
-          and _listed == ("gpt-4.1-nano", "gpt-5.4-mini", "gpt-6-luna",
-                          "gpt-6-sol")
+          and _listed == ("gpt-5.4-mini", "gpt-6-luna", "gpt-6-sol")
+          and "gpt-4.1-nano" not in S.CONTEXT_WINDOWS
           and all(m in S.CONTEXT_WINDOWS for m in
                   ("gpt-6-luna", "gpt-6-sol", "gpt-4o-mini", "gpt-5.6-luna",
                    "gpt-5.6-terra")))
@@ -508,6 +507,8 @@ _BIG, _SMALL = S.ANTHROPIC_THINKING_MAX_TOKENS, S.ANTHROPIC_MAX_TOKENS
 _ant_want = {
     ("claude-opus-5-5", False): (None, _BIG, True),
     ("claude-fable-5-1", False): (None, _BIG, True),
+    ("claude-fable-5-2", False): (None, _BIG, True),
+    ("claude-fable-5-2", True): ({"type": "adaptive"}, _BIG, True),
     ("claude-opus-5-5", True): ({"type": "adaptive"}, _BIG, True),
     ("claude-opus-5", False): ({"type": "disabled"}, _SMALL, False),
     ("claude-sonnet-5", False): ({"type": "disabled"}, _SMALL, False),
@@ -534,6 +535,8 @@ ok_ant = (_ant_got == _ant_want
           and S.thinking_status(_prov("claude-opus-5-5"), False)
               == "on (always on for claude-opus-5-5)"
           and S.thinking_active(_prov("claude-opus-5-5"), False)
+          and S.thinking_status(_prov("claude-fable-5-2"), False)
+              == "on (always on for claude-fable-5-2)"
           and S.thinking_status(_prov("claude-haiku-4-5-20251001"), False) == "off"
           and not S.thinking_active(_prov("claude-haiku-4-5-20251001"), False)
           and S.thinking_status(_prov("claude-sonnet-5-5"), False)
@@ -545,8 +548,8 @@ ok_ant = (_ant_got == _ant_want
           and all(v.get("type") in ("disabled", "between_tools") and len(v) == 1
                   for v in S._THINKING_OFF_PAYLOAD.values())
           and S.PROVIDER_MODELS["anthropic"] == (
-              "claude-haiku-4-5-20251001", "claude-haiku-5-5",
-              "claude-sonnet-5-5", "claude-opus-5-5")
+              "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
+          and "claude-haiku-4-5-20251001" in S.CONTEXT_WINDOWS
           and all(m in S.CONTEXT_WINDOWS for m in
                   S.PROVIDER_MODELS["anthropic"] + tuple(S._THINKING_OFF_PAYLOAD)
                   + tuple(S._THINKING_ALWAYS_ON_MODELS) + ("claude-opus-4-8",)))

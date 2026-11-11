@@ -80,7 +80,7 @@ uv run tools/live_probe.py
 uv run tools/live_probe.py sonnet55_off sonnet55_toggle
 ```
 
-It spends real tokens (about $0.13 for the five Anthropic checks, mostly Sonnet 5.5; the four DeepSeek checks are cents) but
+It spends real tokens (about $0.13 for the five Sonnet and Haiku checks, mostly Sonnet 5.5; about $0.50 for the three Fable 5.2 checks; the four DeepSeek checks are cents) but
 never executes a command: every `run_command` call is answered with canned
 output, so nothing runs on the host and the approval gate is not involved. It
 reads the API key the same way sys_agent does. Results go to
@@ -95,6 +95,15 @@ ships, add a check for its off form before adding it to `PROVIDER_MODELS`.
 The first run (2026-10-20, Pi, anthropic SDK 1.16.0) passed all five; Haiku
 5.5 cost about one seventh of Haiku 4.5 per session at similar latency,
 despite about 26% more tokens for the same system prompt.
+
+Three `fable52_*` checks cover Claude Fable 5.2, which cannot turn thinking
+off: with `/thinking off` no thinking field or effort is sent, but the turn is
+streamed at the thinking-sized cap and the state reads `on (always on ...)`;
+an on→off→on toggle; and a rollback, where the second turn is removed whole
+(what the REPL does on Ctrl-C or a refusal) before a third is sent. Fable 5.2
+rejects replayed thinking blocks if earlier history was edited, on every
+account, so the rollback check is what shows sys_agent's history handling is
+compatible. All three passed on the Pi on 2026-11-11 (anthropic SDK 1.17.0).
 
 Four `ds_*` checks cover DeepSeek and need `DEEPSEEK_API_KEY`: `deepseek-flash`
 thinking on, off, and an on(max)→off→on(low) toggle, plus the retired

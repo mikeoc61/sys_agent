@@ -36,7 +36,7 @@ Env:      OPENAI_API_KEY            (one of these is required)
           DEEPSEEK_API_KEY
           SYS_PROVIDER               (skip prompt: openai|anthropic|deepseek)
           SYS_OPENAI_MODEL           (default gpt-5.4-mini)
-          SYS_ANTHROPIC_MODEL        (default claude-haiku-4-5-20251001)
+          SYS_ANTHROPIC_MODEL        (default claude-haiku-5-5)
           SYS_DEEPSEEK_MODEL         (default deepseek-flash)
           SYS_ENV_FILE               (path to env file; overrides search)
           SYS_COLOR                  (on|off|auto, default auto)
@@ -139,7 +139,6 @@ from typing import Any
 # Default model per provider, overridable via env. Defaults favor dependable
 # tool calling at a sensible price tier; switch at runtime with /model.
 # OpenAI options (verified Sep 2026; prices per 1M tok, in/out):
-#   gpt-4.1-nano  — $0.10/$0.40, cheapest output, weakest tool use.
 #   gpt-5.4-mini  — $0.75/$4.50, reasons with tools on Chat Completions (no
 #                   forced effort), best tool use of the listed models. Default.
 #   gpt-6-luna    — $0.10/$0.50, GPT-6 low tier. Probe 2026-09-23: tool call ->
@@ -170,6 +169,10 @@ from typing import Any
 #   gpt-5.6-luna  — $0.20/$1.20; gpt-6-luna is cheaper, same constraints.
 #   gpt-5.6-terra — $2/$12; gpt-6-sol matches input, cheaper output.
 #   gpt-5.6-sol   — $5/$30; never listed (wrong tier for this tool).
+# Removed outright 2026-11-11 (list, window, and all): gpt-4.1-nano — OpenAI
+# shut it down 2026-10-23 (deprecations page), so no pin can work and a
+# window entry would only make a dead model look supported. gpt-6-luna is
+# the low-cost pick ($0.10/$0.50 vs nano's $0.10/$0.40).
 # gpt-6-astra — NOT USABLE HERE (probed 2026-09-23). Flagship, $10/$50. Chat
 # Completions rejects function tools with any reasoning effort, and unlike the
 # models above the "none" escape hatch is gone: the tools error says "set
@@ -185,8 +188,6 @@ from typing import Any
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"          # override: SYS_OPENAI_MODEL
 
 # Anthropic options (verified Oct 2026; prices per 1M tok, in/out):
-#   claude-haiku-4-5-20251001  — $1/$5, fast/cheap, solid tool use, legacy
-#                                enabled+budget_tokens thinking. Default.
 #   claude-haiku-5-5           — $0.10/$0.50, cache reads $0.01, for prompts
 #                                up to 100K tokens; $0.50/$2.50 above (whole
 #                                request, cache tokens counted). API 2026-10-07.
@@ -196,8 +197,11 @@ DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"          # override: SYS_OPENAI_MODEL
 #                                so it is in _THINKING_OFF_PAYLOAD. Server
 #                                default effort is medium. Accepts forced
 #                                tool_choice; rejects prefill and sampling
-#                                params (neither used here). Not yet the
-#                                default: pending acceptance testing.
+#                                params (neither used here). Default since
+#                                2026-11-11: live_probe haiku55_off/on
+#                                passed on the Pi 2026-10-20 and again
+#                                2026-11-11, at about one seventh of Haiku
+#                                4.5's cost per session.
 #   claude-sonnet-5-5          — $2/$10, cache reads $0.10 (0.05x; Sonnet 5:
 #                                $0.20). API 2026-09-28. Adaptive thinking runs
 #                                by DEFAULT; {"type":"disabled"} 400s. Its
@@ -227,6 +231,10 @@ DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"          # override: SYS_OPENAI_MODEL
 # Dropped from PROVIDER_MODELS (CONTEXT_WINDOWS entries and thinking-set
 # membership kept, so SYS_ANTHROPIC_MODEL pins and /model still work via the
 # prefix fallback):
+#   claude-haiku-4-5-20251001  — $1/$5; the default until 2026-11-11, when
+#                                Haiku 5.5 replaced it at a tenth of the
+#                                price. Legacy enabled+budget_tokens
+#                                thinking (_thinking_mode), 200K window.
 #   claude-sonnet-5            — $2/$10; Sonnet 5.5 has the same price and
 #                                half the cache-read rate (dropped 2026-10-20).
 #                                Thinking on by default; off is
@@ -249,7 +257,21 @@ DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"          # override: SYS_OPENAI_MODEL
 #                                _THINKING_ALWAYS_ON_MODELS). Fable 5.1 (API
 #                                2026-08-28) also rejects forced tool_choice.
 #                                CONTEXT_WINDOWS entries only.
-DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"   # override: SYS_ANTHROPIC_MODEL
+#   claude-fable-5-2           — $8/$40, cache reads $0.20 (API 2026-11-09).
+#                                Same surface as Fable 5.1: thinking ALWAYS
+#                                ON, server default effort high, rejects
+#                                forced tool_choice. Enforces the
+#                                history-editing check on replayed thinking
+#                                blocks for EVERY account (5.1: new accounts
+#                                only). The REPL passes it: its only edits
+#                                are whole-turn tail rollbacks, and a system
+#                                prompt change resets the conversation.
+#                                Probe 2026-11-11 (Pi, live_probe fable52_*):
+#                                no thinking field -> thinking blocks on
+#                                tool turns, replayed with no 400 across an
+#                                on/off toggle and after a turn rollback.
+#                                CONTEXT_WINDOWS and always-on entries only.
+DEFAULT_ANTHROPIC_MODEL = "claude-haiku-5-5"   # override: SYS_ANTHROPIC_MODEL
 
 # DeepSeek options (verified Oct 2026):
 #   deepseek-flash     — DeepSeek-V4.1-Flash (released 2026-09-10), new causal
@@ -310,7 +332,6 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 # less text even though the number is identical.
 CONTEXT_WINDOWS: dict[str, int] = {
     # OpenAI
-    "gpt-4.1-nano":  1_000_000,
     "gpt-5.4-mini":    400_000,
     # GPT-5.6 and GPT-6 — every tier ships 1.05M context / 128K max output.
     # Entries kept for models not in PROVIDER_MODELS (gpt-4o-mini, all of
@@ -327,9 +348,9 @@ CONTEXT_WINDOWS: dict[str, int] = {
     # Fable 5/5.1 all ship a 1M window (Models API max_input_tokens,
     # 2026-09-24; Sonnet/Haiku 5.5 per launch notes). Haiku 5.5 bills prompts
     # over 100K at a higher tier; the window itself is 1M. Haiku 4.5 remains
-    # 200K. Entries kept for models not in PROVIDER_MODELS below (sonnet-5,
-    # sonnet-4-6, opus-4-7/4-8/5, fable-5/5-1) so /model still shows correct
-    # context-% on a manual switch.
+    # 200K. Entries kept for models not in PROVIDER_MODELS below (haiku-4-5,
+    # sonnet-5, sonnet-4-6, opus-4-7/4-8/5, fable-5/5-1/5-2) so /model still
+    # shows correct context-% on a manual switch.
     "claude-haiku-4-5-20251001": 200_000,
     "claude-haiku-5-5":        1_000_000,
     "claude-sonnet-5-5":       1_000_000,
@@ -341,6 +362,7 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "claude-opus-5-5":         1_000_000,
     "claude-fable-5":          1_000_000,
     "claude-fable-5-1":        1_000_000,
+    "claude-fable-5-2":        1_000_000,
     # DeepSeek — V4.1 Flash and V4 Pro both ship a 1M window (Models API
     # context_window 1048576). deepseek-v4-flash is a legacy name the server
     # routes to V4.1 Flash; entry kept for existing pins.
@@ -356,13 +378,11 @@ CONTEXT_WINDOWS: dict[str, int] = {
 # work before this list is updated.
 PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
     "openai": (
-        "gpt-4.1-nano",
         "gpt-5.4-mini",
         "gpt-6-luna",
         "gpt-6-sol",
     ),
     "anthropic": (
-        "claude-haiku-4-5-20251001",
         "claude-haiku-5-5",
         "claude-sonnet-5-5",
         "claude-opus-5-5",
@@ -503,6 +523,7 @@ def _thinking_off_payload(model: str) -> dict[str, str] | None:
 # thinking_status()/thinking_active() report them as on either way.
 _THINKING_ALWAYS_ON_MODELS = frozenset({
     "claude-opus-5-5", "claude-fable-5", "claude-fable-5-1",
+    "claude-fable-5-2",
 })
 
 def _thinking_always_on(model: str) -> bool:

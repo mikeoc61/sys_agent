@@ -93,16 +93,23 @@ list on 2026-09-23. Each costs the same as or more than a GPT-6 replacement.
 A `SYS_OPENAI_MODEL` setting or `/model` switch that names one of them still
 works, with an unlisted-model warning.
 
+`gpt-4.1-nano` was removed on 2026-11-11. OpenAI shut it down on 2026-10-23,
+so a setting that still names it fails on the first question. Use
+`gpt-6-luna` as the low-cost option instead.
+
 On the Anthropic side, `claude-opus-5-5` ($4/$20) replaced `claude-opus-5` and
 `claude-opus-4-8` (both $5/$25) in the model list on 2026-09-24. Opus 5.5 can't
 turn thinking off (see [extended thinking](#extended-thinking)). On 2026-10-20,
 `claude-sonnet-5-5` replaced `claude-sonnet-5` (same $2/$10 price, half the
 cache-read rate), and `claude-haiku-5-5` was added ($0.10/$0.50 for prompts up
-to 100K tokens, $0.50/$2.50 above). The default stays
-`claude-haiku-4-5-20251001` until Haiku 5.5 passes acceptance testing. Existing
+to 100K tokens, $0.50/$2.50 above). On 2026-11-11 Haiku 5.5 became the default
+and `claude-haiku-4-5-20251001` ($1/$5) left the model list: Haiku 5.5 passed
+the live tool-loop checks at about one seventh of the cost per session. Existing
 `SYS_ANTHROPIC_MODEL` settings that name the older models keep working with the
-same warning. `claude-fable-5-1` is recorded but not listed: at $10/$50 it is
-priced for harder work than this tool needs.
+same warning. `claude-fable-5-1` ($10/$50) and `claude-fable-5-2` ($8/$40,
+released 2026-11-09) are recorded but not listed: they are priced for harder
+work than this tool needs. `/model claude-fable-5-2` works, with the
+unlisted-model warning, and is handled as an always-on thinking model.
 
 ## Multi-provider consult
 
@@ -249,10 +256,10 @@ automatically:
   Opus 5, with thinking disabled the model may occasionally phrase a proposed
   command as text rather than a tool call, so use `/thinking on` if you hit
   that.
-- **Anthropic always-on** (Opus 5.5, Fable 5 / 5.1): these models cannot turn
+- **Anthropic always-on** (Opus 5.5, Fable 5 / 5.1 / 5.2): these models cannot turn
   thinking off; the API rejects `disabled` with a 400. `/thinking off` therefore
   can't be honored. It only stops sys_agent from sending an effort level, so
-  the server default applies (`medium` on Opus 5.5). Displays say so: the state
+  the server default applies (`medium` on Opus 5.5, `high` on Fable). Displays say so: the state
   reads `on (always on for claude-opus-5-5)` instead of `off`. Because the model
   may still think, sys_agent uses the thinking-turn output cap and streaming for
   these models even when thinking is off. `/thinking on` sends your `/effort`

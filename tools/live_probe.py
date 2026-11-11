@@ -23,6 +23,14 @@ Checks:
   haiku55_off      claude-haiku-5-5, /thinking off: thinking=disabled, no effort.
   haiku55_on       claude-haiku-5-5, /thinking on (high): adaptive, streamed.
   haiku45_off      claude-haiku-4-5-20251001 baseline for token comparison.
+  fable52_off      claude-fable-5-2, /thinking off: always-on model, so NO
+                   thinking field and no effort, on the thinking-sized cap and
+                   streaming path; status reads "on (always on ...)".
+  fable52_toggle   claude-fable-5-2 on(low) -> off -> on(low) over one history.
+  fable52_rollback claude-fable-5-2: the second turn is rolled back whole (the
+                   REPL's Ctrl-C / refusal path, `del messages[turn_start:]`)
+                   and a third is sent. Fable 5.2 enforces the history-editing
+                   check on every account; a trailing removal must not 400.
   ds_flash_on      deepseek-flash, /thinking on (high): enabled+reasoning_effort
                    on every request; reasoning_content replays with no 400.
   ds_flash_off     deepseek-flash, /thinking off: thinking=disabled on every
@@ -171,7 +179,8 @@ def run_prompt(provider: S.Provider, messages: list[dict], system: str,
     raise RuntimeError(f"no final answer within {MAX_ITER} model calls")
 
 
-def session(model: str, phases: list[tuple[bool, str]], system: str) -> dict[str, Any]:
+def session(model: str, phases: list[tuple[bool, str]], system: str,
+            rollback_phase: int | None = None) -> dict[str, Any]:
     provider: S.Provider = S.DeepSeekProvider(model) if model.startswith("deepseek") \
         else S.AnthropicProvider(model)
     spy: Spy | DSSpy = DSSpy(provider) if model.startswith("deepseek") else Spy(provider)
@@ -179,8 +188,12 @@ def session(model: str, phases: list[tuple[bool, str]], system: str) -> dict[str
     log: list[dict] = []
     error = None
     try:
-        for prompt, (thinking, effort) in zip(PROMPTS, phases):
+        for i, (prompt, (thinking, effort)) in enumerate(zip(PROMPTS, phases)):
+            turn_start = len(messages)
             run_prompt(provider, messages, system, prompt, thinking, effort, log)
+            if i == rollback_phase:
+                # Same edit the REPL makes on Ctrl-C / refusal / stopped turn.
+                del messages[turn_start:]
     except Exception as e:
         error = f"{type(e).__name__}: {S.explain_api_error(e) if hasattr(S, 'explain_api_error') else e}"
         error += "\n" + traceback.format_exc(limit=3)
@@ -198,6 +211,21 @@ def expect_off(res: dict, payload: dict) -> list[str]:
             bad.append(f"req{i} output_config={r['output_config']}")
         if r["streamed"] or r["max_tokens"] != S.ANTHROPIC_MAX_TOKENS:
             bad.append(f"req{i} streamed={r['streamed']} max_tokens={r['max_tokens']}")
+    return bad
+
+
+def expect_always_on(res: dict, model: str) -> list[str]:
+    """Off-phase requests to an always-on model: nothing sent to steer
+    thinking, but sized and streamed as a thinking turn."""
+    bad = []
+    for i, r in enumerate(res["requests"]):
+        if r["thinking"] is not None or r["output_config"] is not None:
+            bad.append(f"req{i} thinking={r['thinking']} output_config={r['output_config']}")
+        if not r["streamed"] or r["max_tokens"] != S.ANTHROPIC_THINKING_MAX_TOKENS:
+            bad.append(f"req{i} streamed={r['streamed']} max_tokens={r['max_tokens']}")
+    want = f"on (always on for {model})"
+    if not all(t["status"] == want for t in res["turns"]):
+        bad.append(f"status line not {want!r}")
     return bad
 
 
@@ -246,6 +274,9 @@ def main() -> int:
         "haiku55_off": ("claude-haiku-5-5", [off, off, off]),
         "haiku55_on": ("claude-haiku-5-5", [(True, "high"), (True, "high"), (True, "high")]),
         "haiku45_off": ("claude-haiku-4-5-20251001", [off, off, off]),
+        "fable52_off": ("claude-fable-5-2", [off, off, off]),
+        "fable52_toggle": ("claude-fable-5-2", [(True, "low"), off, (True, "low")]),
+        "fable52_rollback": ("claude-fable-5-2", [off, off, off]),
         "ds_flash_on": ("deepseek-flash", [(True, "high")] * 3),
         "ds_flash_off": ("deepseek-flash", [off, off, off]),
         "ds_flash_toggle": ("deepseek-flash", [(True, "max"), off, (True, "low")]),
@@ -270,7 +301,8 @@ def main() -> int:
     for name in wanted:
         model, phases = checks[name]
         print(f"[{name}] {model} ...", flush=True)
-        res = session(model, phases, system)
+        res = session(model, phases, system,
+                      rollback_phase=1 if name == "fable52_rollback" else None)
         bad = check_common(res)
         if name == "sonnet55_off":
             bad += expect_off(res, {"type": "between_tools"})
@@ -284,6 +316,14 @@ def main() -> int:
             kinds = [(r["thinking"] or {}).get("type") for r in res["requests"]]
             if "between_tools" not in kinds or "adaptive" not in kinds:
                 bad.append(f"toggle did not exercise both modes: {kinds}")
+        elif name in ("fable52_off", "fable52_rollback"):
+            bad += expect_always_on(res, model)
+        elif name == "fable52_toggle":
+            kinds = [(r["thinking"] or {}).get("type") for r in res["requests"]]
+            if "adaptive" not in kinds or None not in kinds:
+                bad.append(f"toggle did not exercise both modes: {kinds}")
+            bad += [f"req{i} not streamed at the thinking cap" for i, r in enumerate(res["requests"])
+                    if not r["streamed"] or r["max_tokens"] != S.ANTHROPIC_THINKING_MAX_TOKENS]
         elif name == "haiku55_on":
             bad += [f"req{i} not adaptive+streamed" for i, r in enumerate(res["requests"])
                     if (r["thinking"] or {}).get("type") != "adaptive" or not r["streamed"]]
