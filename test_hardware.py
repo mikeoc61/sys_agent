@@ -166,6 +166,62 @@ def check_sigterm_ignorer() -> None:
     report("sigterm-ignorer", ok, f"(escalated to SIGKILL: {not alive(child)})")
 
 
+def check_stdin_detached() -> None:
+    """A command must not inherit the REPL's stdin. Under a pty, the way a
+    real session runs, the child used to see the terminal on fd 0 and `cat`
+    waited for keystrokes until the timeout. The driver gets a pty as stdin
+    so the result does not depend on how this harness itself was launched."""
+    driver = (
+        "import sys\n"
+        f"sys.path.insert(0, {HERE!r})\n"
+        "import sys_agent as S\n"
+        "S.COMMAND_TIMEOUT = 4\n"
+        "r = S.execute('[ -t 0 ] && echo TTY || echo NOTTY; cat; echo done')\n"
+        "print('RESULT', r.returncode, r.stdout.split())\n"
+    )
+    master, slave = pty.openpty()
+    start = time.monotonic()
+    proc = subprocess.Popen([sys.executable, "-c", driver], stdin=slave,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True)
+    os.close(slave)
+    try:
+        out, _ = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, _ = proc.communicate()
+    os.close(master)
+    elapsed = time.monotonic() - start
+    ok = "RESULT 0 ['NOTTY', 'done']" in out and elapsed < 3.5
+    report("stdin", ok, f"({out.strip()[-40:]!r} in {elapsed:.1f}s)")
+
+
+def check_output_cap() -> None:
+    """A command that never stops writing is stopped at the capture cap, not
+    buffered until the timeout, and its whole group goes with it."""
+    pidfile = tempfile.NamedTemporaryFile("r", suffix=".pid", delete=False)
+    pidfile.close()
+    saved = S.COMMAND_TIMEOUT, S.OUTPUT_CAPTURE_MAX_BYTES
+    S.COMMAND_TIMEOUT, S.OUTPUT_CAPTURE_MAX_BYTES = 6, 256 * 1024
+    start = time.monotonic()
+    try:
+        result = S.execute(
+            f"sleep 120 & echo $! > {pidfile.name}; yes sys_agent-cap-check")
+    finally:
+        S.COMMAND_TIMEOUT, S.OUTPUT_CAPTURE_MAX_BYTES = saved
+    elapsed = time.monotonic() - start
+    child = _wait_for_pid(pidfile.name, timeout=1.0)
+    time.sleep(0.8)
+    ok = (result.returncode == 125 and "OUTPUT LIMIT" in result.stderr
+          and len(result.stdout) <= 256 * 1024 and elapsed < 5
+          and child > 0 and not alive(child))
+    if child > 0 and alive(child):
+        os.kill(child, signal.SIGKILL)
+    report("output-cap", ok,
+           f"(rc={result.returncode}, kept {len(result.stdout)} chars in "
+           f"{elapsed:.1f}s, descendant reaped: {not alive(child)})")
+
+
 # -----------------------------------------------------------------------------
 # REPL under a pty, driven by a scripted provider
 # -----------------------------------------------------------------------------
@@ -543,6 +599,8 @@ def main() -> int:
     check_ctrl_c()
     check_timeout()
     check_sigterm_ignorer()
+    check_stdin_detached()
+    check_output_cap()
     check_deny_edit()
     check_tool_args()
     check_paste_block()

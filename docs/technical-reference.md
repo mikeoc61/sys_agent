@@ -365,6 +365,13 @@ Execution controls:
    group first — and returns to the prompt; it never ends the session. Under
    `/auto on` there is no per-command prompt, so Ctrl-C is the only way to
    break out of a run.
+   The command and reason are shown with every control character and
+   invisible Unicode format character (terminal escape sequences, carriage
+   returns, bidi overrides, zero-width characters) written out as `\xNN` /
+   `\uNNNN`, so a proposed command cannot erase or rewrite part of itself on
+   screen. A warning line says when escapes are present, and such a command
+   always gets the prompt, even under `/auto on`. Tabs and the newlines of a
+   multi-line command are shown as they are.
 2. **Local hard-deny list** (always-on). A short set of irrecoverable command
    patterns is blocked before the approval prompt is even shown. The model
    cannot disable this and `/auto on` cannot bypass it. Matching is
@@ -381,6 +388,15 @@ Execution controls:
    ignores SIGTERM (or outlives the shell that spawned it) is still cleaned
    up while it remains in that process group. Descendants that create a separate
    session or group are outside this cleanup mechanism.
+4. **No terminal input, bounded output.** A command's stdin is `/dev/null`,
+   so one that asks a question (`apt-get` without `-y`, `rm -i`) fails at once
+   instead of waiting unseen for keystrokes until the timeout. Captured output
+   is capped at 4 MB per stream; a command that writes more (`yes`, an
+   unbounded `journalctl`) is stopped the same way as a timeout and reports
+   exit `125`. The model receives at most 8,000 characters per stream: when
+   output is longer, the first and last 4,000 are kept and the middle is
+   replaced by a marker stating how much was cut, so the end of a log or a
+   failed build is never lost.
 
 Ahead of all three sits a **stop-reason guard** in the REPL loop. A reply
 that the API cut short (`stop_reason` `max_tokens` /
@@ -440,8 +456,8 @@ On by default. Each `run_command` the model proposes appends one JSON line to
 | `command` | always | the command the model proposed |
 | `explanation` | when given | the model's stated reason |
 | `edited_command` | `action=edit`, or `action=deny` for a blocked edit | the command as you rewrote it before running |
-| `returncode` | run/edit | process exit code (`124` = timeout) |
-| `truncated` | run/edit | whether output to the model was clipped at `OUTPUT_MAX_CHARS` |
+| `returncode` | run/edit | process exit code (`124` = timeout, `125` = output limit) |
+| `truncated` | run/edit | whether output to the model was clipped to `OUTPUT_MAX_CHARS` (head and tail kept) |
 | `reason` | `action=deny` | which hard-deny rule matched (on the proposed command, or on your edit) |
 | `note` | as needed | e.g. `interrupted (workflow stopped)` |
 | `stdout` / `stderr` | only with `SYS_AUDIT_BODY=on` | command output, capped at `OUTPUT_MAX_CHARS` |

@@ -112,6 +112,7 @@ import sys
 import textwrap
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 import itertools
@@ -431,8 +432,17 @@ def _default_env_candidates() -> list[str]:
         "~/.sys_agent.env",                  # home dotfile fallback
     ]
 
-# How much subprocess output to forward back to the model (chars).
+# How much subprocess output to forward back to the model (chars, per
+# stream). Longer output keeps its head AND tail (see CmdResult): the end of
+# a log or a failed build is usually where the error is.
 OUTPUT_MAX_CHARS = 8000
+
+# Hard cap on what execute() holds in memory per stream (bytes). The model
+# cap above is applied only after the command ends, so without this a
+# command that never stops writing (`yes`, an unbounded journalctl) grew the
+# buffer for the whole COMMAND_TIMEOUT: gigabytes on a Pi. Past the cap the
+# process group is stopped and the command reports exit 125.
+OUTPUT_CAPTURE_MAX_BYTES = 4 * 1024 * 1024
 
 # Per-command wall-clock timeout (seconds). Override with SYS_COMMAND_TIMEOUT.
 # Default raised to 120s so package upgrades on slower hosts (e.g. a Pi) are
@@ -684,6 +694,37 @@ def ask(t: str) -> str:        return _wrap(t, _ANSI.BOLD, _ANSI.CYAN)
 def user_tag(t: str) -> str:   return _wrap(t, _ANSI.BOLD, _ANSI.CYAN)
 def host_tag(t: str) -> str:   return _wrap(t, _ANSI.BOLD, _ANSI.MAGENTA)
 def agent_tag(t: str) -> str:  return _wrap(t, _ANSI.BOLD, _ANSI.GREEN)
+
+
+def visible(text: str, newlines: bool = True) -> tuple[str, int]:
+    """(display form, hidden-character count) for model- or log-supplied text
+    shown where the user makes a decision.
+
+    The approval prompt is the security gate, so what it shows must be what
+    runs. Printed raw, a proposed command can carry terminal control
+    sequences (ESC[2K + CR erases the line it was just printed on) or
+    Unicode format characters (bidi overrides, zero-width) that make the
+    displayed text differ from the string handed to the shell. Every control
+    (Cc), format (Cf) and line/paragraph-separator character is rendered as
+    a visible \\xNN / \\uNNNN escape instead. Tab stays, and newline stays
+    when `newlines` is true: a multi-line command (heredoc) is legitimate and
+    displays honestly. The count lets the caller say that escapes are
+    present, since a typed literal backslash-x looks the same.
+    """
+    out: list[str] = []
+    hidden = 0
+    for ch in text:
+        if ch == "\t" or (ch == "\n" and newlines):
+            out.append(ch)
+        elif unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp"):
+            hidden += 1
+            code = ord(ch)
+            out.append(f"\\x{code:02x}" if code <= 0xff
+                       else f"\\u{code:04x}" if code <= 0xffff
+                       else f"\\U{code:08x}")
+        else:
+            out.append(ch)
+    return "".join(out), hidden
 
 
 def short_model(model: str) -> str:
@@ -1113,9 +1154,10 @@ def render_history(path: str, limit: int | None) -> str | None:
             tag = fail(" [aborted]")
         rc_str = fail(f" (exit {rc})") if rc not in (None, 0) else ""
 
-        line = f"{i:>{width}}.  {dim(tm)}  {cmd_label(cmd)}{tag}{rc_str}"
+        line = (f"{i:>{width}}.  {dim(tm)}  "
+                f"{cmd_label(visible(cmd)[0])}{tag}{rc_str}")
         if why:
-            line += f"  {dim('— ' + why)}"
+            line += f"  {dim('— ' + visible(why, newlines=False)[0])}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -2677,13 +2719,25 @@ class CmdResult:
     stderr: str
     truncated: bool = False
 
+    @staticmethod
+    def _clip(text: str, stream: str) -> tuple[str, bool]:
+        """Fit `text` to OUTPUT_MAX_CHARS by cutting the MIDDLE. Head-only
+        truncation dropped exactly the part a log or a failed build puts
+        last, so the model reasoned from the preamble and never saw the
+        error. The marker states how much is missing so the model can ask
+        for a narrower read instead of assuming it saw everything."""
+        if len(text) <= OUTPUT_MAX_CHARS:
+            return text, False
+        head = OUTPUT_MAX_CHARS // 2
+        tail = OUTPUT_MAX_CHARS - head
+        omitted = len(text) - head - tail
+        return (f"{text[:head]}\n...[{stream} truncated: {omitted} chars "
+                f"omitted from the middle]...\n{text[-tail:]}"), True
+
     def as_tool_payload(self) -> str:
-        out, err = self.stdout, self.stderr
-        if len(out) > OUTPUT_MAX_CHARS:
-            out = out[:OUTPUT_MAX_CHARS] + "\n...[stdout truncated]"
-            self.truncated = True
-        if len(err) > OUTPUT_MAX_CHARS:
-            err = err[:OUTPUT_MAX_CHARS] + "\n...[stderr truncated]"
+        out, cut_out = self._clip(self.stdout, "stdout")
+        err, cut_err = self._clip(self.stderr, "stderr")
+        if cut_out or cut_err:
             self.truncated = True
         return json.dumps({
             "returncode": self.returncode,
@@ -2822,10 +2876,23 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
     print()
     print(dim("─" * 72))
     # Command body stays plain (per preference); only the label is loud.
-    print(f"{cmd_label('COMMAND:')}  {cmd}")
-    print(f"REASON:   {explanation}")
+    # Shown through visible(): the string below is what the user approves, so
+    # it must not be able to hide or rewrite itself on the terminal.
+    shown_cmd, hidden = visible(cmd)
+    print(f"{cmd_label('COMMAND:')}  {shown_cmd}")
+    print(f"REASON:   {visible(explanation, newlines=False)[0]}")
     print(dim(f"CWD:      {os.getcwd()}"))
     print(dim("─" * 72))
+    if hidden:
+        print(warn_bold(
+            f"[warning: this command contains {hidden} control or invisible "
+            "character(s), shown above as \\xNN / \\uNNNN escapes; it would "
+            "run with the real characters]"))
+        if auto:
+            # Auto-approve skips the human read that the escapes exist for,
+            # so a command carrying them falls back to the prompt.
+            print(warn("[auto-approve on, but not applied to this command]"))
+            auto = False
     if auto:
         print(warn("[auto-approve on] running."))
         return "run", None
@@ -2931,25 +2998,102 @@ def _terminate_group(proc: subprocess.Popen) -> None:
         pass
 
 
+def _decode_output(data: bytes) -> str:
+    """Bytes -> text the way text-mode pipes did (locale encoding, universal
+    newlines), except that undecodable bytes are replaced: a strict decode
+    turned any binary output into an "exec error" with nothing shown."""
+    text = data.decode(errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def execute(cmd: str) -> CmdResult:
+    """Run one approved command in its own session and return its result.
+
+    stdin is /dev/null. Inherited, it was the REPL's terminal: the new
+    session has no controlling tty, so nothing stops the child reading it,
+    and a command that asked a question (`apt-get` without -y, `rm -i`)
+    waited unseen behind the spinner until the timeout while consuming the
+    user's keystrokes. With /dev/null such a command gets EOF and fails at
+    once, which the model can see and correct.
+
+    Output is read by one thread per stream into buffers capped at
+    OUTPUT_CAPTURE_MAX_BYTES. The threads keep draining past the cap so the
+    child never blocks on a full pipe; the main thread sees the overflow and
+    stops the group. As with communicate(), the command is done only when
+    both pipes reach EOF and the shell has exited, so a backgrounded
+    descendant holding a pipe still runs into COMMAND_TIMEOUT.
+    """
     try:
         proc = subprocess.Popen(
             cmd, shell=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True,
         )
     except Exception as e:                  # noqa: BLE001
         return CmdResult(cmd, 1, "", f"exec error: {e}")
-    try:
-        out, err = proc.communicate(timeout=COMMAND_TIMEOUT)
-        return CmdResult(cmd, proc.returncode, out, err)
-    except subprocess.TimeoutExpired:
-        _terminate_group(proc)
+
+    cap = OUTPUT_CAPTURE_MAX_BYTES
+    overflow = threading.Event()
+
+    def pump(pipe: Any, buf: bytearray) -> None:
         try:
-            out, err = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            out, err = "", ""
-        return CmdResult(cmd, 124, out or "", f"TIMEOUT after {COMMAND_TIMEOUT}s")
+            while chunk := pipe.read1(65536):
+                room = cap - len(buf)
+                if room > 0:
+                    buf.extend(chunk[:room])
+                if len(chunk) > room:
+                    overflow.set()
+        except (OSError, ValueError):
+            pass
+
+    out_buf, err_buf = bytearray(), bytearray()
+    pumps = [
+        threading.Thread(target=pump, args=(proc.stdout, out_buf),
+                         name="exec-stdout", daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, err_buf),
+                         name="exec-stderr", daemon=True),
+    ]
+    for t in pumps:
+        t.start()
+
+    def collect() -> tuple[str, str]:
+        # After a kill the pipes close and the pumps finish; bounded in case
+        # a process that left the group still holds one open (the daemon
+        # thread is then abandoned, with whatever it had read so far).
+        for t in pumps:
+            t.join(timeout=5)
+        if not any(t.is_alive() for t in pumps):
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except (OSError, ValueError):
+                    pass
+        return _decode_output(bytes(out_buf)), _decode_output(bytes(err_buf))
+
+    deadline = time.monotonic() + COMMAND_TIMEOUT
+    stopped = ""                            # "" | "timeout" | "overflow"
+    try:
+        while any(t.is_alive() for t in pumps):
+            if overflow.is_set():
+                stopped = "overflow"
+                break
+            if time.monotonic() >= deadline:
+                stopped = "timeout"
+                break
+            pumps[0].join(0.05)
+            pumps[1].join(0.05)
+        if not stopped:
+            if overflow.is_set():           # crossed the cap on its last write
+                stopped = "overflow"
+            else:
+                try:
+                    proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    stopped = "timeout"
+        if stopped:
+            _terminate_group(proc)
+        out, err = collect()
     except KeyboardInterrupt:
         # Kill the group before unwinding so Ctrl-C never orphans a command.
         _terminate_group(proc)
@@ -2957,6 +3101,13 @@ def execute(cmd: str) -> CmdResult:
     except Exception as e:                  # noqa: BLE001
         _terminate_group(proc)
         return CmdResult(cmd, 1, "", f"exec error: {e}")
+    if stopped == "timeout":
+        return CmdResult(cmd, 124, out, f"TIMEOUT after {COMMAND_TIMEOUT}s")
+    if stopped == "overflow":
+        return CmdResult(cmd, 125, out, (
+            f"OUTPUT LIMIT: the command wrote more than {cap} bytes and was "
+            "stopped. Narrow it (head, tail, grep, -n, --since) and rerun."))
+    return CmdResult(cmd, proc.returncode, out, err)
 
 
 # -----------------------------------------------------------------------------
@@ -4193,9 +4344,9 @@ def print_consult(
         print(dim(f"reference — {active.name}/{active.model} {moment}")
               + _cmd_count_suffix(len(reference)) + dim(":"))
         for c, why in reference:
-            print(f"  {cmd_label(c)}")
+            print(f"  {cmd_label(visible(c)[0])}")
             if why:
-                print(f"  {dim('— ' + why)}")
+                print(f"  {dim('— ' + visible(why, newlines=False)[0])}")
     else:
         if ref_aborted:
             print(dim(f"reference — {active.name}/{active.model} was aborted "
@@ -4229,9 +4380,9 @@ def print_consult(
         if cmds:
             for c, why in cmds:
                 tag = ok("  [matches reference]") if _norm_cmd(c) in ref_norm else ""
-                print(f"  {cmd_label(c)}{tag}")
+                print(f"  {cmd_label(visible(c)[0])}{tag}")
                 if why:
-                    print(f"  {dim('— ' + why)}")
+                    print(f"  {dim('— ' + visible(why, newlines=False)[0])}")
         if turn.text.strip():
             body = turn.text.strip()
             if len(body) > 600:
@@ -4914,7 +5065,7 @@ def run_repl(provider: Provider) -> None:
                 deny = is_denied(cmd)
                 if deny:
                     # blocked tag loud; command body and reason in normal red
-                    print(f"\n{err_bold('[blocked]')} {cmd}")
+                    print(f"\n{err_bold('[blocked]')} {visible(cmd)[0]}")
                     print(fail(f"   reason: {deny}"))
                     results.append((tc.id, json.dumps({"error": f"blocked locally: {deny}"})))
                     audit("deny", cmd, explanation=why, reason=deny)
@@ -4941,7 +5092,7 @@ def run_repl(provider: Provider) -> None:
                     # an otherwise always-on backstop.
                     deny = is_denied(to_run)
                     if deny:
-                        print(f"\n{err_bold('[blocked]')} {to_run}")
+                        print(f"\n{err_bold('[blocked]')} {visible(to_run)[0]}")
                         print(fail(f"   reason: {deny}"))
                         results.append((tc.id, json.dumps(
                             {"error": f"blocked locally (edited command): {deny}"})))
@@ -4949,7 +5100,7 @@ def run_repl(provider: Provider) -> None:
                               edited=to_run, reason=deny)
                         continue
                     # tag colored, edited command body plain
-                    print(f"{warn('[running edited]:')} {to_run}")
+                    print(f"{warn('[running edited]:')} {visible(to_run)[0]}")
 
                 try:
                     with Activity("running"):
