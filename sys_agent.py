@@ -566,6 +566,30 @@ _THINKING_ALWAYS_ON_MODELS = frozenset({
 def _thinking_always_on(model: str) -> bool:
     return model in _THINKING_ALWAYS_ON_MODELS
 
+def _thinking_unverified(model: str) -> bool:
+    """True for an Anthropic model this file knows nothing about: one reached
+    through the "claude-" prefix fallback (/model or a SYS_ANTHROPIC_MODEL
+    pin) that has no CONTEXT_WINDOWS entry. Every model whose thinking
+    behavior has been checked has one.
+
+    Such a model is usually a new release, and every release since Sonnet 5
+    thinks when no thinking field is sent; some cannot stop. Handled as a
+    plain no-thinking model it got the 4096-token cap and the non-streaming
+    call, so if it did think, a hard turn was truncated with nothing to say
+    why (the Fable 5.2 gap the model monitor flagged before v1.29.0). With
+    thinking off it therefore gets the always-on shape: no thinking field (no
+    off form is known, and a wrong one 400s), the thinking-turn cap, and
+    streaming. That shape is valid whether or not the model thinks; the cap
+    bills only for tokens produced. Legacy-named models (_thinking_mode
+    "enabled") are excluded: that generation does not think by default.
+    """
+    return model not in CONTEXT_WINDOWS and _thinking_mode(model) == "adaptive"
+
+def _thinking_headroom(model: str) -> bool:
+    """Whether a thinking-off turn must still be sized and streamed for
+    thinking: the model cannot stop (always-on) or might not (unverified)."""
+    return _thinking_always_on(model) or _thinking_unverified(model)
+
 # SDK-level retry count. Both the openai and anthropic SDKs implement
 # exponential backoff with jitter and honor Retry-After headers; they retry
 # on 408/409/429 and 5xx (including Anthropic's 529 overloaded_error).
@@ -3521,11 +3545,12 @@ class AnthropicProvider(Provider):
                 kwargs["extra_headers"] = {
                     "anthropic-beta": ANTHROPIC_INTERLEAVED_BETA
                 }
-        elif _thinking_always_on(self.model):
+        elif _thinking_headroom(self.model):
             # Opus 5.5 / Fable 5.x: no way to disable thinking (disabled 400s).
             # Send no thinking field and no effort (server default applies),
             # but size and stream the turn for thinking — see
-            # _THINKING_ALWAYS_ON_MODELS.
+            # _THINKING_ALWAYS_ON_MODELS. An unlisted model gets the same
+            # shape, since it may think by default (_thinking_unverified).
             kwargs["max_tokens"] = ANTHROPIC_THINKING_MAX_TOKENS
         elif (off := _thinking_off_payload(self.model)) is not None:
             # Sonnet 5 / Opus 5 / Haiku 5.5 / Sonnet 5.5 think by default when
@@ -3551,7 +3576,7 @@ class AnthropicProvider(Provider):
             # /thinking or /effort change re-writes the messages cache once.
             kwargs.setdefault("extra_body", {})["cache_control"] = {
                 "type": "ephemeral"}
-        if thinking or _thinking_always_on(self.model):
+        if thinking or _thinking_headroom(self.model):
             # A thinking turn raises max_tokens high enough that the SDK's
             # non-streaming guard refuses the request (it estimates worst-case
             # duration from max_tokens and blocks anything that could exceed
@@ -3988,6 +4013,9 @@ def unlisted_model_warning(provider_name: str, model: str) -> str:
     """
     tail = ("" if model in CONTEXT_WINDOWS
             else "; context-% may be unavailable")
+    if provider_name == "anthropic" and _thinking_unverified(model):
+        tail += ("; its thinking default is unverified, so /thinking off "
+                 "may not stop it")
     return (f"[warning: {model!r} is not a known {provider_name} model — "
             f"switching anyway{tail}]")
 
@@ -4013,6 +4041,9 @@ def thinking_status(provider: Provider, flag: bool) -> str:
     if (not flag and provider.name == "anthropic"
             and _thinking_always_on(provider.model)):
         return f"on (always on for {provider.model})"
+    if (not flag and provider.name == "anthropic"
+            and _thinking_unverified(provider.model)):
+        return f"off (unverified for {provider.model}: it may think by default)"
     if not flag:
         off = (_thinking_off_payload(provider.model)
                if provider.name == "anthropic" else None)

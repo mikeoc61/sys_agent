@@ -278,6 +278,18 @@ automatically:
   these models even when thinking is off. `/thinking on` sends your `/effort`
   level as usual, so on Opus 5.5 `/thinking on` with `/effort low` can cost
   *less* than "off", which runs at `medium`.
+- **Anthropic models sys_agent does not know** (a `claude-` name it has no
+  record of, reached with `/model` or `SYS_ANTHROPIC_MODEL`, usually a new
+  release): recent Claude models think unless told not to, and the way to turn
+  thinking off differs per model, so sys_agent cannot assume `/thinking off`
+  works. It sends no thinking setting and uses the thinking-turn output cap and
+  streaming, the same as for an always-on model, so a reply is not cut short if
+  the model does think. The state reads
+  `off (unverified for <model>: it may think by default)`, and the
+  unlisted-model warning says the same. `/thinking on` works as on any current
+  model. Checked 2026-11-16 by sending this request shape to Haiku 5.5 and
+  Sonnet 5.5 as if they were unknown: both thought, and both sessions
+  completed.
 - **Anthropic legacy** (Haiku 4.5 and older): use a fixed `budget_tokens` budget
   (`SYS_THINKING_BUDGET`) plus the interleaved-thinking beta header so reasoning
   can span tool calls. Effort does not apply here.

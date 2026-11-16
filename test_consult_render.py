@@ -523,6 +523,13 @@ _ant_want = {
     ("claude-sonnet-5-5", False): ({"type": "between_tools"}, _SMALL, False),
     ("claude-sonnet-5-5", True): ({"type": "adaptive"}, _BIG, True),
     ("claude-haiku-4-5-20251001", False): (None, _SMALL, False),
+    # Unlisted models (no CONTEXT_WINDOWS entry). A new release may think by
+    # default, so thinking-off must use the always-on shape; treated as a
+    # plain model it got (None, 4096, False) and truncated if it thought.
+    ("claude-opus-6", False): (None, _BIG, True),
+    ("claude-opus-6", True): ({"type": "adaptive"}, _BIG, True),
+    # ...except legacy-named ones, which do not think by default.
+    ("claude-haiku-4-5", False): (None, _SMALL, False),
 }
 def _ant_off_kwargs(model: str) -> dict:
     p = _mk(S.AnthropicProvider, "anthropic", model)
@@ -583,6 +590,16 @@ ok_ant = (_ant_got == _ant_want
               .startswith("off (between_tools")
           and not S.thinking_active(_prov("claude-sonnet-5-5"), False)
           and S.thinking_status(_prov("claude-haiku-5-5"), False) == "off"
+          and S.thinking_status(_prov("claude-opus-6"), False)
+              == "off (unverified for claude-opus-6: it may think by default)"
+          and S.thinking_status(_prov("claude-opus-6"), True) == "on"
+          and "thinking default is unverified"
+              in S.unlisted_model_warning("anthropic", "claude-opus-6")
+          and "unverified" not in S.unlisted_model_warning(
+              "anthropic", "claude-fable-5-2")
+          and "unverified" not in S.unlisted_model_warning(
+              "openai", "gpt-9-nova")
+          and not any(S._thinking_unverified(m) for m in S.CONTEXT_WINDOWS)
           and ok_bt
           and not (S._THINKING_ALWAYS_ON_MODELS & set(S._THINKING_OFF_PAYLOAD))
           and all(v.get("type") in ("disabled", "between_tools") and len(v) == 1
