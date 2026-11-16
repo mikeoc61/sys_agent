@@ -3205,6 +3205,12 @@ def stop_notice(turn: "ChatTurn") -> str:
 class Provider:
     name: str = ""
     model: str = ""
+    # Whether chat() may ask the API to cache the conversation as it grows
+    # (Anthropic only; other providers cache on their own or not at all).
+    # True for the live session, whose every request extends the last one.
+    # /consult turns it off on its one-shot providers: their transcript is
+    # sent once, so a cache write there is a surcharge nothing reads back.
+    cache_conversation: bool = True
 
     def initial_messages(self, system: str) -> list[dict]:
         raise NotImplementedError
@@ -3474,7 +3480,10 @@ class AnthropicProvider(Provider):
         # (instructions + host-facts JSON) is identical every turn, so
         # marking it with cache_control lets Anthropic bill cache reads at
         # ~10% of input rate after the first call. Cache TTL is 5 min,
-        # refreshed on each hit — fine for an interactive session.
+        # refreshed on each hit — fine for an interactive session. This
+        # explicit marker is the read point that survives anything that
+        # happens later in `messages` (a rollback, a /thinking toggle); the
+        # conversation itself is cached separately below.
         system_blocks = [{
             "type": "text",
             "text": system,
@@ -3525,6 +3534,23 @@ class AnthropicProvider(Provider):
             # rationale above. No effort is sent: every off form 400s at
             # xhigh|max, and the server default is high or below.
             kwargs["extra_body"] = {"thinking": dict(off)}
+        if self.cache_conversation:
+            # Automatic caching: a top-level cache_control makes the API put
+            # a breakpoint on the last cacheable block of each request and
+            # move it forward as the conversation grows. Without it only the
+            # system prompt was cached, so every iteration of the tool loop
+            # re-billed the whole history (each command's output included)
+            # at the full input rate. Now the prior history reads back at
+            # the cache rate and only the new tail is written. It takes one
+            # of the four breakpoint slots (the system marker is the other)
+            # and shares that marker's 5-minute TTL, which the API requires
+            # to be no longer than the one before it. Via extra_body like
+            # the thinking fields, so the SDK floor need not know the param.
+            # A rollback only drops the tail: the next request's breakpoint
+            # looks back up to 20 positions and finds the earlier entry. A
+            # /thinking or /effort change re-writes the messages cache once.
+            kwargs.setdefault("extra_body", {})["cache_control"] = {
+                "type": "ephemeral"}
         if thinking or _thinking_always_on(self.model):
             # A thinking turn raises max_tokens high enough that the SDK's
             # non-streaming guard refuses the request (it estimates worst-case
@@ -4444,7 +4470,7 @@ def run_repl(provider: Provider) -> None:
     show_tokens = False                  # /tokens on|off
     thinking_enabled = ANTHROPIC_THINKING_DEFAULT   # /thinking on|off
     effort = ANTHROPIC_THINKING_EFFORT_DEFAULT       # /effort low..max (adaptive)
-    session_in = 0                       # cumulative input tokens this session
+    session_in = 0                       # cumulative prompt tokens (cached incl.)
     session_out = 0                      # cumulative output tokens this session
     last_usage = Usage()                 # token usage from most recent call
     ctx_window = CONTEXT_WINDOWS.get(provider.model)   # may be None
@@ -4916,6 +4942,7 @@ def run_repl(provider: Provider) -> None:
 
             def consult_one(name: str) -> tuple[str, str, Any]:
                 p = make_provider(name)
+                p.cache_conversation = False    # one-shot: see Provider
                 rendered = render(p, trimmed, system)
                 turn = p.chat(rendered, system,
                               thinking=thinking_enabled, effort=effort)
@@ -5015,7 +5042,14 @@ def run_repl(provider: Provider) -> None:
 
             # Accumulate token usage from this API call
             last_usage = turn.usage
-            session_in += last_usage.input_tokens
+            # Whole prompt, cached tokens included. Anthropic's input_tokens
+            # is only the uncached remainder, a handful of tokens per call
+            # once the conversation is cached, so summing it made the
+            # session total read near zero there while OpenAI's
+            # prompt_tokens counted everything. The per-turn line still
+            # breaks out in / cache read / cache write, which bill
+            # differently.
+            session_in += last_usage.context_tokens
             session_out += last_usage.output_tokens
             if show_tokens:
                 print(fmt_tokens(last_usage))

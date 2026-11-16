@@ -111,6 +111,7 @@ class Spy:
             "max_tokens": kw.get("max_tokens"),
             "streamed": streamed,
             "n_messages": len(kw.get("messages", [])),
+            "cache_control": eb.get("cache_control"),
         })
 
 
@@ -252,6 +253,24 @@ def expect_ds(res: dict, modes: list[str]) -> list[str]:
     return bad
 
 
+def expect_cache(res: dict) -> list[str]:
+    """Conversation caching on a session whose thinking settings never change:
+    every request asks for it, and from the second model call on the cache
+    read covers (nearly) the whole previous request, i.e. the history is no
+    longer re-billed at the input rate. 0.9 leaves room for blocks the API
+    does not cache verbatim; a system-prompt-only cache reads a constant
+    amount and fails this as the conversation grows."""
+    bad = [f"req{i} sent no cache_control" for i, r in enumerate(res["requests"])
+           if r.get("cache_control") != {"type": "ephemeral"}]
+    turns = res["turns"]
+    for i in range(1, len(turns)):
+        prev = turns[i - 1]["in"] + turns[i - 1]["cache_read"] + turns[i - 1]["cache_write"]
+        if turns[i]["cache_read"] < 0.9 * prev:
+            bad.append(f"call{i} cache_read={turns[i]['cache_read']} < 90% of "
+                       f"previous prompt ({prev})")
+    return bad
+
+
 def check_common(res: dict, min_tool_rounds: int = 2) -> list[str]:
     bad = []
     if res["error"]:
@@ -273,6 +292,7 @@ def main() -> int:
         "sonnet55_toggle": ("claude-sonnet-5-5", [(True, "xhigh"), off, (True, "xhigh")]),
         "haiku55_off": ("claude-haiku-5-5", [off, off, off]),
         "haiku55_on": ("claude-haiku-5-5", [(True, "high"), (True, "high"), (True, "high")]),
+        "opus55_off": ("claude-opus-5-5", [off, off, off]),
         "haiku45_off": ("claude-haiku-4-5-20251001", [off, off, off]),
         "fable52_off": ("claude-fable-5-2", [off, off, off]),
         "fable52_toggle": ("claude-fable-5-2", [(True, "low"), off, (True, "low")]),
@@ -310,6 +330,8 @@ def main() -> int:
                 bad.append("status line not 'off (between_tools...)'")
         elif name == "haiku55_off":
             bad += expect_off(res, {"type": "disabled"})
+        elif name == "opus55_off":
+            bad += expect_always_on(res, model)
         elif name == "haiku45_off":
             bad += [f"req{i} thinking={r['thinking']}" for i, r in enumerate(res["requests"]) if r["thinking"] is not None]
         elif name == "sonnet55_toggle":
@@ -333,6 +355,10 @@ def main() -> int:
             bad += expect_ds(res, ["off"])
         elif name in ("ds_flash_toggle", "ds_legacy_toggle"):
             bad += expect_ds(res, ["toggle"])
+        if name in ("sonnet55_off", "haiku55_off", "haiku55_on", "opus55_off",
+                    "fable52_off"):
+            bad += expect_cache(res)
+        cache = [(t["in"], t["cache_read"], t["cache_write"]) for t in res["turns"]]
         res["pass"] = not bad
         res["problems"] = bad
         results["checks"][name] = res
@@ -340,6 +366,8 @@ def main() -> int:
         notes = sum(t["thinking_blocks_nonempty"] for t in res["turns"])
         line = (f"[{name}] {'PASS' if not bad else 'FAIL'}  calls={len(res['requests'])} "
                 f"tool_rounds={res['tool_rounds']} out_tokens={out} nonempty_thinking_blocks={notes}")
+        if not model.startswith("deepseek"):
+            line += f"\n    (in, cache_read, cache_write) per call: {cache}"
         print(line + ("" if not bad else "\n    " + "\n    ".join(bad)), flush=True)
         if bad:
             failed.append(name)

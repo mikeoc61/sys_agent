@@ -532,10 +532,44 @@ def _ant_off_kwargs(model: str) -> dict:
            effort="xhigh")
     return fm.kwargs
 _bt_kw = _ant_off_kwargs("claude-sonnet-5-5")
-ok_bt = (_bt_kw.get("extra_body") == {"thinking": {"type": "between_tools"}}
+ok_bt = (_bt_kw.get("extra_body") == {"thinking": {"type": "between_tools"},
+                                      "cache_control": {"type": "ephemeral"}}
          and "output_config" not in _bt_kw
          and "thinking" not in _bt_kw)
 _ant_got = {k: _ant_req(*k) for k in _ant_want}
+#     Conversation caching: every live request carries a top-level
+#     cache_control beside (never instead of) its thinking fields, on the
+#     create and the stream path alike, plus the explicit system marker.
+#     Without it each tool-loop iteration re-billed the whole history at the
+#     full input rate. A /consult provider must NOT send it: its transcript
+#     is sent once, so a cache write there is never read back.
+def _ant_cache(model: str, thinking: bool, cache: bool = True) -> tuple:
+    p = _mk(S.AnthropicProvider, "anthropic", model)
+    if not cache:
+        p.cache_conversation = False
+    fm = _FakeMessages()
+    p.client = _NS(messages=fm)
+    p.chat([{"role": "user", "content": "hi"}], SYS, thinking=thinking,
+           effort="high")
+    eb = fm.kwargs.get("extra_body", {})
+    return (eb.get("cache_control"),
+            fm.kwargs["system"][-1].get("cache_control"),
+            "cache_control" in fm.kwargs)
+_EPH = {"type": "ephemeral"}
+_cache_got = {k: _ant_cache(*k) for k in _ant_want}
+import inspect as _insp_c
+_consult_src = _insp_c.getsource(S.run_repl)
+_co = _consult_src[_consult_src.find("def consult_one"):]
+ok_cache = (all(v == (_EPH, _EPH, False) for v in _cache_got.values())
+            and _ant_cache("claude-haiku-5-5", False, cache=False)
+                == (None, _EPH, False)
+            and _ant_cache("claude-opus-5-5", True, cache=False)
+                == (None, _EPH, False)
+            and S.Provider.cache_conversation is True
+            and 0 < _co.find("p.cache_conversation = False") < _co.find("p.chat("))
+print(f"[anthropic] conversation cached on every live request, not on "
+      f"consult: {'OK' if ok_cache else f'FAIL {_cache_got}'}")
+if not ok_cache: fails.append("conversation-cache")
 _prov = lambda m: _mk(S.AnthropicProvider, "anthropic", m)
 ok_ant = (_ant_got == _ant_want
           and S.thinking_status(_prov("claude-opus-5-5"), False)

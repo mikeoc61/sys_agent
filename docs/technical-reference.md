@@ -525,6 +525,30 @@ OpenAI-compatible endpoint — overriding only client construction (base URL +
 key) and the thinking path (`reasoning_effort` plus `reasoning_content`
 preservation). The REPL is provider-agnostic.
 
+### Prompt caching (Anthropic)
+
+Every Anthropic request is sent with two cache markers. One sits on the system
+prompt (instructions plus host facts), which is identical on every call. The
+other is a top-level `cache_control` field, which asks the API to cache the
+conversation as it grows. Each step of a tool loop re-sends the whole history,
+so without the second marker every earlier command's output was billed again
+at the full input rate on each step. With it, the earlier history is billed at
+the cache-read rate (a tenth of the input rate or less, depending on the
+model) and only the newly added part is written to the cache, at a premium
+over the input rate that the later reads more than repay.
+
+In a session probed on 2026-11-16, each call after the first sent 2 to 4
+uncached input tokens; the rest of an 8,000 to 10,000 token prompt was read
+from the cache. Cache entries last five minutes and are refreshed by each
+call, so a pause longer than that writes the conversation again once.
+Changing `/thinking` or `/effort` mid-conversation also re-writes it once.
+`/consult` does not cache the conversation on the providers it consults,
+because that transcript is sent only once.
+
+With `/tokens on`, the per-turn line shows `in` (uncached), `cache(r=… w=…)`
+(read and written), and a session input total that counts all three. OpenAI
+and DeepSeek cache on their own; sys_agent sends them nothing for it.
+
 ### Packaging
 
 Everything lives in one file. `sys_agent.py` declares its dependencies in a
