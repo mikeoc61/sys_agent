@@ -75,7 +75,7 @@ SYS_DEEPSEEK_MODEL=deepseek-flash
 | `ANTHROPIC_API_KEY` | Anthropic auth (one of the three required) | — |
 | `DEEPSEEK_API_KEY` | DeepSeek auth (one of the three required) | — |
 | `SYS_PROVIDER` | Skip provider prompt: `openai`, `anthropic`, or `deepseek` | (prompt) |
-| `SYS_OPENAI_MODEL` | OpenAI model string (default favors reliable tool use; set `gpt-6-luna` for lower cost) | `gpt-5.4-mini` |
+| `SYS_OPENAI_MODEL` | OpenAI model string (default is the low-cost pick; set `gpt-5.4-mini` for a model that reasons while using tools) | `gpt-6-luna` |
 | `SYS_ANTHROPIC_MODEL` | Anthropic model string | `claude-haiku-5-5` |
 | `SYS_DEEPSEEK_MODEL` | DeepSeek model string | `deepseek-flash` |
 | `SYS_THINKING` | Startup state for extended thinking: `on` / `off` (Anthropic / DeepSeek) | `off` |

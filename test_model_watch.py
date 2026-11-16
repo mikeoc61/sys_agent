@@ -30,6 +30,7 @@ class ModelWatchTests(unittest.TestCase):
                 "gpt-4.1-nano": {"created": 1},
                 "gpt-6-luna": {"created": 1},
                 "gpt-6-sol": {"created": 1},
+                "gpt-6.1-terra": {"created": 1},
             }
             second = dict(first, **{"gpt-6-luna": {"created": 2},
                                     "gpt-6-new": {"created": 2}})

@@ -76,17 +76,30 @@ on OpenAI's Responses API, which sys_agent does not use.
 `/model gpt-6-astra` is still accepted (it matches the `gpt-` prefix), but the
 first question fails with a 400 error and no command is run. sys_agent replaces
 OpenAI's misleading "set reasoning_effort to 'none'" advice with an explanation
-that links here. Switch back with `/model gpt-5.4-mini`, or pick a listed
+that links here. Switch back with `/model gpt-6-luna`, or pick a listed
 model with `/models`. Astra is also priced at $10/$50 per million input/output
 tokens, the same tier as `claude-fable-5`, which sys_agent leaves out of its
 model list as too expensive for this workload.
 
-The rest of the GPT-6 family *does* work and is in the model list:
-`gpt-6-luna` ($0.10/$0.50) is the low-cost option, and `gpt-6-sol` ($2/$10) is
-the mid tier. GPT-6 renamed its tiers: Luna, then Sol, then Astra at the top,
-with no Terra. Both accept `reasoning_effort` `none`, and sys_agent sends it
-automatically, so both run without reasoning here. The default stays
-`gpt-5.4-mini` until the GPT-6 models' tool use holds up in real sessions.
+`gpt-6.1-sol` has the same restriction (checked 2026-11-16): it rejects tools
+on Chat Completions and rejects `reasoning_effort` `none`, so it is not in the
+model list either. `gpt-6-sol` remains the strongest OpenAI model sys_agent can
+use.
+
+The OpenAI model list, in order:
+
+| Model | Price per 1M tokens (in/out) | Role |
+|---|---|---|
+| `gpt-6-luna` | $0.10 / $0.50 | Default since 2026-11-16; lowest cost |
+| `gpt-6.1-terra` | $1 / $5 | Middle option |
+| `gpt-6-sol` | $2 / $10 | Strongest usable option |
+| `gpt-5.4-mini` | $0.75 / $4.50 | The only one that reasons while using tools |
+
+The three GPT-6 models accept `reasoning_effort` `none`, and sys_agent sends it
+automatically, so they run without reasoning here. `gpt-5.4-mini` was the
+default until 2026-11-16 and stays listed: switch to it with
+`/model gpt-5.4-mini` when a question needs more careful step-by-step work than
+`gpt-6-luna` gives.
 
 `gpt-4o-mini`, `gpt-5.6-luna`, and `gpt-5.6-terra` were removed from the model
 list on 2026-09-23. Each costs the same as or more than a GPT-6 replacement.

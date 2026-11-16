@@ -456,17 +456,23 @@ def _sent_effort(model: str) -> object:
     return fc.kwargs.get("extra_body", {}).get("reasoning_effort")
 #     Models dropped from the list (gpt-4o-mini, GPT-5.6) keep their window
 #     and, for GPT-5.6, the forced "none", so existing pins keep working.
+#     gpt-6.1-terra takes "none" like Luna; gpt-6.1-sol rejects it like
+#     Astra (probe 2026-11-16), so it must get no effort and stay unlisted.
 _want = {"gpt-6-luna": "none", "gpt-6-sol": "none", "gpt-5.6-luna": "none",
-         "gpt-5.6-terra": "none", "gpt-6-astra": None, "gpt-5.4-mini": None}
+         "gpt-5.6-terra": "none", "gpt-6-astra": None, "gpt-5.4-mini": None,
+         "gpt-6.1-terra": "none", "gpt-6.1-sol": None}
 _eff = {m: _sent_effort(m) for m in _want}
 _listed = S.PROVIDER_MODELS["openai"]
 ok_eff = (_eff == _want
-          and _listed == ("gpt-5.4-mini", "gpt-6-luna", "gpt-6-sol")
+          and _listed == ("gpt-6-luna", "gpt-6.1-terra", "gpt-6-sol",
+                          "gpt-5.4-mini")
+          and S.unlisted_model_warning("openai", "gpt-6.1-sol").endswith(
+              "switching anyway]")
           and "gpt-4.1-nano" not in S.CONTEXT_WINDOWS
           and all(m in S.CONTEXT_WINDOWS for m in
                   ("gpt-6-luna", "gpt-6-sol", "gpt-4o-mini", "gpt-5.6-luna",
-                   "gpt-5.6-terra")))
-print(f"[openai] effort=none routing (luna/sol yes, astra no), list: "
+                   "gpt-5.6-terra", "gpt-6.1-terra", "gpt-6.1-sol")))
+print(f"[openai] effort=none routing (luna/sol/6.1-terra yes, astra/6.1-sol no), list: "
       f"{'OK' if ok_eff else f'FAIL {_eff}'}")
 if not ok_eff: fails.append("effort-none-routing")
 

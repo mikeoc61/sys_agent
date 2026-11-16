@@ -35,7 +35,7 @@ Env:      OPENAI_API_KEY            (one of these is required)
           ANTHROPIC_API_KEY
           DEEPSEEK_API_KEY
           SYS_PROVIDER               (skip prompt: openai|anthropic|deepseek)
-          SYS_OPENAI_MODEL           (default gpt-5.4-mini)
+          SYS_OPENAI_MODEL           (default gpt-6-luna)
           SYS_ANTHROPIC_MODEL        (default claude-haiku-5-5)
           SYS_DEEPSEEK_MODEL         (default deepseek-flash)
           SYS_ENV_FILE               (path to env file; overrides search)
@@ -139,27 +139,48 @@ from typing import Any
 
 # Default model per provider, overridable via env. Defaults favor dependable
 # tool calling at a sensible price tier; switch at runtime with /model.
-# OpenAI options (verified Sep 2026; prices per 1M tok, in/out):
-#   gpt-5.4-mini  — $0.75/$4.50, reasons with tools on Chat Completions (no
-#                   forced effort), best tool use of the listed models. Default.
-#   gpt-6-luna    — $0.10/$0.50, GPT-6 low tier. Probe 2026-09-23: tool call ->
-#                   role:tool replay -> final answer round-trips with effort
-#                   "none", reasoning_tokens=0.
-#   gpt-6-sol     — $2/$10, GPT-6 MID tier (the family renamed its tiers:
-#                   Luna < Sol < Astra, no Terra; in GPT-5.6 Sol was the top).
-#                   Probe 2026-09-23: tool call with effort "none" OK.
-# All GPT-6 models: 1.05M context / 128K max output; above 272K input, 2x input
-# and 1.5x output rates.
-# Chat Completions caveat (GPT-5.6, gpt-6-luna, gpt-6-sol): the server-side
-# default effort ("medium") 400s with function tools; only "none" is allowed
-# with them. This agent forces it (see _OPENAI_EFFORT_NONE_PREFIXES), so these
-# run as non-reasoning models here. Tools + reasoning needs the Responses API,
-# which this single-file Chat Completions provider does not use — revisit
-# only if no-reasoning tool quality proves insufficient.
-# Default stays gpt-5.4-mini: for an agent that proposes and executes commands,
-# reliable tool-calling is the deciding factor, not token price. gpt-6-luna is
-# the cost pick and gpt-6-sol the mid tier, pending evidence of their
-# non-reasoning tool-use quality on this workload.
+# OpenAI options (verified Nov 2026; prices per 1M tok, in/out), in picker
+# order:
+#   gpt-6-luna    — $0.10/$0.50, GPT-6 low tier. Default since 2026-11-16.
+#                   Probe 2026-09-23: tool call -> role:tool replay -> final
+#                   answer round-trips with effort "none", reasoning_tokens=0.
+#                   Probe 2026-11-16 (Pi, real system prompt, 3-prompt canned
+#                   session, twice): correct answers both runs at about a
+#                   seventh of gpt-5.4-mini's cost. One run chained commands
+#                   with && against the one-step-per-call rule, so its
+#                   discipline is weaker than mini's; the evidence is three
+#                   easy read-only prompts, nothing multi-step.
+#   gpt-6.1-terra — $1/$5, cached input $0.05 (docs 2026-11-16; knowledge
+#                   cutoff 2026-06-01). GPT-6.1 mid tier, the middle pick.
+#                   Probe 2026-11-16: tools 400 with no effort and with
+#                   "low"; "none" round-trips a tool call and its replay,
+#                   reasoning_tokens=0. Same session as above: correct, about
+#                   twice mini's wall time in one run.
+#   gpt-6-sol     — $2/$10, GPT-6 tier above Luna (GPT-6 had no Terra; in
+#                   GPT-5.6 Sol was the top). The strongest OpenAI model this
+#                   provider can drive with tools. Probe 2026-09-23 and
+#                   2026-11-16: tool call with effort "none" OK. Not
+#                   deprecated (deprecations page, 2026-11-16).
+#   gpt-5.4-mini  — $0.75/$4.50, 400K context. The default until 2026-11-16
+#                   and the ONLY listed model that reasons with tools on Chat
+#                   Completions (no forced effort). Kept listed as the
+#                   fallback when a non-reasoning model falls short. No
+#                   deprecation entry (2026-11-16).
+# All GPT-6 / GPT-6.1 models: 1.05M context / 128K max output; above 272K
+# input, 2x input and 1.5x output rates.
+# Chat Completions caveat (GPT-5.6, gpt-6-luna, gpt-6-sol, gpt-6.1-terra): the
+# server-side default effort ("medium") 400s with function tools; only "none"
+# is allowed with them. This agent forces it (see
+# _OPENAI_EFFORT_NONE_PREFIXES), so these run as non-reasoning models here.
+# Tools + reasoning needs the Responses API, which this single-file Chat
+# Completions provider does not use.
+# gpt-6.1-sol — NOT USABLE HERE (probed 2026-11-16), same dead end as
+# gpt-6-astra below. $2/$10, cached input $0.10. Chat Completions 400s on
+# tools with no effort and with "low", and rejects "none" (supported: low|
+# medium|high|xhigh). OpenAI's reasoning guide says it outright: "Chat
+# Completions does not support function calling with GPT-6 Astra or GPT-6.1
+# Sol". Left out of PROVIDER_MODELS and of the effort-none prefixes;
+# CONTEXT_WINDOWS entry only. gpt-6-sol stays listed in its place.
 # Dropped from PROVIDER_MODELS 2026-09-23 (CONTEXT_WINDOWS entries and the
 # effort-none prefix kept, so existing SYS_OPENAI_MODEL pins and /model still
 # work via the prefix fallback):
@@ -181,12 +202,12 @@ from typing import Any
 # (only low|medium|high|xhigh are accepted). Omitting the field hits the tools
 # error too. So no Chat Completions request with tools succeeds: Astra +
 # function tools is Responses-API-only. Left out of PROVIDER_MODELS.
-# /model gpt-6-astra still passes the "gpt-" prefix fallback and then 400s on
+# (gpt-6.1-sol behaves identically.) /model gpt-6-astra still passes the "gpt-" prefix fallback and then 400s on
 # the first turn (translated by explain_api_error). Adopting it means a
 # Responses-API path in OpenAIProvider (function_call / function_call_output
 # items, reasoning-item replay), which would also let the models above reason
 # with tools. Price alone puts it in the claude-fable-5 tier.
-DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"          # override: SYS_OPENAI_MODEL
+DEFAULT_OPENAI_MODEL = "gpt-6-luna"            # override: SYS_OPENAI_MODEL
 
 # Anthropic options (verified Oct 2026; prices per 1M tok, in/out):
 #   claude-haiku-5-5           — $0.10/$0.50, cache reads $0.01, for prompts
@@ -335,9 +356,11 @@ CONTEXT_WINDOWS: dict[str, int] = {
     # OpenAI
     "gpt-5.4-mini":    400_000,
     # GPT-5.6 and GPT-6 — every tier ships 1.05M context / 128K max output.
+    # GPT-6.1 the same (model pages, 2026-11-16).
     # Entries kept for models not in PROVIDER_MODELS (gpt-4o-mini, all of
-    # GPT-5.6, gpt-6-astra) so pins and manual /model switches still show
-    # context-%. Astra is unusable with tools (see OpenAI options above).
+    # GPT-5.6, gpt-6-astra, gpt-6.1-sol) so pins and manual /model switches
+    # still show context-%. Astra and 6.1 Sol are unusable with tools (see
+    # OpenAI options above).
     "gpt-4o-mini":     128_000,
     "gpt-5.6-luna":  1_050_000,
     "gpt-5.6-terra": 1_050_000,
@@ -345,6 +368,8 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-6-astra":   1_050_000,
     "gpt-6-luna":    1_050_000,
     "gpt-6-sol":     1_050_000,
+    "gpt-6.1-sol":   1_050_000,
+    "gpt-6.1-terra": 1_050_000,
     # Anthropic — Opus 4.6 through 5.5, Sonnet 4.6/5/5.5, Haiku 5.5, and
     # Fable 5/5.1 all ship a 1M window (Models API max_input_tokens,
     # 2026-09-24; Sonnet/Haiku 5.5 per launch notes). Haiku 5.5 bills prompts
@@ -379,9 +404,10 @@ CONTEXT_WINDOWS: dict[str, int] = {
 # work before this list is updated.
 PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
     "openai": (
-        "gpt-5.4-mini",
         "gpt-6-luna",
+        "gpt-6.1-terra",
         "gpt-6-sol",
+        "gpt-5.4-mini",
     ),
     "anthropic": (
         "claude-haiku-5-5",
@@ -409,12 +435,13 @@ PROVIDER_MODEL_PREFIXES: dict[str, tuple[str, ...]] = {
 # explicitly "none" (the tools+reasoning combination is Responses-API-only
 # for these models). Sent via extra_body so the pinned openai SDK need not
 # recognize the parameter — same defensive pattern as the DeepSeek path.
-# gpt-6-luna and gpt-6-sol have the same rule. Deliberately NOT a bare
-# "gpt-6": gpt-6-astra rejects "none" (unsupported_value), which would replace
-# its tools 400 with an error explain_api_error does not translate, and a
-# future GPT-6 tier may differ again. Add each GPT-6 name only after probing.
+# gpt-6-luna, gpt-6-sol and gpt-6.1-terra have the same rule. Deliberately NOT
+# a bare "gpt-6" or "gpt-6.1": gpt-6-astra and gpt-6.1-sol reject "none"
+# (unsupported_value), which would replace their tools 400 with an error
+# explain_api_error does not translate, and a future tier may differ again.
+# Add each name only after probing.
 _OPENAI_EFFORT_NONE_PREFIXES: tuple[str, ...] = (
-    "gpt-5.6", "gpt-6-luna", "gpt-6-sol",
+    "gpt-5.6", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-terra",
 )
 
 # =============================================================================
@@ -3231,7 +3258,7 @@ class OpenAIProvider(Provider):
             tools=OPENAI_TOOLS,
             tool_choice="auto",
         )
-        # GPT-5.6 / gpt-6-luna / gpt-6-sol on Chat Completions: default effort
+        # GPT-5.6 / gpt-6-luna / gpt-6-sol / gpt-6.1-terra: default effort
         # is incompatible with function tools; force it off or every turn
         # 400s. Guarded on provider name because DeepSeekProvider inherits
         # this class and manages reasoning_effort itself.
@@ -3890,7 +3917,8 @@ def explain_api_error(e: Exception) -> str:
         return (f"{m.group(1)} cannot call tools on Chat Completions, the "
                 "endpoint sys_agent uses, so it cannot propose commands. "
                 "OpenAI's suggested reasoning_effort='none' is rejected by "
-                "some models (gpt-6-astra among them). Pick a listed model "
+                "some models (gpt-6-astra and gpt-6.1-sol among them). Pick a "
+                "listed model "
                 "with /models. See "
                 "docs/advanced-usage.md#unsupported-openai-gpt-6-astra.")
     if code == 529 or "overloaded" in s.lower():
