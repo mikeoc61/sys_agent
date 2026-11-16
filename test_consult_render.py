@@ -57,14 +57,18 @@ for name, p in PROVIDERS.items():
     if not ok: fails.append(f"x-{name}")
 
 # 3) wire invariants the live APIs enforce
+# OpenAI is the Responses API: system prompt in `instructions`, not input;
+# function_call items keyed on call_id with string arguments; results as
+# function_call_output on the same call_id.
 oai_wire = S.render(OAI, events, SYS)
-assert oai_wire[0] == {"role":"system","content":SYS}, "OpenAI system placement"
-for m in (m for m in oai_wire if m.get("role")=="assistant"):
-    for tc in m.get("tool_calls", []):
-        assert tc["type"]=="function" and isinstance(tc["function"]["arguments"], str)
-        json.loads(tc["function"]["arguments"])
+assert not any(m.get("role") == "system" for m in oai_wire), "OpenAI system placement"
+fcs = [m for m in oai_wire if m.get("type") == "function_call"]
+assert len(fcs) == 2, fcs
+for m in fcs:
+    assert isinstance(m["arguments"], str) and "id" not in m
+    json.loads(m["arguments"])
 oai_from_ant = S.render(OAI, active_events, SYS)
-tids = [m["tool_call_id"] for m in oai_from_ant if m.get("role")=="tool"]
+tids = [m["call_id"] for m in oai_from_ant if m.get("type") == "function_call_output"]
 assert TID1 in tids and TID2 in tids, f"tool id verbatim: {tids}"
 print("[openai] wire invariants (system/tc-shape/id-preservation): OK")
 ds_asst = [m for m in S.render(DS, active_events, SYS) if m.get("role")=="assistant"]
@@ -360,36 +364,25 @@ ok_conf = ok_cfg and ok_bad and ok_derived
 print(f"[config] env file values applied, bad values reported not fatal: {'OK' if ok_conf else 'FAIL'}")
 if not ok_conf: fails.append("config-init")
 
-# 14) gpt-6-astra's tools 400 tells the user to "set reasoning_effort to
-#     'none'", which that model rejects; the raw text used to reach the REPL
-#     untranslated. The unlisted-model warning must drop its context-% hedge
-#     when the window is recorded.
+# 14) The unlisted-model warning must drop its context-% hedge when the
+#     window is recorded. (gpt-6-astra's Chat Completions tools-400
+#     translation went away with the Responses path: OpenAI no longer
+#     touches /v1/chat/completions, so that error cannot occur.)
 class _FakeAPIError(Exception):
     # Stand-in for the SDK's BadRequestError (the baseline runs without the
     # SDKs installed): same status_code attribute and str() shape.
     def __init__(self, msg: str, status_code: int) -> None:
         super().__init__(msg); self.status_code = status_code
-# Verbatim str(e) from a live M3 session, 2026-09-23.
-_e = _FakeAPIError(
-    "Error code: 400 - {'error': {'message': \"Function tools with "
-    "reasoning_effort are not supported for gpt-6-astra in "
-    "/v1/chat/completions. To use function tools, use /v1/responses or set "
-    "reasoning_effort to 'none'.\", 'type': 'invalid_request_error', "
-    "'param': 'reasoning_effort', 'code': None}}", 400)
-_x = S.explain_api_error(_e)
-ok_x = ("gpt-6-astra cannot call tools" in _x and "/models" in _x
-        and "set reasoning_effort to 'none'" not in _x)
-# Unrelated 400s still fall through to the raw message.
 _e2 = _FakeAPIError("Error code: 400 - other", 400)
-ok_x = ok_x and S.explain_api_error(_e2) == "Error code: 400 - other"
+ok_x = S.explain_api_error(_e2) == "Error code: 400 - other"
 _w_known = S.unlisted_model_warning("openai", "gpt-6-astra")
 _w_unknown = S.unlisted_model_warning("openai", "gpt-9-nova")
 ok_w = ("context-%" not in _w_known and "context-% may be unavailable"
         in _w_unknown)
-print(f"[apierr] astra tools-400 translated: {'OK' if ok_x else 'FAIL: ' + _x}")
+print(f"[apierr] unrecognized 400 falls through raw: {'OK' if ok_x else 'FAIL'}")
 print(f"[apierr] unlisted-model warning hedges only on unknown window: "
       f"{'OK' if ok_w else 'FAIL'}")
-if not ok_x: fails.append("apierr-astra")
+if not ok_x: fails.append("apierr-raw")
 if not ok_w: fails.append("unlisted-warning")
 
 # SDKs hide DNS/TLS/socket failures behind a generic connection error. These
@@ -435,11 +428,31 @@ assert "test-secret" not in S.explain_api_error(_net)
 assert "test-secret" not in S.explain_api_error(Exception("sk-proj-test-secret"))
 print("[apierr] malformed credential headers identified, credentials redacted: OK")
 
-# 15) reasoning_effort="none" routing through the real OpenAIProvider.chat().
-#     gpt-6-luna needs it or every tools turn 400s; gpt-6-astra must NOT get
-#     it (a bare "gpt-6" prefix would send it, turning Astra's translated
-#     tools 400 into an untranslated unsupported_value 400). DeepSeek inherits
-#     chat() plumbing and must stay untouched.
+# 15) OpenAI Responses routing through the real OpenAIProvider.chat(): a
+#     fake client records the request. Grades come from each model's 400
+#     (probes 2026-11-16): an unaccepted grade 400s the whole turn, so
+#     /thinking off must send "none" only where accepted and "low" on
+#     gpt-6.1-sol / gpt-6-astra; gpt-4o-mini 400s on any reasoning field.
+class _Item:
+    def __init__(self, d: dict) -> None: self._d = d
+    def model_dump(self, **_): return json.loads(json.dumps(self._d))
+class _FakeResponses:
+    def __init__(self, output=None, status="completed", reason=None,
+                 usage=(1, 1)) -> None:
+        self.output = output if output is not None else [
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "status": "completed",
+             "content": [{"type": "output_text", "text": "ok",
+                          "annotations": []}]}]
+        self.status, self.reason, self.usage = status, reason, usage
+        self.kwargs: dict = {}
+    def create(self, **kw):
+        self.kwargs = kw
+        return _NS(status=self.status, error=None,
+                   incomplete_details=_NS(reason=self.reason) if self.reason else None,
+                   output=[_Item(d) for d in self.output],
+                   usage=_NS(input_tokens=self.usage[0], output_tokens=self.usage[1]))
+# Chat Completions fake for the DeepSeek checks below.
 class _FakeCompletions:
     def __init__(self) -> None: self.kwargs: dict = {}
     def create(self, **kw):
@@ -448,33 +461,125 @@ class _FakeCompletions:
                   model_dump=lambda **_: {"role": "assistant", "content": "ok"})
         return _NS(choices=[_NS(message=msg)],
                    usage=_NS(prompt_tokens=1, completion_tokens=1))
-def _sent_effort(model: str) -> object:
+def _oai(model: str, **fake_kw):
     p = _mk(S.OpenAIProvider, "openai", model)
-    fc = _FakeCompletions()
-    p.client = _NS(chat=_NS(completions=fc))
-    p.chat([{"role": "user", "content": "hi"}], SYS)
-    return fc.kwargs.get("extra_body", {}).get("reasoning_effort")
-#     Models dropped from the list (gpt-4o-mini, GPT-5.6) keep their window
-#     and, for GPT-5.6, the forced "none", so existing pins keep working.
-#     gpt-6.1-terra takes "none" like Luna; gpt-6.1-sol rejects it like
-#     Astra (probe 2026-11-16), so it must get no effort and stay unlisted.
-_want = {"gpt-6-luna": "none", "gpt-6-sol": "none", "gpt-5.6-luna": "none",
-         "gpt-5.6-terra": "none", "gpt-6-astra": None, "gpt-5.4-mini": None,
-         "gpt-6.1-terra": "none", "gpt-6.1-sol": None}
-_eff = {m: _sent_effort(m) for m in _want}
+    fr = _FakeResponses(**fake_kw)
+    p.client = _NS(responses=fr)
+    return p, fr
+def _sent(model: str, thinking: bool = False, effort: str = "high"):
+    p, fr = _oai(model)
+    p.chat([{"role": "user", "content": "hi"}], SYS, thinking=thinking, effort=effort)
+    return fr.kwargs
+_want_off = {"gpt-6-luna": "none", "gpt-6.1-terra": "none", "gpt-6-sol": "none",
+             "gpt-5.6-luna": "none", "gpt-5.4-mini": "none",
+             "gpt-6.1-sol": "low", "gpt-6-astra": "low",
+             "gpt-4o-mini": None, "gpt-9-nova": None}
+_eff_off = {m: _sent(m).get("reasoning", {}).get("effort") for m in _want_off}
+_k = _sent("gpt-6.1-sol", thinking=True, effort="xhigh")
+_mini_max = _sent("gpt-5.4-mini", thinking=True, effort="max")["reasoning"]
+_luna_off = _sent("gpt-6-luna")
 _listed = S.PROVIDER_MODELS["openai"]
-ok_eff = (_eff == _want
-          and _listed == ("gpt-6-luna", "gpt-6.1-terra", "gpt-6-sol",
-                          "gpt-5.4-mini")
-          and S.unlisted_model_warning("openai", "gpt-6.1-sol").endswith(
-              "switching anyway]")
-          and "gpt-4.1-nano" not in S.CONTEXT_WINDOWS
-          and all(m in S.CONTEXT_WINDOWS for m in
-                  ("gpt-6-luna", "gpt-6-sol", "gpt-4o-mini", "gpt-5.6-luna",
-                   "gpt-5.6-terra", "gpt-6.1-terra", "gpt-6.1-sol")))
-print(f"[openai] effort=none routing (luna/sol/6.1-terra yes, astra/6.1-sol no), list: "
-      f"{'OK' if ok_eff else f'FAIL {_eff}'}")
-if not ok_eff: fails.append("effort-none-routing")
+ok_eff = (
+    _eff_off == _want_off
+    and "reasoning" not in _sent("gpt-4o-mini", thinking=True)
+    and _k["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+    and _k["instructions"] == SYS and _k["store"] is False
+    and _k["tools"] == S.RESPONSES_TOOLS and "function" not in _k["tools"][0]
+    and _k["input"] == [{"role": "user", "content": "hi"}]
+    and _mini_max == {"effort": "xhigh", "summary": "auto"}   # clamped, not 400
+    and "summary" not in _luna_off["reasoning"]               # off: no summary
+    and _listed == ("gpt-6-luna", "gpt-6.1-terra", "gpt-6-sol",
+                    "gpt-6.1-sol", "gpt-5.4-mini")
+    and "gpt-4.1-nano" not in S.CONTEXT_WINDOWS
+    and all(m in S.CONTEXT_WINDOWS for m in _want_off if m != "gpt-9-nova"))
+print(f"[openai] Responses effort routing (none/low floor, clamp, no field "
+      f"for 4o-mini/unknown), request shape, list: "
+      f"{'OK' if ok_eff else f'FAIL {_eff_off} {_k} {_mini_max}'}")
+if not ok_eff: fails.append("openai-effort-routing")
+
+# 15b) thinking/effort displays follow the same table: Sol/Astra read as
+#      always on with /thinking off, 4o-mini as inactive, mini's max capped.
+_sol = _mk(S.OpenAIProvider, "openai", "gpt-6.1-sol")
+_luna = _mk(S.OpenAIProvider, "openai", "gpt-6-luna")
+_4o = _mk(S.OpenAIProvider, "openai", "gpt-4o-mini")
+_mini = _mk(S.OpenAIProvider, "openai", "gpt-5.4-mini")
+ok_disp = (
+    S.thinking_active(_sol, False) and S.thinking_status(_sol, False).startswith("on (always on")
+    and not S.thinking_active(_luna, False) and S.thinking_status(_luna, False) == "off"
+    and S.thinking_active(_luna, True) and S.thinking_status(_luna, True) == "on"
+    and not S.thinking_active(_4o, True) and "inactive" in S.thinking_status(_4o, True)
+    and S.effort_applies(_luna) and not S.effort_applies(_4o)
+    and S.effective_effort(_mini, "max")[0] == "xhigh"
+    and S.effective_effort(_luna, "max") == ("max", "")
+    and S._effort_usage_levels(_mini) == ("low", "medium", "high", "xhigh"))
+print(f"[openai] thinking/effort displays match the effort table: "
+      f"{'OK' if ok_disp else 'FAIL'}")
+if not ok_disp: fails.append("openai-thinking-display")
+
+# 15c) Response parsing and the replay contract. A live-shaped turn
+#      (reasoning + function_call) is stored WHOLE (reasoning items carry
+#      encrypted_content the model reuses), the ToolCall id is call_id (not
+#      the item id), and the result pairs on call_id. normalize() folds the
+#      turn's items into one assistant event and drops reasoning.
+_live = [
+    {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "Need uname."}],
+     "encrypted_content": "gAAAA-opaque"},
+    {"type": "function_call", "id": "fc_1", "call_id": "call_A", "name": "run_command",
+     "arguments": json.dumps({"command": "uname -r", "explanation": "kernel"}),
+     "status": "completed"},
+]
+_p, _fr = _oai("gpt-6.1-sol", output=_live, usage=(3045, 40))
+_t = _p.chat([{"role": "user", "content": "kernel?"}], SYS, thinking=True)
+_hist = [{"role": "user", "content": "kernel?"}]
+_p.append_assistant(_hist, _t)
+_p.append_tool_results(_hist, [("call_A", "6.12.25")])
+_ev = S.normalize("openai", _hist)
+ok_parse = (
+    _t.stop == "" and _t.text == "" and _t.thinking_text == "Need uname."
+    and [(c.id, c.arguments["command"]) for c in _t.tool_calls] == [("call_A", "uname -r")]
+    and _t.usage.context_tokens == 3045            # input_tokens already includes cached
+    and _hist[1].get("encrypted_content") == "gAAAA-opaque" and _hist[1].get("type") == "reasoning"
+    and _hist[-1] == {"type": "function_call_output", "call_id": "call_A", "output": "6.12.25"}
+    and [e.kind for e in _ev] == ["user", "assistant", "tool_results"]
+    and _ev[1].tool_calls[0].id == "call_A" and _ev[2].results == [("call_A", "6.12.25")]
+    # /consult from a live Responses history: reasoning dropped, the rest
+    # replays into every other provider and reads back identical.
+    and all(canon_eq(_ev, S.normalize(n, S.render(PROVIDERS[n], _ev, SYS)))
+            for n in ("anthropic", "deepseek", "openai")))
+print(f"[openai] Responses parse + reasoning-item replay + call_id pairing: "
+      f"{'OK' if ok_parse else f'FAIL {_t} {_hist}'}")
+if not ok_parse: fails.append("openai-responses-parse")
+
+# 15d) Stop classification. A refusal is a content part inside a completed
+#      message; truncation is status "incomplete". A function_call cut by
+#      max_output_tokens still parses, so it must classify as truncated for
+#      the REPL to discard it. failed/cancelled raise (api-error path).
+_cut_fc = [{"type": "function_call", "call_id": "call_B", "name": "run_command",
+            "arguments": json.dumps({"command": "rm -rf /var/lib/apt/lists/part",
+                                     "explanation": "x"})}]
+_refuse = [{"type": "message", "role": "assistant", "content": [
+    {"type": "refusal", "refusal": "I can't help with that."}]}]
+def _stop(**kw):
+    p, _ = _oai("gpt-6-luna", **kw)
+    return p.chat([{"role": "user", "content": "hi"}], SYS)
+_s_cut = _stop(output=_cut_fc, status="incomplete", reason="max_output_tokens")
+_s_filt = _stop(status="incomplete", reason="content_filter")
+_s_other = _stop(status="incomplete", reason="max_messages")
+_s_ref = _stop(output=_refuse)
+_s_ok = _stop()
+try:
+    _stop(status="failed"); _raised = False
+except RuntimeError as e:
+    _raised = "failed" in str(e)
+ok_ostop = (
+    _s_cut.stop == S.STOP_TRUNCATED and _s_cut.tool_calls and "gpt-6-luna" in _s_cut.stop_detail
+    and _s_filt.stop == S.STOP_REFUSAL and "content_filter" in _s_filt.stop_detail
+    and _s_other.stop == S.STOP_TRUNCATED and "max_messages" in _s_other.stop_detail
+    and _s_ref.stop == S.STOP_REFUSAL and "can't help" in _s_ref.stop_detail
+    and _s_ok.stop == "" and _s_ok.text == "ok" and _raised)
+print(f"[openai] Responses incomplete/refusal/failed → ChatTurn.stop: "
+      f"{'OK' if ok_ostop else 'FAIL'}")
+if not ok_ostop: fails.append("openai-responses-stop")
 
 # 16) Anthropic thinking routing through the real AnthropicProvider.chat().
 #     Opus 5.5 / Fable 5.x 400 on thinking=disabled (probe 2026-09-24), so the
@@ -704,7 +809,7 @@ print(f"[anthropic] stop_reason refusal/max_tokens/ctx → ChatTurn.stop: "
 if not ok_ant_stop: fails.append("anthropic-stop-reason")
 
 def _oai_stop(cls, name, finish_reason):
-    p = _mk(cls, name, "gpt-5.4-mini" if name == "openai" else "deepseek-flash")
+    p = _mk(cls, name, "deepseek-flash")
     fc = _FakeCompletions()
     real = fc.create
     def create(**kw):
@@ -715,18 +820,16 @@ def _oai_stop(cls, name, finish_reason):
     fc.create = create
     p.client = _NS(chat=_NS(completions=fc))
     return p.chat([{"role": "user", "content": "hi"}], SYS)
-o_len = _oai_stop(S.OpenAIProvider, "openai", "length")
-o_filt = _oai_stop(S.OpenAIProvider, "openai", "content_filter")
-o_ok = _oai_stop(S.OpenAIProvider, "openai", "tool_calls")
+d_filt = _oai_stop(S.DeepSeekProvider, "deepseek", "content_filter")
+d_tc = _oai_stop(S.DeepSeekProvider, "deepseek", "tool_calls")
 d_len = _oai_stop(S.DeepSeekProvider, "deepseek", "length")
 d_ok = _oai_stop(S.DeepSeekProvider, "deepseek", "stop")
 ok_oai_stop = (
-    o_len.stop == S.STOP_TRUNCATED and "openai" in o_len.stop_detail
-    and o_filt.stop == S.STOP_REFUSAL and "content_filter" in o_filt.stop_detail
-    and o_ok.stop == "" and d_len.stop == S.STOP_TRUNCATED
+    d_filt.stop == S.STOP_REFUSAL and "content_filter" in d_filt.stop_detail
+    and d_tc.stop == "" and d_len.stop == S.STOP_TRUNCATED
     and "deepseek" in d_len.stop_detail and d_ok.stop == ""
     and d_len.raw_message.get("reasoning_content") == "")   # replay contract intact
-print(f"[openai/deepseek] finish_reason length/content_filter → ChatTurn.stop: "
+print(f"[deepseek] finish_reason length/content_filter → ChatTurn.stop: "
       f"{'OK' if ok_oai_stop else 'FAIL'}")
 if not ok_oai_stop: fails.append("openai-finish-reason")
 
@@ -742,10 +845,10 @@ _ran: list = []
 def _tc(cmd, tid="c1"):
     return S.ToolCall(tid, S.TOOL_NAME, {"command": cmd, "explanation": "x"})
 def _turn(text="", calls=(), stop="", detail=""):
-    return S.ChatTurn(text=text, tool_calls=list(calls),
-                      raw_message={"role": "assistant", "content": text or None,
-                                   **({"tool_calls": [{"id": c.id}
-                                       for c in calls]} if calls else {})},
+    # Responses output items: the REPL drives an OpenAIProvider.
+    raw: list = []
+    S.OpenAIProvider.append_rendered(None, raw, text, list(calls))
+    return S.ChatTurn(text=text, tool_calls=list(calls), raw_message=raw,
                       usage=S.Usage(input_tokens=1, output_tokens=1),
                       stop=stop, stop_detail=detail)
 _SCRIPT = [
@@ -797,7 +900,7 @@ ok_repl = (
     and len(_seen_hist) == 4
     and _user_texts(_seen_hist[1]) == ["show shadow"]   # cut turn: question popped, no assistant msg
     and _user_texts(_seen_hist[2]) == ["how long up?"]  # refused turn: rolled back whole
-    and _seen_hist[3][-1].get("role") == "tool"         # normal turn fed its result back
+    and _seen_hist[3][-1].get("type") == "function_call_output"  # normal turn fed its result back
     and "reply truncated" in _out and "discarded as incomplete" in _out
     and "model declined: category=cyber" in _out and "nothing ran" in _out
     and "answer stops mid" in _out                      # text-only cut is shown...

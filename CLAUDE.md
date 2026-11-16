@@ -51,8 +51,11 @@ out of the README; link to the page that owns it.
 
 ## Architecture notes
 - Providers share Turn / Usage / CmdResult / ChatTurn shapes. Anthropic batches
-  tool_results per assistant turn; OpenAI/DeepSeek send one `role: tool` per
-  call. Don't unify message formats without thinking this through.
+  tool_results per assistant turn; DeepSeek sends one `role: tool` per call;
+  OpenAI (Responses API) one `function_call_output` item per call, and one
+  assistant turn is SEVERAL input items (`append_assistant` extends,
+  `append_rendered` for /consult). Don't unify message formats without
+  thinking this through.
 - **Stop-reason contract:** every `chat()` classifies `stop_reason` /
   `finish_reason` into `ChatTurn.stop` (`""` | `refusal` | `truncated`) with a
   user-facing `stop_detail`. Branch on `stop_reason`, never on `stop_details`
@@ -62,11 +65,20 @@ out of the README; link to the page that owns it.
   the stop reason is the only signal. `tool_calls` stays populated so the loop
   can tell a cut command from a cut text answer. No server-side fallbacks
   (`fallbacks` param) without discussion: they change which model runs.
-- `DeepSeekProvider` subclasses `OpenAIProvider` (OpenAI-compatible endpoint).
-  **Replay contract:** with `tools` present, `reasoning_content` must be on
-  every replayed assistant message or the next call 400s.
-- **Default-on thinking:** Sonnet 5/5.5, Opus 5, Haiku 5.5, and DeepSeek think
-  when no field is sent. The `/thinking off` path must send the model's explicit
+- `DeepSeekProvider` subclasses `ChatCompletionsProvider` (the Chat
+  Completions wire format; DeepSeek is its only user). **Replay contract:**
+  with `tools` present, `reasoning_content` must be on every replayed
+  assistant message or the next call 400s.
+- `OpenAIProvider` is the Responses API for EVERY OpenAI model: one wire
+  format per provider name, which `/model` (switches in place, keeps
+  `messages`) and `normalize()` rely on. Never route some OpenAI models to
+  Chat Completions. `store=False`, system prompt in `instructions`. Reasoning
+  items replay verbatim (encrypted_content arrives by default); omitting them
+  does not 400, it silently re-reasons, so a test, not an error, guards it.
+  `ToolCall.id` is the item's `call_id`, not its `id`.
+- **Default-on thinking:** Sonnet 5/5.5, Opus 5, Haiku 5.5, DeepSeek, and
+  OpenAI reasoning models (GPT-5.6 reasons with no field) think when no field
+  is sent. The `/thinking off` path must send the model's explicit
   off form, and that form is per model (`_THINKING_OFF_PAYLOAD`): `disabled` on
   most, `between_tools` on Sonnet 5.5, which rejects `disabled`. Off forms are
   sent without effort (all 400 at xhigh|max). Verify any new model's default
@@ -74,8 +86,12 @@ out of the README; link to the page that owns it.
   `tools/live_probe.py`) before assuming off means off.
 - Anthropic caching: `input_tokens` excludes cached tokens. True context =
   input + cache_read + cache_write. Display logic depends on this.
-- GPT-5.6 on Chat Completions requires `reasoning_effort: "none"` (via
-  `extra_body`) to use function tools.
+- OpenAI effort grades are per exact model name (`_OPENAI_REASONING_EFFORTS`,
+  from each model's unsupported-value 400): an unaccepted grade 400s the turn.
+  `/thinking off` sends the lowest grade (`none`, or `low` on gpt-6.1-sol /
+  gpt-6-astra, which always reason). No row = no reasoning field (gpt-4o-mini
+  400s on it). Probe a new model with `minimal` to read its list, then
+  `tools/live_probe.py oai_*`.
 
 ## Startup facts (host priors)
 Three-filter rule — reject an addition if it is (1) already collected,

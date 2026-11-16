@@ -265,9 +265,11 @@ def chat(messages, system, thinking=False, effort="high"):
     spec = SCRIPT[i] if i < len(SCRIPT) else {"text": "done", "calls": []}
     calls = [S.ToolCall(c["id"], c.get("name", "run_command"), c["args"])
              for c in spec.get("calls", [])]
+    # Responses output items: PROVIDER is an OpenAIProvider.
+    raw = []
+    S.OpenAIProvider.append_rendered(PROVIDER, raw, spec.get("text", ""), calls)
     return S.ChatTurn(text=spec.get("text", ""), tool_calls=calls,
-                      raw_message={"role": "assistant",
-                                   "content": spec.get("text", "")},
+                      raw_message=raw,
                       usage=S.Usage(input_tokens=1, output_tokens=1))
 
 PROVIDER.chat = chat

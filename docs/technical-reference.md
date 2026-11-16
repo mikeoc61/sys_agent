@@ -496,8 +496,9 @@ line per command); truncate with `> ~/.config/sys_agent/audit.log`.
                                  ▼
                   ┌─────────────────────────────────────────────┐
                   │            Provider abstraction             │
-                  │ OpenAIProvider | AnthropicProvider |        │
-                  │ DeepSeekProvider (OpenAI-compatible)        │
+                  │ OpenAIProvider (Responses) |                │
+                  │ AnthropicProvider |                         │
+                  │ DeepSeekProvider (Chat Completions)         │
                   └──────────────┬──────────────────────────────┘
                                  │  HTTPS + tool calling
                                  ▼
@@ -518,12 +519,21 @@ line per command); truncate with `> ~/.config/sys_agent/audit.log`.
 ```
 
 The provider abstraction normalizes tool-call/tool-result message structure
-across the APIs (OpenAI and DeepSeek send one `role: tool` message per call;
-Anthropic batches all `tool_result` blocks into a single user message).
-`DeepSeekProvider` subclasses `OpenAIProvider` — same wire shape over DeepSeek's
-OpenAI-compatible endpoint — overriding only client construction (base URL +
-key) and the thinking path (`reasoning_effort` plus `reasoning_content`
-preservation). The REPL is provider-agnostic.
+across the APIs. DeepSeek sends one `role: tool` message per call. OpenAI,
+on the Responses API, sends one `function_call_output` item per call.
+Anthropic batches all `tool_result` blocks into a single user message.
+`DeepSeekProvider` builds on `ChatCompletionsProvider`, which holds the Chat
+Completions message format, and adds DeepSeek's client (base URL + key) and
+thinking path (`reasoning_effort` plus `reasoning_content` preservation).
+`OpenAIProvider` uses the Responses API for every OpenAI model, so one
+provider name always means one message format. That is what lets `/model`
+keep the conversation. The system prompt goes in `instructions`, and requests
+use `store=false`, so OpenAI keeps no conversation state and the whole
+history is re-sent each call, as on the other providers. One assistant turn
+is stored as all of that response's output items (reasoning, message,
+function calls). The reasoning items come back encrypted and are sent back
+unchanged; leaving them out is not an error, but the model reasons again from
+scratch. The REPL is provider-agnostic.
 
 ### Prompt caching (Anthropic)
 
@@ -547,7 +557,9 @@ because that transcript is sent only once.
 
 With `/tokens on`, the per-turn line shows `in` (uncached), `cache(r=… w=…)`
 (read and written), and a session input total that counts all three. OpenAI
-and DeepSeek cache on their own; sys_agent sends them nothing for it.
+and DeepSeek cache on their own; sys_agent sends them nothing for it. OpenAI's
+`input_tokens` already includes its cached tokens (3,042 of 3,045 on a repeat
+call, probed 2026-11-16), so no separate cache column is shown for OpenAI.
 
 ### Packaging
 

@@ -57,34 +57,24 @@ Provider and model selection are no longer startup-only. During a session:
 
 Switching providers resets the active conversation and token counters because
 the providers use different tool-call message formats (Anthropic batches
-`tool_result` blocks; OpenAI and DeepSeek send one `role: tool` message per
-call). Host facts and REPL toggles are preserved.
+`tool_result` blocks; DeepSeek sends one `role: tool` message per call, and
+OpenAI one `function_call_output` item per call). Host facts and REPL toggles
+are preserved.
 
-Changing the model keeps the same provider and session state. Unknown context
-windows are allowed; token display falls back to absolute token counts.
+Changing the model keeps the same provider and session state, including the
+conversation. That holds across OpenAI models too: a conversation started on
+`gpt-6.1-sol` carries on after `/model gpt-6-luna` (checked 2026-11-16).
+Unknown context windows are allowed; token display falls back to absolute
+token counts.
 
-### Unsupported: OpenAI GPT-6 Astra
+### OpenAI models
 
-`gpt-6-astra` cannot be used with sys_agent (checked 2026-09-23). sys_agent
-talks to OpenAI through the Chat Completions endpoint, and there Astra rejects
-function tools, which is how every command is proposed. The error message tells
-you to set `reasoning_effort` to `none`, but Astra rejects `none` too. Only
-`low`, `medium`, `high`, and `xhigh` are accepted, and all of them hit the same
-tools error. Leaving the field out hits it as well. Astra with tools works only
-on OpenAI's Responses API, which sys_agent does not use.
-
-`/model gpt-6-astra` is still accepted (it matches the `gpt-` prefix), but the
-first question fails with a 400 error and no command is run. sys_agent replaces
-OpenAI's misleading "set reasoning_effort to 'none'" advice with an explanation
-that links here. Switch back with `/model gpt-6-luna`, or pick a listed
-model with `/models`. Astra is also priced at $10/$50 per million input/output
-tokens, the same tier as `claude-fable-5`, which sys_agent leaves out of its
-model list as too expensive for this workload.
-
-`gpt-6.1-sol` has the same restriction (checked 2026-11-16): it rejects tools
-on Chat Completions and rejects `reasoning_effort` `none`, so it is not in the
-model list either. `gpt-6-sol` remains the strongest OpenAI model sys_agent can
-use.
+sys_agent talks to OpenAI through the Responses API. Earlier versions used
+Chat Completions, where GPT-6 Astra and GPT-6.1 Sol cannot use tools at all and the
+other current models can only with reasoning turned off. On the Responses
+API every listed model can propose commands, and the reasoning models reason
+while they do it when `/thinking` is on (see
+[extended thinking](#extended-thinking)).
 
 The OpenAI model list, in order:
 
@@ -92,14 +82,19 @@ The OpenAI model list, in order:
 |---|---|---|
 | `gpt-6-luna` | $0.10 / $0.50 | Default since 2026-11-16; lowest cost |
 | `gpt-6.1-terra` | $1 / $5 | Middle option |
-| `gpt-6-sol` | $2 / $10 | Strongest usable option |
-| `gpt-5.4-mini` | $0.75 / $4.50 | The only one that reasons while using tools |
+| `gpt-6-sol` | $2 / $10 | Strong option; can turn reasoning off |
+| `gpt-6.1-sol` | $2 / $10 | Newest Sol; always reasons |
+| `gpt-5.4-mini` | $0.75 / $4.50 | Default until 2026-11-16 |
 
-The three GPT-6 models accept `reasoning_effort` `none`, and sys_agent sends it
-automatically, so they run without reasoning here. `gpt-5.4-mini` was the
-default until 2026-11-16 and stays listed: switch to it with
-`/model gpt-5.4-mini` when a question needs more careful step-by-step work than
-`gpt-6-luna` gives.
+`gpt-6.1-sol` always reasons: it rejects reasoning effort `none`, so with
+`/thinking off` sys_agent sends its lowest grade, `low`, and the state reads
+`on (always on ...)`.
+
+`gpt-6-astra` works but is left out of the list. At $10/$50 per million
+input/output tokens it is in the same tier as `claude-fable-5`, which is too
+expensive for this workload. `/model gpt-6-astra` or `SYS_OPENAI_MODEL=gpt-6-astra`
+still selects it, with an unlisted-model warning. Like `gpt-6.1-sol`, it always
+reasons.
 
 `gpt-4o-mini`, `gpt-5.6-luna`, and `gpt-5.6-terra` were removed from the model
 list on 2026-09-23. Each costs the same as or more than a GPT-6 replacement.
@@ -337,9 +332,25 @@ Anthropic-specific:
   cap is large) and buffered until complete. DeepSeek uses a plain
   non-streaming call.
 
-**OpenAI**: both flags are inert. Displays say so — the banner and `/help`
-show `thinking=on (inactive: openai)`, and `/info` reports `thinking_enabled`,
-`thinking_active`, and `thinking_mode`.
+**OpenAI** (Responses API): thinking is the request's reasoning effort.
+`/thinking on` sends your `/effort` level and asks for a reasoning summary,
+which is shown dimmed like other providers' thinking. `gpt-5.4-mini` stops at
+`xhigh`, so `max` is sent as `xhigh` there and `/effort` says so. `/thinking off`
+sends each model's lowest grade: `none` on `gpt-6-luna`, `gpt-6.1-terra`,
+`gpt-6-sol`, `gpt-5.4-mini`, and GPT-5.6, which turns reasoning off; `low` on
+`gpt-6.1-sol` and `gpt-6-astra`, which reject `none` and so always reason (the
+state reads `on (always on ...)`). Every OpenAI model rejects `minimal`.
+`gpt-4o-mini` is not a reasoning model and is sent no reasoning field; its
+state reads `on (inactive: ...)` when the flag is on. The grades each model
+accepts were taken from the API on 2026-11-16. A newer OpenAI model reached
+through the `gpt-` prefix is sent no reasoning field until it has been
+checked, so it runs at OpenAI's default effort whatever `/thinking` says.
+`/info` reports `thinking_enabled`, `thinking_active`, and `thinking_mode`
+(`reasoning.effort`).
+
+OpenAI reasoning is carried between steps: each step's reasoning items are
+sent back, encrypted, with the next request. Leaving them out does not cause an
+error. The model reasons again from scratch, which costs extra tokens.
 
 Reach for it on a non-obvious multi-step diagnosis (tricky `systemd`,
 partitioning, networking). For everyday work, leave it off and stay on a fast
@@ -349,7 +360,7 @@ tier (Haiku, Flash).
 
 Two outcomes arrive from the API as a normal HTTP 200, not an error, so
 sys_agent inspects the response's stop reason (`stop_reason` on Anthropic,
-`finish_reason` on OpenAI/DeepSeek) on every turn and says what happened:
+`finish_reason` on DeepSeek, `status` and the reply's content on OpenAI) on every turn and says what happened:
 
 - **Model declined.** Anthropic's safety classifiers (Opus 5: `cyber`;
   Opus 5.5 / Fable 5.x: also `bio`, `reasoning_extraction`, `frontier_llm`,
@@ -363,9 +374,10 @@ sys_agent inspects the response's stop reason (`stop_reason` on Anthropic,
   Any partial output is discarded and the turn is rolled back as if you had
   pressed Ctrl-C, so the conversation is left exactly as before you asked.
   The question is kept for `/consult`, which asks the other configured
-  providers — they run different classifiers. On OpenAI/DeepSeek the
-  equivalent is `finish_reason=content_filter`, reported as
-  `openai content_filter`.
+  providers — they run different classifiers. On DeepSeek the equivalent is
+  `finish_reason=content_filter`. On OpenAI it is a `refusal` part in the
+  reply (reported as `openai refusal: <explanation>`) or a reply stopped
+  early for `content_filter` (reported as `openai content_filter`).
 
 - **Reply truncated.** The reply hit the output-token cap. On Anthropic the
   cap is 4096 on a plain turn and `SYS_THINKING_MAX_TOKENS` (default 32000) on
@@ -381,8 +393,10 @@ sys_agent inspects the response's stop reason (`stop_reason` on Anthropic,
   thinking); on Haiku 4.5, where `/effort` is a no-op, the notice names
   `SYS_THINKING_MAX_TOKENS` alone.
 
-  OpenAI/DeepSeek are sent no cap, so `finish_reason=length` means the
-  model's own output limit; ask for a shorter answer or fewer steps. A full
+  OpenAI/DeepSeek are sent no cap, so a stop for length
+  (`finish_reason=length` on DeepSeek, `incomplete` with `max_output_tokens`
+  on OpenAI) means the model's own output limit; ask for a shorter answer or
+  fewer steps. A full
   context window (`model_context_window_exceeded`) is reported the same way
   and points at `/reset`.
 

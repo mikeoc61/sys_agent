@@ -38,6 +38,21 @@ Checks:
   ds_flash_toggle  deepseek-flash on(max) -> off -> on(low) over one history.
   ds_legacy_toggle deepseek-v4-flash (retired name): same toggle; response
                    `model` must show the server-routed deepseek-flash.
+  oai_luna_off     gpt-6-luna on the Responses API, /thinking off: every
+                   request reasoning.effort "none", no summary; system prompt
+                   in `instructions`, never in input.
+  oai_sol61_off    gpt-6.1-sol, /thinking off: effort "low" (it rejects
+                   "none"); status reads "on (always on ...)".
+  oai_sol61_toggle gpt-6.1-sol on(high) -> off -> on(xhigh) over one history:
+                   reasoning items replayed across effort changes, no 400.
+  oai_astra_on     gpt-6-astra on(low) -> off -> off: tools work on Responses.
+  oai_switch       gpt-6.1-sol on(high), then /model gpt-6-luna (off) on the
+                   SAME history: the 6.1-sol reasoning items replay to Luna.
+  oai_rollback     gpt-6.1-sol: second turn rolled back whole, third sent.
+  oai_consult      gpt-6-luna on a history rendered from another provider's
+                   transcript (assistant message + function_call items with
+                   no ids or reasoning): what /consult sends.
+OpenAI checks need OPENAI_API_KEY.
 DeepSeek checks need DEEPSEEK_API_KEY and record each response's `model`:
 DeepSeek's docs say deepseek-flash is served by V4.1-Flash-1017 but the API
 reports only the alias, so the snapshot itself cannot be verified here.
@@ -138,6 +153,33 @@ class DSSpy:
         comp.create = create
 
 
+class OAISpy:
+    """Wrap client.responses.create to record the reasoning field and input."""
+
+    def __init__(self, provider: S.OpenAIProvider) -> None:
+        self.requests: list[dict[str, Any]] = []
+        self.models: list[str] = []
+        resp_api = provider.client.responses
+        real = resp_api.create
+
+        def create(**kw: Any) -> Any:
+            inp = kw.get("input", [])
+            self.requests.append({
+                "model": kw.get("model"),
+                "reasoning": kw.get("reasoning"),
+                "store": kw.get("store"),
+                "instructions": bool(kw.get("instructions")),
+                "system_in_input": any(m.get("role") in ("system", "developer") for m in inp),
+                "n_input": len(inp),
+                "n_reasoning_replayed": sum(1 for m in inp if m.get("type") == "reasoning"),
+            })
+            resp = real(**kw)
+            self.models.append(resp.model)
+            return resp
+
+        resp_api.create = create
+
+
 def run_prompt(provider: S.Provider, messages: list[dict], system: str,
                prompt: str, thinking: bool, effort: str, log: list[dict]) -> None:
     messages.append({"role": "user", "content": prompt})
@@ -145,7 +187,12 @@ def run_prompt(provider: S.Provider, messages: list[dict], system: str,
         t0 = time.monotonic()
         turn = provider.chat(messages, system, thinking=thinking, effort=effort)
         dt = time.monotonic() - t0
-        if provider.name == "deepseek":
+        if provider.name == "openai":
+            # reasoning items; their summary is the visible part
+            thinking_blocks = [
+                {"thinking": "".join(x.get("text", "") for x in it.get("summary") or [])}
+                for it in turn.raw_message if it.get("type") == "reasoning"]
+        elif provider.name == "deepseek":
             # content is a string; the scratchpad rides in reasoning_content
             thinking_blocks = [{"thinking": turn.raw_message.get("reasoning_content", "")}] \
                 if "reasoning_content" in turn.raw_message else []
@@ -181,15 +228,26 @@ def run_prompt(provider: S.Provider, messages: list[dict], system: str,
 
 
 def session(model: str, phases: list[tuple[bool, str]], system: str,
-            rollback_phase: int | None = None) -> dict[str, Any]:
-    provider: S.Provider = S.DeepSeekProvider(model) if model.startswith("deepseek") \
-        else S.AnthropicProvider(model)
-    spy: Spy | DSSpy = DSSpy(provider) if model.startswith("deepseek") else Spy(provider)
-    messages: list[dict] = provider.initial_messages(system)
+            rollback_phase: int | None = None,
+            switch: tuple[int, str] | None = None,
+            seed: list["S.CanonicalEvent"] | None = None) -> dict[str, Any]:
+    provider: S.Provider
+    spy: Spy | DSSpy | OAISpy
+    if model.startswith("deepseek"):
+        provider = S.DeepSeekProvider(model); spy = DSSpy(provider)
+    elif model.startswith("gpt-"):
+        provider = S.OpenAIProvider(model); spy = OAISpy(provider)
+    else:
+        provider = S.AnthropicProvider(model); spy = Spy(provider)
+    # seed: a transcript another provider wrote, as /consult renders it.
+    messages: list[dict] = (S.render(provider, seed, system) if seed
+                            else provider.initial_messages(system))
     log: list[dict] = []
     error = None
     try:
         for i, (prompt, (thinking, effort)) in enumerate(zip(PROMPTS, phases)):
+            if switch and i == switch[0]:
+                provider.model = switch[1]      # what /model does: history kept
             turn_start = len(messages)
             run_prompt(provider, messages, system, prompt, thinking, effort, log)
             if i == rollback_phase:
@@ -253,6 +311,42 @@ def expect_ds(res: dict, modes: list[str]) -> list[str]:
     return bad
 
 
+def expect_oai(name: str, res: dict) -> list[str]:
+    """Responses request shape per check. The effort sent must be one the
+    model accepts (an unaccepted grade 400s, which check_common catches);
+    this asserts sys_agent chose the intended one."""
+    bad = []
+    reqs = res["requests"]
+    for i, r in enumerate(reqs):
+        if r["store"] is not False or not r["instructions"] or r["system_in_input"]:
+            bad.append(f"req{i} store={r['store']} instructions={r['instructions']} "
+                       f"system_in_input={r['system_in_input']}")
+    efforts = [(r["reasoning"] or {}).get("effort") for r in reqs]
+    summaries = [(r["reasoning"] or {}).get("summary") for r in reqs]
+    if name in ("oai_luna_off", "oai_consult"):
+        if set(efforts) != {"none"} or any(summaries):
+            bad.append(f"efforts={efforts} summaries={summaries}")
+    elif name in ("oai_sol61_off", "oai_rollback"):
+        if set(efforts) != {"low"} or any(summaries):
+            bad.append(f"efforts={efforts} summaries={summaries}")
+        if not all(t["status"].startswith("on (always on") for t in res["turns"]):
+            bad.append("status line not 'on (always on ...)'")
+    elif name == "oai_sol61_toggle":
+        if not {"high", "low", "xhigh"} <= set(efforts):
+            bad.append(f"toggle did not exercise high/low/xhigh: {efforts}")
+    elif name == "oai_astra_on":
+        if not {"low"} == set(efforts):
+            bad.append(f"efforts={efforts}")
+    elif name == "oai_switch":
+        models = [r["model"] for r in reqs]
+        if "gpt-6-luna" not in models or "gpt-6.1-sol" not in models:
+            bad.append(f"switch not exercised: {models}")
+        replayed = [r["n_reasoning_replayed"] for r in reqs if r["model"] == "gpt-6-luna"]
+        if not any(replayed):
+            bad.append("no 6.1-sol reasoning items reached Luna (switch case not exercised)")
+    return bad
+
+
 def expect_cache(res: dict) -> list[str]:
     """Conversation caching on a session whose thinking settings never change:
     every request asks for it, and from the second model call on the cache
@@ -301,13 +395,31 @@ def main() -> int:
         "ds_flash_off": ("deepseek-flash", [off, off, off]),
         "ds_flash_toggle": ("deepseek-flash", [(True, "max"), off, (True, "low")]),
         "ds_legacy_toggle": ("deepseek-v4-flash", [(True, "high"), off, (True, "high")]),
+        "oai_luna_off": ("gpt-6-luna", [off, off, off]),
+        "oai_sol61_off": ("gpt-6.1-sol", [off, off, off]),
+        "oai_sol61_toggle": ("gpt-6.1-sol", [(True, "high"), off, (True, "xhigh")]),
+        "oai_astra_on": ("gpt-6-astra", [(True, "low"), off, off]),
+        "oai_switch": ("gpt-6.1-sol", [(True, "high"), off, off]),
+        "oai_rollback": ("gpt-6.1-sol", [off, off, off]),
+        "oai_consult": ("gpt-6-luna", [off, off]),
     }
+    consult_seed = [
+        S.CanonicalEvent("user", text="Is the root filesystem filling up?"),
+        S.CanonicalEvent("assistant", text="Checking disk usage.", tool_calls=[
+            S.ToolCall("toolu_seed1", S.TOOL_NAME,
+                       {"command": "df -h /", "explanation": "root fs usage"})]),
+        S.CanonicalEvent("tool_results", results=[
+            ("toolu_seed1", canned_result("df -h /"))]),
+        S.CanonicalEvent("assistant", text="Root is 27% full; plenty of room."),
+    ]
     wanted = sys.argv[1:] or list(checks)
     for name in wanted:
         if name not in checks:
             print(f"unknown check {name!r}; choices: {', '.join(checks)}")
             return 2
-        key = "DEEPSEEK_API_KEY" if checks[name][0].startswith("deepseek") else "ANTHROPIC_API_KEY"
+        key = ("DEEPSEEK_API_KEY" if checks[name][0].startswith("deepseek")
+               else "OPENAI_API_KEY" if checks[name][0].startswith("gpt-")
+               else "ANTHROPIC_API_KEY")
         if not os.environ.get(key):
             print(f"{key} not set (environment or sys_agent env file); needed by {name}")
             return 2
@@ -322,7 +434,9 @@ def main() -> int:
         model, phases = checks[name]
         print(f"[{name}] {model} ...", flush=True)
         res = session(model, phases, system,
-                      rollback_phase=1 if name == "fable52_rollback" else None)
+                      rollback_phase=1 if name in ("fable52_rollback", "oai_rollback") else None,
+                      switch=(1, "gpt-6-luna") if name == "oai_switch" else None,
+                      seed=consult_seed if name == "oai_consult" else None)
         bad = check_common(res)
         if name == "sonnet55_off":
             bad += expect_off(res, {"type": "between_tools"})
@@ -355,6 +469,8 @@ def main() -> int:
             bad += expect_ds(res, ["off"])
         elif name in ("ds_flash_toggle", "ds_legacy_toggle"):
             bad += expect_ds(res, ["toggle"])
+        elif name.startswith("oai_"):
+            bad += expect_oai(name, res)
         if name in ("sonnet55_off", "haiku55_off", "haiku55_on", "opus55_off",
                     "fable52_off"):
             bad += expect_cache(res)
@@ -366,7 +482,7 @@ def main() -> int:
         notes = sum(t["thinking_blocks_nonempty"] for t in res["turns"])
         line = (f"[{name}] {'PASS' if not bad else 'FAIL'}  calls={len(res['requests'])} "
                 f"tool_rounds={res['tool_rounds']} out_tokens={out} nonempty_thinking_blocks={notes}")
-        if not model.startswith("deepseek"):
+        if not model.startswith(("deepseek", "gpt-")):
             line += f"\n    (in, cache_read, cache_write) per call: {cache}"
         print(line + ("" if not bad else "\n    " + "\n    ".join(bad)), flush=True)
         if bad:

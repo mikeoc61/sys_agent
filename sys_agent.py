@@ -139,55 +139,54 @@ from typing import Any
 
 # Default model per provider, overridable via env. Defaults favor dependable
 # tool calling at a sensible price tier; switch at runtime with /model.
+# Every OpenAI model runs on the Responses API (see OpenAIProvider); the
+# effort each accepts is in _OPENAI_REASONING_EFFORTS below.
 # OpenAI options (verified Nov 2026; prices per 1M tok, in/out), in picker
 # order:
 #   gpt-6-luna    — $0.10/$0.50, GPT-6 low tier. Default since 2026-11-16.
-#                   Probe 2026-09-23: tool call -> role:tool replay -> final
-#                   answer round-trips with effort "none", reasoning_tokens=0.
+#                   Probe 2026-09-23 (Chat Completions): tool call -> replay
+#                   -> final answer round-trips with effort "none".
 #                   Probe 2026-11-16 (Pi, real system prompt, 3-prompt canned
-#                   session, twice): correct answers both runs at about a
-#                   seventh of gpt-5.4-mini's cost. One run chained commands
-#                   with && against the one-step-per-call rule, so its
-#                   discipline is weaker than mini's; the evidence is three
-#                   easy read-only prompts, nothing multi-step.
+#                   session, twice, Chat Completions at effort "none"):
+#                   correct answers both runs at about a seventh of
+#                   gpt-5.4-mini's cost. One run chained commands with &&
+#                   against the one-step-per-call rule, so its discipline is
+#                   weaker than mini's; the evidence is three easy read-only
+#                   prompts, nothing multi-step. On Responses it reasons with
+#                   tools (79 reasoning tokens at "high", probe 2026-11-16).
 #   gpt-6.1-terra — $1/$5, cached input $0.05 (docs 2026-11-16; knowledge
 #                   cutoff 2026-06-01). GPT-6.1 mid tier, the middle pick.
-#                   Probe 2026-11-16: tools 400 with no effort and with
-#                   "low"; "none" round-trips a tool call and its replay,
-#                   reasoning_tokens=0. Same session as above: correct, about
-#                   twice mini's wall time in one run.
 #   gpt-6-sol     — $2/$10, GPT-6 tier above Luna (GPT-6 had no Terra; in
-#                   GPT-5.6 Sol was the top). The strongest OpenAI model this
-#                   provider can drive with tools. Probe 2026-09-23 and
-#                   2026-11-16: tool call with effort "none" OK. Not
-#                   deprecated (deprecations page, 2026-11-16).
-#   gpt-5.4-mini  — $0.75/$4.50, 400K context. The default until 2026-11-16
-#                   and the ONLY listed model that reasons with tools on Chat
-#                   Completions (no forced effort). Kept listed as the
-#                   fallback when a non-reasoning model falls short. No
-#                   deprecation entry (2026-11-16).
+#                   GPT-5.6 Sol was the top). Not deprecated (deprecations
+#                   page, 2026-11-16).
+#   gpt-6.1-sol   — $2/$10, cached input $0.10. Same price as gpt-6-sol, one
+#                   generation newer. Always reasons: rejects effort "none"
+#                   and "minimal". Tools work only on the Responses API
+#                   (OpenAI reasoning guide: "Chat Completions does not
+#                   support function calling with GPT-6 Astra or GPT-6.1
+#                   Sol"); unusable here until the Responses path landed.
+#   gpt-5.4-mini  — $0.75/$4.50, 400K context. The default until 2026-11-16.
+#                   Kept listed as the fallback when a newer model falls
+#                   short. No deprecation entry (2026-11-16).
 # All GPT-6 / GPT-6.1 models: 1.05M context / 128K max output; above 272K
 # input, 2x input and 1.5x output rates.
-# Chat Completions caveat (GPT-5.6, gpt-6-luna, gpt-6-sol, gpt-6.1-terra): the
-# server-side default effort ("medium") 400s with function tools; only "none"
-# is allowed with them. This agent forces it (see
-# _OPENAI_EFFORT_NONE_PREFIXES), so these run as non-reasoning models here.
-# Tools + reasoning needs the Responses API, which this single-file Chat
-# Completions provider does not use.
-# gpt-6.1-sol — NOT USABLE HERE (probed 2026-11-16), same dead end as
-# gpt-6-astra below. $2/$10, cached input $0.10. Chat Completions 400s on
-# tools with no effort and with "low", and rejects "none" (supported: low|
-# medium|high|xhigh). OpenAI's reasoning guide says it outright: "Chat
-# Completions does not support function calling with GPT-6 Astra or GPT-6.1
-# Sol". Left out of PROVIDER_MODELS and of the effort-none prefixes;
-# CONTEXT_WINDOWS entry only. gpt-6-sol stays listed in its place.
-# Dropped from PROVIDER_MODELS 2026-09-23 (CONTEXT_WINDOWS entries and the
-# effort-none prefix kept, so existing SYS_OPENAI_MODEL pins and /model still
-# work via the prefix fallback):
+# Why not Chat Completions (history): there, GPT-5.6 and every GPT-6 model
+# except the two below accept function tools only at reasoning_effort "none"
+# (they ran as non-reasoning models here until the Responses path), and
+# gpt-6-astra / gpt-6.1-sol reject tools at every effort including "none"
+# (probes 2026-09-23, 2026-11-16).
+# Unlisted (CONTEXT_WINDOWS entries and effort-table rows kept, so
+# SYS_OPENAI_MODEL pins and /model still work via the "gpt-" prefix
+# fallback):
+#   gpt-6-astra   — Flagship, $10/$50: price alone puts it in the
+#                   claude-fable-5 tier, the wrong tier for routine host
+#                   work. Works on the Responses path; always reasons.
 #   gpt-4o-mini   — $0.15/$0.60; costlier than gpt-6-luna both ways and the
 #                   chattiest tier: under tool_choice=auto it tends to ASK
 #                   ("Would you like me to check…?") instead of emitting the
 #                   run_command call, stalling multi-step investigations.
+#                   Not a reasoning model: Responses 400s on reasoning.effort,
+#                   so it gets no reasoning field.
 #   gpt-5.6-luna  — $0.20/$1.20; gpt-6-luna is cheaper, same constraints.
 #   gpt-5.6-terra — $2/$12; gpt-6-sol matches input, cheaper output.
 #   gpt-5.6-sol   — $5/$30; never listed (wrong tier for this tool).
@@ -195,18 +194,6 @@ from typing import Any
 # shut it down 2026-10-23 (deprecations page), so no pin can work and a
 # window entry would only make a dead model look supported. gpt-6-luna is
 # the low-cost pick ($0.10/$0.50 vs nano's $0.10/$0.40).
-# gpt-6-astra — NOT USABLE HERE (probed 2026-09-23). Flagship, $10/$50. Chat
-# Completions rejects function tools with any reasoning effort, and unlike the
-# models above the "none" escape hatch is gone: the tools error says "set
-# reasoning_effort to 'none'", but sending "none" 400s with unsupported_value
-# (only low|medium|high|xhigh are accepted). Omitting the field hits the tools
-# error too. So no Chat Completions request with tools succeeds: Astra +
-# function tools is Responses-API-only. Left out of PROVIDER_MODELS.
-# (gpt-6.1-sol behaves identically.) /model gpt-6-astra still passes the "gpt-" prefix fallback and then 400s on
-# the first turn (translated by explain_api_error). Adopting it means a
-# Responses-API path in OpenAIProvider (function_call / function_call_output
-# items, reasoning-item replay), which would also let the models above reason
-# with tools. Price alone puts it in the claude-fable-5 tier.
 DEFAULT_OPENAI_MODEL = "gpt-6-luna"            # override: SYS_OPENAI_MODEL
 
 # Anthropic options (verified Oct 2026; prices per 1M tok, in/out):
@@ -358,9 +345,8 @@ CONTEXT_WINDOWS: dict[str, int] = {
     # GPT-5.6 and GPT-6 — every tier ships 1.05M context / 128K max output.
     # GPT-6.1 the same (model pages, 2026-11-16).
     # Entries kept for models not in PROVIDER_MODELS (gpt-4o-mini, all of
-    # GPT-5.6, gpt-6-astra, gpt-6.1-sol) so pins and manual /model switches
-    # still show context-%. Astra and 6.1 Sol are unusable with tools (see
-    # OpenAI options above).
+    # GPT-5.6, gpt-6-astra) so pins and manual /model switches still show
+    # context-%.
     "gpt-4o-mini":     128_000,
     "gpt-5.6-luna":  1_050_000,
     "gpt-5.6-terra": 1_050_000,
@@ -407,6 +393,7 @@ PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
         "gpt-6-luna",
         "gpt-6.1-terra",
         "gpt-6-sol",
+        "gpt-6.1-sol",
         "gpt-5.4-mini",
     ),
     "anthropic": (
@@ -429,20 +416,29 @@ PROVIDER_MODEL_PREFIXES: dict[str, tuple[str, ...]] = {
     "deepseek": ("deepseek-",),
 }
 
-# OpenAI model-name prefixes that must be sent reasoning_effort="none" on
-# /v1/chat/completions. GPT-5.6 applies a server-side default reasoning
-# effort, and Chat Completions rejects function tools unless effort is
-# explicitly "none" (the tools+reasoning combination is Responses-API-only
-# for these models). Sent via extra_body so the pinned openai SDK need not
-# recognize the parameter — same defensive pattern as the DeepSeek path.
-# gpt-6-luna, gpt-6-sol and gpt-6.1-terra have the same rule. Deliberately NOT
-# a bare "gpt-6" or "gpt-6.1": gpt-6-astra and gpt-6.1-sol reject "none"
-# (unsupported_value), which would replace their tools 400 with an error
-# explain_api_error does not translate, and a future tier may differ again.
-# Add each name only after probing.
-_OPENAI_EFFORT_NONE_PREFIXES: tuple[str, ...] = (
-    "gpt-5.6", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-terra",
-)
+# reasoning.effort grades each OpenAI model accepts on the Responses API
+# with function tools, lowest first, copied from each model's 400 for an
+# unsupported value (probes 2026-11-16). No model accepts "minimal". An
+# exact name, not a prefix: grades differ inside one generation (gpt-6-sol
+# takes "none", gpt-6.1-sol does not), so add each model only after probing.
+# A model with no row gets no reasoning field at all: right for gpt-4o-mini
+# (400s on reasoning.effort) and the safe choice for an unprobed release
+# (the server default works with tools on Responses, but /thinking off
+# cannot stop it reasoning; GPT-5.6 reasons with no field, 12 tokens on a
+# trivial prompt).
+_OPENAI_EFFORTS_FULL = ("none", "low", "medium", "high", "xhigh", "max")
+_OPENAI_EFFORTS_NO_NONE = ("low", "medium", "high", "xhigh", "max")
+_OPENAI_REASONING_EFFORTS: dict[str, tuple[str, ...]] = {
+    "gpt-6-luna":    _OPENAI_EFFORTS_FULL,
+    "gpt-6.1-terra": _OPENAI_EFFORTS_FULL,
+    "gpt-6-sol":     _OPENAI_EFFORTS_FULL,
+    "gpt-5.6-luna":  _OPENAI_EFFORTS_FULL,
+    "gpt-5.6-terra": _OPENAI_EFFORTS_FULL,
+    "gpt-5.6-sol":   _OPENAI_EFFORTS_FULL,
+    "gpt-5.4-mini":  ("none", "low", "medium", "high", "xhigh"),
+    "gpt-6.1-sol":   _OPENAI_EFFORTS_NO_NONE,
+    "gpt-6-astra":   _OPENAI_EFFORTS_NO_NONE,
+}
 
 # =============================================================================
 # RUNTIME TUNING
@@ -590,6 +586,30 @@ def _thinking_headroom(model: str) -> bool:
     thinking: the model cannot stop (always-on) or might not (unverified)."""
     return _thinking_always_on(model) or _thinking_unverified(model)
 
+def _openai_effort(model: str, thinking: bool, effort: str) -> str | None:
+    """reasoning.effort to send for an OpenAI model, or None for no field.
+
+    /thinking off sends the model's lowest grade: "none" where accepted,
+    else "low" (gpt-6.1-sol, gpt-6-astra always reason). /thinking on sends
+    the session effort, clamped down to the highest grade the model accepts
+    (max -> xhigh on gpt-5.4-mini), since sending an unlisted grade 400s."""
+    levels = _OPENAI_REASONING_EFFORTS.get(model)
+    if not levels:
+        return None
+    if not thinking:
+        return levels[0]
+    if effort in levels:
+        return effort
+    rank = _VALID_EFFORTS.index(effort) if effort in _VALID_EFFORTS else 0
+    below = [lvl for lvl in levels
+             if lvl in _VALID_EFFORTS and _VALID_EFFORTS.index(lvl) <= rank]
+    return below[-1] if below else levels[-1]
+
+def _openai_always_reasons(model: str) -> bool:
+    """True for an OpenAI model whose lowest grade still reasons."""
+    levels = _OPENAI_REASONING_EFFORTS.get(model)
+    return bool(levels) and levels[0] != "none"
+
 # SDK-level retry count. Both the openai and anthropic SDKs implement
 # exponential backoff with jitter and honor Retry-After headers; they retry
 # on 408/409/429 and 5xx (including Anthropic's 529 overloaded_error).
@@ -626,8 +646,8 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/version",        "sys_agent version, GitHub main status, runtime versions"),
     ("/reset",          "Clear conversation history and token counters"),
     ("/auto on|off",    "Skip the per-command approval prompt (deny list still applies)"),
-    ("/thinking on|off", "Toggle extended thinking — Anthropic/DeepSeek (next turn)"),
-    ("/effort [level]", "Thinking depth low|medium|high|xhigh|max — Anthropic adaptive models (all 5), DeepSeek (low|high|max); needs /thinking on"),
+    ("/thinking on|off", "Toggle extended thinking — Anthropic/DeepSeek/OpenAI reasoning models (next turn)"),
+    ("/effort [level]", "Thinking depth low|medium|high|xhigh|max — Anthropic adaptive models and OpenAI reasoning models (all 5; gpt-5.4-mini caps at xhigh), DeepSeek (low|high|max); needs /thinking on"),
     ("/tokens on|off",  "Toggle the per-turn token-usage line"),
     ("/color on|off",   "Toggle ANSI color output"),
     ("/audit [on|off]", "Show or toggle the command audit log"),
@@ -2742,13 +2762,22 @@ TOOL_PARAMETERS = {
     "additionalProperties": False,
 }
 
-OPENAI_TOOLS = [{
+# Chat Completions shape (nested "function"); DeepSeek only.
+CHAT_COMPLETIONS_TOOLS = [{
     "type": "function",
     "function": {
         "name": TOOL_NAME,
         "description": TOOL_DESCRIPTION,
         "parameters": TOOL_PARAMETERS,
     },
+}]
+
+# Responses API shape (flat: name/parameters beside "type"); OpenAI.
+RESPONSES_TOOLS = [{
+    "type": "function",
+    "name": TOOL_NAME,
+    "description": TOOL_DESCRIPTION,
+    "parameters": TOOL_PARAMETERS,
 }]
 
 ANTHROPIC_TOOLS = [{
@@ -3183,8 +3212,9 @@ class Usage:
     def context_tokens(self) -> int:
         # True context size. Anthropic reports input_tokens as the non-cached
         # portion only; cached tokens come back separately. OpenAI's
-        # prompt_tokens is already the full count, so cache_read/cache_write
-        # stay 0 there and this sum is a no-op.
+        # input_tokens and DeepSeek's prompt_tokens are already the full
+        # count, so cache_read/cache_write stay 0 there and this sum is a
+        # no-op.
         return self.input_tokens + self.cache_read + self.cache_write
 
 
@@ -3194,7 +3224,7 @@ class ChatTurn:
     tool_calls: list[ToolCall]
     raw_message: Any           # provider-native dict, appended to history
     usage: Usage
-    thinking_text: str = ""    # extended-thinking scratchpad (Anthropic/DeepSeek)
+    thinking_text: str = ""    # thinking scratchpad (Anthropic/DeepSeek) or OpenAI reasoning summary
     # Provider-neutral stop classification. "" is a normal stop (end_turn /
     # tool_use on Anthropic; stop / tool_calls on OpenAI-compatible APIs).
     # STOP_REFUSAL: a safety classifier or the model itself declined — arrives
@@ -3260,8 +3290,48 @@ class Provider:
         # ChatTurn this provider just produced).
         raise NotImplementedError
 
+    def append_rendered(
+        self, messages: list[dict], text: str, tool_calls: list["ToolCall"]
+    ) -> None:
+        # render()'s entry point. One message per assistant turn on Chat
+        # Completions and Anthropic; the Responses API overrides it because a
+        # turn there is several input items (a message plus function_calls).
+        messages.append(self.render_assistant(text, tool_calls))
+
 
 class OpenAIProvider(Provider):
+    """OpenAI via the Responses API (/v1/responses), for every OpenAI model.
+
+    Why Responses and not Chat Completions: gpt-6-astra and gpt-6.1-sol
+    cannot call function tools on Chat Completions at all, and every other
+    current model there only with reasoning_effort "none" (see the OpenAI
+    options in PROVIDER & MODEL CONFIG). One endpoint for the whole provider
+    keeps one wire format per provider name, which /model relies on (it
+    switches model in place and keeps `messages`) and normalize() keys on.
+
+    Wire format: `messages` holds Responses input items. User turns are
+    {"role": "user", "content": str}; an assistant turn is the response's
+    output items verbatim (reasoning, message, function_call), so one turn
+    adds SEVERAL items (append_assistant extends); a tool result is a
+    function_call_output keyed on call_id. The system prompt travels as
+    `instructions` on every call, so initial_messages() is empty.
+
+    Stateless: store=False, the conversation is resent each call (as on
+    every other provider). Reasoning items come back with encrypted_content
+    by default when store=False, with no `include` needed (probe
+    2026-11-16).
+
+    REASONING REPLAY (soft, unlike DeepSeek's): reasoning items are replayed
+    verbatim beside their function_calls. Omitting them does NOT 400; the
+    model silently re-reasons (Astra: 0 reasoning tokens on the next call
+    with them, 55 without; probe 2026-11-16). So dropping them costs tokens
+    and consistency, not correctness. Items stripped of `id` or `status`
+    are accepted, which is what lets render() rebuild function_calls for a
+    transcript another provider wrote. A reasoning model's items replayed
+    to a different OpenAI model (gpt-6.1-sol -> gpt-6-luna) are accepted
+    too, so /model mid-session needs no history rewrite.
+    """
+
     def __init__(self, model: str) -> None:
         try:
             from openai import OpenAI
@@ -3272,52 +3342,146 @@ class OpenAIProvider(Provider):
         self.name = "openai"
 
     def initial_messages(self, system: str) -> list[dict]:
-        # OpenAI: system prompt is the first message
-        return [{"role": "system", "content": system}]
+        # System prompt goes in `instructions` on each call, not in input.
+        return []
 
     def chat(
         self, messages: list[dict], system: str,
         thinking: bool = False, effort: str = "high",
     ) -> ChatTurn:
-        # `thinking`/`effort` are Anthropic-only; ignored here so the call site
-        # can pass them uniformly. OpenAI reasoning models use a different
-        # mechanism.
         kwargs: dict[str, Any] = dict(
             model=self.model,
-            messages=messages,
-            tools=OPENAI_TOOLS,
+            instructions=system,
+            input=messages,
+            tools=RESPONSES_TOOLS,
             tool_choice="auto",
+            store=False,
         )
-        # GPT-5.6 / gpt-6-luna / gpt-6-sol / gpt-6.1-terra: default effort
-        # is incompatible with function tools; force it off or every turn
-        # 400s. Guarded on provider name because DeepSeekProvider inherits
-        # this class and manages reasoning_effort itself.
-        if self.name == "openai" and self.model.startswith(
-            _OPENAI_EFFORT_NONE_PREFIXES
-        ):
-            kwargs["extra_body"] = {"reasoning_effort": "none"}
-        resp = self.client.chat.completions.create(**kwargs)
-        choice = resp.choices[0]
-        msg = choice.message
+        # None = send no reasoning field: a non-reasoning model (gpt-4o-mini
+        # 400s on reasoning.effort) or one whose grades are unprobed.
+        eff = _openai_effort(self.model, thinking, effort)
+        if eff is not None:
+            reasoning: dict[str, str] = {"effort": eff}
+            # Summaries only when the user asked to see thinking; an
+            # always-reasoning model with /thinking off still reasons, but
+            # quietly.
+            if thinking and eff != "none":
+                reasoning["summary"] = "auto"
+            kwargs["reasoning"] = reasoning
+        resp = self.client.responses.create(**kwargs)
+        if resp.status not in ("completed", "incomplete"):
+            # failed / cancelled: no usable output. Raised so the REPL's
+            # api-error path handles it (and pops the orphan question).
+            detail = getattr(getattr(resp, "error", None), "message", "") or ""
+            raise RuntimeError(f"OpenAI response {resp.status}: {detail}".rstrip(": "))
+        items = [it.model_dump(exclude_none=True) for it in resp.output]
+        text_parts: list[str] = []
+        summary_parts: list[str] = []
+        refusal = ""
         calls: list[ToolCall] = []
-        for tc in (msg.tool_calls or []):
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
-        stop, stop_detail = self._classify_finish(choice)
+        for it in items:
+            kind = it.get("type")
+            if kind == "function_call":
+                try:
+                    args = json.loads(it.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                # call_id, not id: call_id pairs with function_call_output.
+                calls.append(ToolCall(id=it.get("call_id", ""),
+                                      name=it.get("name", ""), arguments=args))
+            elif kind == "message":
+                for part in it.get("content") or []:
+                    if part.get("type") == "output_text":
+                        text_parts.append(part.get("text", ""))
+                    elif part.get("type") == "refusal":
+                        refusal = part.get("refusal", "") or "refused"
+            elif kind == "reasoning":
+                summary_parts.extend(s.get("text", "")
+                                     for s in it.get("summary") or [])
+        stop, stop_detail = self._classify_status(resp, refusal)
+        usage = resp.usage
         return ChatTurn(
-            text=msg.content or "",
+            text="".join(text_parts),
             tool_calls=calls,
-            raw_message=msg.model_dump(exclude_none=True),
+            raw_message=items,
+            # input_tokens INCLUDES cached tokens (probe 2026-11-16: 3045
+            # input, 3042 of them cached), like Chat Completions'
+            # prompt_tokens. cache_read stays 0 so context_tokens does not
+            # count the cached part twice.
             usage=Usage(
-                input_tokens=getattr(resp.usage, "prompt_tokens", 0) or 0,
-                output_tokens=getattr(resp.usage, "completion_tokens", 0) or 0,
+                input_tokens=getattr(usage, "input_tokens", 0) or 0,
+                output_tokens=getattr(usage, "output_tokens", 0) or 0,
             ),
+            thinking_text="\n\n".join(p for p in summary_parts if p),
             stop=stop,
             stop_detail=stop_detail,
         )
+
+    def _classify_status(self, resp: Any, refusal: str) -> tuple[str, str]:
+        """Map a Responses result to (ChatTurn.stop, detail).
+
+        A refusal is a `refusal` content part inside the output message
+        (ResponseOutputRefusal, openai SDK 3.51), on an otherwise completed
+        response. Truncation is status "incomplete" with
+        incomplete_details.reason one of max_output_tokens, max_messages,
+        content_filter, steered (SDK 3.51 IncompleteDetails; steered is
+        WebSocket-only). sys_agent sends no max_output_tokens, so
+        max_output_tokens means the model's own ceiling. Anything incomplete
+        that is not a filter is treated as truncated: a function_call cut
+        short still parses, so the REPL must discard it.
+        """
+        if refusal:
+            return STOP_REFUSAL, f"openai refusal: {refusal[:200]}"
+        if resp.status != "incomplete":
+            return "", ""
+        reason = getattr(getattr(resp, "incomplete_details", None),
+                         "reason", None)
+        if reason == "content_filter":
+            return STOP_REFUSAL, "openai content_filter"
+        if reason == "max_output_tokens":
+            return STOP_TRUNCATED, (
+                f"hit openai's output-token limit for {self.model}; "
+                "ask for a shorter answer or fewer steps and resend")
+        return STOP_TRUNCATED, (
+            f"openai response incomplete ({reason or 'no reason given'}); "
+            "resend")
+
+    def append_assistant(self, messages: list[dict], turn: ChatTurn) -> None:
+        # raw_message is the list of output items (see class docstring).
+        messages.extend(turn.raw_message)
+
+    def append_tool_results(
+        self, messages: list[dict], results: list[tuple[str, str]]
+    ) -> None:
+        for call_id, content in results:
+            messages.append({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": content,
+            })
+
+    def append_rendered(
+        self, messages: list[dict], text: str, tool_calls: list["ToolCall"]
+    ) -> None:
+        # A turn another provider authored: no reasoning items exist for it,
+        # and items without id/status are accepted (class docstring).
+        if text:
+            messages.append({"type": "message", "role": "assistant",
+                             "content": [{"type": "output_text", "text": text}]})
+        for tc in tool_calls:
+            messages.append({"type": "function_call", "call_id": tc.id,
+                             "name": tc.name,
+                             "arguments": json.dumps(tc.arguments)})
+
+
+class ChatCompletionsProvider(Provider):
+    """Wire format of an OpenAI-compatible /chat/completions endpoint: system
+    prompt as the first message, assistant tool_calls, one `role: tool`
+    message per result. DeepSeek is the only user since OpenAI moved to the
+    Responses API; subclasses supply __init__ and chat()."""
+
+    def initial_messages(self, system: str) -> list[dict]:
+        return [{"role": "system", "content": system}]
 
     def _classify_finish(self, choice: Any) -> tuple[str, str]:
         """Map Chat Completions finish_reason to (ChatTurn.stop, detail).
@@ -3327,8 +3491,7 @@ class OpenAIProvider(Provider):
         model's output limit reached; `content_filter` = content omitted by
         the provider's filter. sys_agent sends no max_tokens on this path, so
         `length` means the model's own output ceiling — the remedy is a
-        smaller ask, not a config change. DeepSeek inherits this (same wire
-        enum on its OpenAI-compatible endpoint).
+        smaller ask, not a config change.
         """
         reason = getattr(choice, "finish_reason", None)
         if reason == "length":
@@ -3342,7 +3505,7 @@ class OpenAIProvider(Provider):
     def append_tool_results(
         self, messages: list[dict], results: list[tuple[str, str]]
     ) -> None:
-        # OpenAI: one `role: tool` message per tool_call_id
+        # One `role: tool` message per tool_call_id.
         for tc_id, content in results:
             messages.append({
                 "role": "tool",
@@ -3351,7 +3514,7 @@ class OpenAIProvider(Provider):
             })
 
     def render_assistant(self, text: str, tool_calls: list["ToolCall"]) -> dict:
-        # Rebuild an assistant message in OpenAI wire shape from neutral parts
+        # Rebuild an assistant message in Chat Completions shape from neutral parts
         # (see normalize/render). Mirrors what chat() stored as raw_message, so
         # a transcript normalized from any provider replays here verbatim.
         msg: dict[str, Any] = {"role": "assistant", "content": text or None}
@@ -3365,17 +3528,17 @@ class OpenAIProvider(Provider):
         return msg
 
 
-class DeepSeekProvider(OpenAIProvider):
+class DeepSeekProvider(ChatCompletionsProvider):
     """DeepSeek V4.x (deepseek-flash; v4-* names server-routed) via the
     OpenAI-compatible ChatCompletions API.
 
-    Wire-compatible with OpenAIProvider — identical tool-call / tool-result
-    message shape — so it inherits initial_messages() and append_tool_results()
-    unchanged. Only two things differ and are overridden:
+    Inherits the Chat Completions wire format (initial_messages,
+    append_tool_results, render_assistant, _classify_finish) from
+    ChatCompletionsProvider and supplies:
 
-      1. __init__ points the openai SDK at DeepSeek's base_url with the
+      1. __init__ pointing the openai SDK at DeepSeek's base_url with the
          DEEPSEEK_API_KEY (the SDK would otherwise default to OPENAI_API_KEY).
-      2. chat() honors extended thinking, which OpenAI's path ignores. DeepSeek
+      2. chat(), which honors extended thinking. DeepSeek
          exposes it via reasoning_effort + thinking={"type":"enabled"} and
          returns the scratchpad in a `reasoning_content` field beside `content`.
          Thinking is ON by default server-side, so the off path must send
@@ -3427,7 +3590,7 @@ class DeepSeekProvider(OpenAIProvider):
         kwargs: dict[str, Any] = dict(
             model=self.model,
             messages=messages,
-            tools=OPENAI_TOOLS,
+            tools=CHAT_COMPLETIONS_TOOLS,
             tool_choice="auto",
         )
         # Sent via extra_body (merged into the request JSON) rather than as
@@ -3472,7 +3635,7 @@ class DeepSeekProvider(OpenAIProvider):
         )
 
     def render_assistant(self, text: str, tool_calls: list["ToolCall"]) -> dict:
-        # Same wire shape as OpenAI, plus the reasoning_content presence the
+        # Chat Completions shape, plus the reasoning_content presence the
         # DeepSeek replay contract requires on every assistant message once a
         # thinking turn has tool-called. We have no scratchpad for a turn
         # authored by another provider, so send "" — DeepSeek ignores an empty
@@ -3706,14 +3869,15 @@ class AnthropicProvider(Provider):
 # The live `messages` list is always in the ACTIVE provider's wire format and
 # remains the single source of truth for execution. To ask a DIFFERENT provider
 # for a second opinion (/consult) we cannot hand it that format directly:
-# OpenAI/DeepSeek emit one `role:tool` message per call while Anthropic batches
-# tool_result blocks into one user message, and the assistant-turn shapes differ
-# too. So we read the active history into a neutral event list (normalize) and
+# DeepSeek emits one `role:tool` message per call, OpenAI (Responses) one
+# function_call_output item per call, while Anthropic batches tool_result
+# blocks into one user message, and the assistant-turn shapes differ too. So we read the active history into a neutral event list (normalize) and
 # replay it into the target's format (render). No second copy is stored; the
 # canonical form is derived on demand, which is why it cannot drift from
 # `messages`. Thinking scratchpads are intentionally dropped — a consult is a
-# fresh read, and Anthropic's signature-bearing thinking blocks cannot be forged
-# for a turn another model authored.
+# fresh read, and Anthropic's signature-bearing thinking blocks (like OpenAI's
+# encrypted reasoning items) cannot be forged for a turn another model
+# authored.
 
 
 @dataclass
@@ -3727,11 +3891,47 @@ class CanonicalEvent:
 def normalize(provider_name: str, messages: list[dict]) -> list[CanonicalEvent]:
     """Read the active provider's `messages` into provider-neutral events.
 
-    Consecutive OpenAI/DeepSeek `role:tool` messages are coalesced into one
-    tool_results event so the canonical form matches Anthropic's batching — the
-    neutral shape is symmetric regardless of which provider produced it."""
+    Consecutive tool results (DeepSeek `role:tool` messages, OpenAI
+    function_call_output items) are coalesced into one tool_results event so
+    the canonical form matches Anthropic's batching — the neutral shape is
+    symmetric regardless of which provider produced it."""
     events: list[CanonicalEvent] = []
-    if provider_name in ("openai", "deepseek"):
+    if provider_name == "openai":
+        # Responses input items. One assistant turn is several items
+        # (reasoning, message, function_call...), so consecutive assistant
+        # items fold into one event; reasoning items carry nothing neutral.
+        def _asst() -> CanonicalEvent:
+            if not events or events[-1].kind != "assistant":
+                events.append(CanonicalEvent("assistant"))
+            return events[-1]
+        for m in messages:
+            kind = m.get("type")
+            if kind is None and m.get("role") == "user":
+                events.append(CanonicalEvent("user", text=m.get("content") or ""))
+            elif kind == "message" and m.get("role") == "assistant":
+                text = "".join(p.get("text", "") for p in m.get("content") or []
+                               if p.get("type") == "output_text")
+                ev = _asst()
+                ev.text = "\n".join(t for t in (ev.text, text) if t)
+            elif kind == "function_call":
+                try:
+                    args = json.loads(m.get("arguments") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                _asst().tool_calls.append(ToolCall(
+                    id=m.get("call_id", ""), name=m.get("name", ""),
+                    arguments=args))
+            elif kind == "reasoning":
+                _asst()
+            elif kind == "function_call_output":
+                pair = (m.get("call_id", ""), m.get("output") or "")
+                if events and events[-1].kind == "tool_results":
+                    events[-1].results.append(pair)
+                else:
+                    events.append(CanonicalEvent("tool_results", results=[pair]))
+        return events
+
+    if provider_name == "deepseek":
         for m in messages:
             role = m.get("role")
             if role == "system":
@@ -3800,7 +4000,7 @@ def render(target: Provider, events: list[CanonicalEvent], system: str) -> list[
         if ev.kind == "user":
             out.append({"role": "user", "content": ev.text})
         elif ev.kind == "assistant":
-            out.append(target.render_assistant(ev.text, ev.tool_calls))
+            target.append_rendered(out, ev.text, ev.tool_calls)
         elif ev.kind == "tool_results":
             target.append_tool_results(out, ev.results)
     return out
@@ -3957,21 +4157,6 @@ def explain_api_error(e: Exception) -> str:
     s = _redact_api_error(str(e))
     # status_code attribute is present on both SDKs' APIStatusError subclasses
     code = getattr(e, "status_code", None)
-    # OpenAI's tools+reasoning 400 says "set reasoning_effort to 'none'", but
-    # models that reject "none" outright (gpt-6-astra, probe 2026-09-23) have
-    # no Chat Completions path with tools at all, so the raw text sends the
-    # user after a fix that cannot work. Keyed on the message, not the model
-    # name, so a future model with the same restriction is covered too.
-    m = re.search(r"Function tools with reasoning_effort are not supported "
-                  r"for (\S+) in /v1/chat/completions", s)
-    if m:
-        return (f"{m.group(1)} cannot call tools on Chat Completions, the "
-                "endpoint sys_agent uses, so it cannot propose commands. "
-                "OpenAI's suggested reasoning_effort='none' is rejected by "
-                "some models (gpt-6-astra and gpt-6.1-sol among them). Pick a "
-                "listed model "
-                "with /models. See "
-                "docs/advanced-usage.md#unsupported-openai-gpt-6-astra.")
     if code == 529 or "overloaded" in s.lower():
         return ("API overloaded (529) — the provider is at capacity. "
                 "Retries were exhausted. Wait a minute and resend, or try "
@@ -4022,15 +4207,19 @@ def unlisted_model_warning(provider_name: str, model: str) -> str:
 
 def thinking_active(provider: Provider, flag: bool) -> bool:
     """True when thinking will actually run: the flag is set AND the provider
-    honors it, or the Anthropic model cannot disable thinking at all.
+    honors it, or the model cannot disable thinking at all.
 
-    Thinking is supported on Anthropic and DeepSeek; on any other provider the
-    flag is inert, so callers should report *effective* state through this
-    rather than the raw flag to avoid implying thinking is running when it is
-    not (or, for _THINKING_ALWAYS_ON_MODELS, not running when it is).
+    Thinking is supported on Anthropic, DeepSeek, and the OpenAI models in
+    _OPENAI_REASONING_EFFORTS; elsewhere the flag is inert, so callers should
+    report *effective* state through this rather than the raw flag to avoid
+    implying thinking is running when it is not (or, for always-on models,
+    not running when it is).
     """
     if provider.name == "anthropic" and _thinking_always_on(provider.model):
         return True
+    if provider.name == "openai":
+        return (_openai_always_reasons(provider.model)
+                or (flag and provider.model in _OPENAI_REASONING_EFFORTS))
     return flag and provider.name in ("anthropic", "deepseek")
 
 
@@ -4041,6 +4230,9 @@ def thinking_status(provider: Provider, flag: bool) -> str:
     if (not flag and provider.name == "anthropic"
             and _thinking_always_on(provider.model)):
         return f"on (always on for {provider.model})"
+    if (not flag and provider.name == "openai"
+            and _openai_always_reasons(provider.model)):
+        return f"on (always on for {provider.model}: lowest effort is low)"
     if (not flag and provider.name == "anthropic"
             and _thinking_unverified(provider.model)):
         return f"off (unverified for {provider.model}: it may think by default)"
@@ -4052,17 +4244,22 @@ def thinking_status(provider: Provider, flag: bool) -> str:
         return "off"
     if provider.name in ("anthropic", "deepseek"):
         return "on"
-    return f"on (inactive: {provider.name})"
+    if provider.name == "openai" and provider.model in _OPENAI_REASONING_EFFORTS:
+        return "on"
+    return f"on (inactive: {provider.name}/{provider.model})"
 
 
 def effort_applies(provider: Provider) -> bool:
     """True when the active provider/model honors the effort setting:
-    DeepSeek (reasoning_effort) or an Anthropic adaptive-thinking model.
-    OpenAI and Anthropic legacy (Haiku 4.5) thinking ignore it."""
+    DeepSeek (reasoning_effort), an Anthropic adaptive-thinking model, or an
+    OpenAI model with probed grades (reasoning.effort). Anthropic legacy
+    (Haiku 4.5) thinking and non-reasoning OpenAI models ignore it."""
     if provider.name == "deepseek":
         return True
     if provider.name == "anthropic":
         return _thinking_mode(provider.model) == "adaptive"
+    if provider.name == "openai":
+        return provider.model in _OPENAI_REASONING_EFFORTS
     return False
 
 
@@ -4082,6 +4279,10 @@ def effective_effort(provider: Provider, effort: str) -> tuple[str, str]:
         if mapped != effort:
             return mapped, "rounded up to DeepSeek grade"
         return mapped, ""
+    if provider.name == "openai":
+        sent = _openai_effort(provider.model, True, effort)
+        if sent is not None and sent != effort:
+            return sent, f"capped at {provider.model}'s highest grade"
     return effort, ""
 
 
@@ -4698,7 +4899,10 @@ def run_repl(provider: Provider) -> None:
                 "thinking_active": thinking_active(provider, thinking_enabled),
                 "thinking_mode": (
                     _thinking_mode(provider.model) if provider.name == "anthropic"
-                    else ("reasoning_effort" if provider.name == "deepseek" else None)
+                    else ("reasoning_effort" if provider.name == "deepseek"
+                          else ("reasoning.effort" if provider.name == "openai"
+                                and provider.model in _OPENAI_REASONING_EFFORTS
+                                else None))
                 ),
                 "effort": effort,
                 "color": _color_enabled,
@@ -5077,7 +5281,7 @@ def run_repl(provider: Provider) -> None:
             # is only the uncached remainder, a handful of tokens per call
             # once the conversation is cached, so summing it made the
             # session total read near zero there while OpenAI's
-            # prompt_tokens counted everything. The per-turn line still
+            # input_tokens counted everything. The per-turn line still
             # breaks out in / cache read / cache write, which bill
             # differently.
             session_in += last_usage.context_tokens

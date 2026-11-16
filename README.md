@@ -41,9 +41,8 @@ You will need:
 - **An API key from OpenAI, Anthropic, or DeepSeek.** This is a private access
   key for the AI service you choose. One provider is enough. Check that
   provider's API billing before use; do not assume a chat subscription
-  includes it. OpenAI's GPT-6 Astra does not work with sys_agent yet; GPT-6
-  Luna and Sol, and the default OpenAI model, do. See
-  [why](docs/advanced-usage.md#unsupported-openai-gpt-6-astra).
+  includes it. See [OpenAI models](docs/advanced-usage.md#openai-models)
+  for the OpenAI choices.
 
 ### What runs locally, and what is shared?
 
