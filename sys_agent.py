@@ -553,7 +553,7 @@ def _thinking_off_payload(model: str) -> dict[str, str] | None:
 # chat() gives these models the thinking-on token cap and streaming path
 # regardless — a 4096 cap sized for no-thinking turns could truncate a hard
 # turn, and the SDK's non-streaming guard rejects the larger cap.
-# thinking_status()/thinking_active() report them as on either way.
+# Provider.thinking_status()/thinking_active() report them as on either way.
 _THINKING_ALWAYS_ON_MODELS = frozenset({
     "claude-opus-5-5", "claude-fable-5", "claude-fable-5-1",
     "claude-fable-5-2",
@@ -3206,6 +3206,53 @@ class Provider:
         # turn there is several input items (a message plus function_calls).
         messages.append(self.render_assistant(text, tool_calls))
 
+    # Thinking/effort capability. Each provider answers for its own model so
+    # the REPL's displays never branch on provider name. The defaults describe
+    # a model with no reasoning control, where the session flag is inert.
+
+    def _honors_thinking(self) -> bool:
+        """The model thinks when the session flag is on."""
+        return False
+
+    def _always_thinks(self) -> bool:
+        """The model thinks even with the flag off (it cannot be disabled)."""
+        return False
+
+    def _thinking_off_status(self) -> str:
+        return "off"
+
+    def thinking_active(self, flag: bool) -> bool:
+        """True when thinking will actually run. Displays report effective
+        state through this rather than the raw flag, so they never imply
+        thinking is running when it is not (or, for always-on models, not
+        running when it is)."""
+        return self._always_thinks() or (flag and self._honors_thinking())
+
+    def thinking_status(self, flag: bool) -> str:
+        """Display text: off / on / on-but-inactive. Models that cannot
+        disable thinking read as on with the flag off, so /thinking off never
+        claims a state the model is not in."""
+        if not flag:
+            return self._thinking_off_status()
+        if self._honors_thinking():
+            return "on"
+        return f"on (inactive: {self.name}/{self.model})"
+
+    def effort_applies(self) -> bool:
+        """True when the model honors the session effort setting."""
+        return False
+
+    def effective_effort(self, effort: str) -> tuple[str, str]:
+        """(grade actually sent, note) for a requested effort; note is ""
+        unless the provider changed the value. Display-only: the stored
+        session effort keeps the user's request, so switching to a
+        finer-grained provider still honors it."""
+        return effort, ""
+
+    def thinking_mode(self) -> str | None:
+        """The wire control /info reports, or None when there is none."""
+        return None
+
 
 class OpenAIProvider(Provider):
     """OpenAI via the Responses API (/v1/responses), for every OpenAI model.
@@ -3252,6 +3299,31 @@ class OpenAIProvider(Provider):
     def initial_messages(self, system: str) -> list[dict]:
         # System prompt goes in `instructions` on each call, not in input.
         return []
+
+    # Only models with probed grades get a reasoning field (no row = none;
+    # gpt-4o-mini 400s on one), so only they honor thinking and effort.
+    def _honors_thinking(self) -> bool:
+        return self.model in _OPENAI_REASONING_EFFORTS
+
+    def _always_thinks(self) -> bool:
+        return _openai_always_reasons(self.model)
+
+    def _thinking_off_status(self) -> str:
+        if self._always_thinks():
+            return f"on (always on for {self.model}: lowest effort is low)"
+        return "off"
+
+    def effort_applies(self) -> bool:
+        return self._honors_thinking()
+
+    def effective_effort(self, effort: str) -> tuple[str, str]:
+        sent = _openai_effort(self.model, True, effort)
+        if sent is not None and sent != effort:
+            return sent, f"capped at {self.model}'s highest grade"
+        return effort, ""
+
+    def thinking_mode(self) -> str | None:
+        return "reasoning.effort" if self._honors_thinking() else None
 
     def chat(
         self, messages: list[dict], system: str,
@@ -3491,6 +3563,20 @@ class DeepSeekProvider(ChatCompletionsProvider):
         self.model = model
         self.name = "deepseek"
 
+    def _honors_thinking(self) -> bool:
+        return True
+
+    def effort_applies(self) -> bool:
+        return True
+
+    def effective_effort(self, effort: str) -> tuple[str, str]:
+        # Three grades (low|high|max); medium and xhigh round up (_EFFORT_MAP).
+        mapped = self._map_effort(effort)
+        return mapped, ("" if mapped == effort else "rounded up to DeepSeek grade")
+
+    def thinking_mode(self) -> str | None:
+        return "reasoning_effort"
+
     def chat(
         self, messages: list[dict], system: str,
         thinking: bool = False, effort: str = "high",
@@ -3566,6 +3652,30 @@ class AnthropicProvider(Provider):
     def initial_messages(self, system: str) -> list[dict]:
         # Anthropic: system prompt is a top-level parameter, not in messages
         return []
+
+    def _honors_thinking(self) -> bool:
+        return True
+
+    def _always_thinks(self) -> bool:
+        return _thinking_always_on(self.model)
+
+    def _thinking_off_status(self) -> str:
+        if self._always_thinks():
+            return f"on (always on for {self.model})"
+        if _thinking_unverified(self.model):
+            return f"off (unverified for {self.model}: it may think by default)"
+        off = _thinking_off_payload(self.model)
+        if off and off.get("type") == "between_tools":
+            return "off (between_tools: notes between tool calls still shown)"
+        return "off"
+
+    def effort_applies(self) -> bool:
+        # Adaptive models honor all five grades verbatim; legacy (Haiku 4.5)
+        # thinking ignores effort.
+        return _thinking_mode(self.model) == "adaptive"
+
+    def thinking_mode(self) -> str | None:
+        return _thinking_mode(self.model)
 
     def chat(
         self, messages: list[dict], system: str,
@@ -4113,87 +4223,6 @@ def unlisted_model_warning(provider_name: str, model: str) -> str:
             f"switching anyway{tail}]")
 
 
-def thinking_active(provider: Provider, flag: bool) -> bool:
-    """True when thinking will actually run: the flag is set AND the provider
-    honors it, or the model cannot disable thinking at all.
-
-    Thinking is supported on Anthropic, DeepSeek, and the OpenAI models in
-    _OPENAI_REASONING_EFFORTS; elsewhere the flag is inert, so callers should
-    report *effective* state through this rather than the raw flag to avoid
-    implying thinking is running when it is not (or, for always-on models,
-    not running when it is).
-    """
-    if provider.name == "anthropic" and _thinking_always_on(provider.model):
-        return True
-    if provider.name == "openai":
-        return (_openai_always_reasons(provider.model)
-                or (flag and provider.model in _OPENAI_REASONING_EFFORTS))
-    return flag and provider.name in ("anthropic", "deepseek")
-
-
-def thinking_status(provider: Provider, flag: bool) -> str:
-    """Human-readable thinking state for displays: off / on / on-but-inactive.
-    Models that cannot disable thinking read as on even when the flag is off,
-    so /thinking off never claims a state the model is not in."""
-    if (not flag and provider.name == "anthropic"
-            and _thinking_always_on(provider.model)):
-        return f"on (always on for {provider.model})"
-    if (not flag and provider.name == "openai"
-            and _openai_always_reasons(provider.model)):
-        return f"on (always on for {provider.model}: lowest effort is low)"
-    if (not flag and provider.name == "anthropic"
-            and _thinking_unverified(provider.model)):
-        return f"off (unverified for {provider.model}: it may think by default)"
-    if not flag:
-        off = (_thinking_off_payload(provider.model)
-               if provider.name == "anthropic" else None)
-        if off and off.get("type") == "between_tools":
-            return "off (between_tools: notes between tool calls still shown)"
-        return "off"
-    if provider.name in ("anthropic", "deepseek"):
-        return "on"
-    if provider.name == "openai" and provider.model in _OPENAI_REASONING_EFFORTS:
-        return "on"
-    return f"on (inactive: {provider.name}/{provider.model})"
-
-
-def effort_applies(provider: Provider) -> bool:
-    """True when the active provider/model honors the effort setting:
-    DeepSeek (reasoning_effort), an Anthropic adaptive-thinking model, or an
-    OpenAI model with probed grades (reasoning.effort). Anthropic legacy
-    (Haiku 4.5) thinking and non-reasoning OpenAI models ignore it."""
-    if provider.name == "deepseek":
-        return True
-    if provider.name == "anthropic":
-        return _thinking_mode(provider.model) == "adaptive"
-    if provider.name == "openai":
-        return provider.model in _OPENAI_REASONING_EFFORTS
-    return False
-
-
-def effective_effort(provider: Provider, effort: str) -> tuple[str, str]:
-    """Map a requested effort level to the grade the active provider will
-    actually run, plus a short note when the request was clamped.
-
-    DeepSeek's thinking mode exposes three grades (low|high|max); medium and
-    xhigh round up to the next grade (see DeepSeekProvider._EFFORT_MAP).
-    Anthropic adaptive models honor all five verbatim. The stored
-    session effort keeps the user's requested level (so switching to a
-    finer-grained provider still honors it); this mapping is display-only.
-
-    Returns (shown_grade, note); note is "" unless clamping changed the value."""
-    if provider.name == "deepseek":
-        mapped = DeepSeekProvider._map_effort(effort)
-        if mapped != effort:
-            return mapped, "rounded up to DeepSeek grade"
-        return mapped, ""
-    if provider.name == "openai":
-        sent = _openai_effort(provider.model, True, effort)
-        if sent is not None and sent != effort:
-            return sent, f"capped at {provider.model}'s highest grade"
-    return effort, ""
-
-
 def effort_display(provider: Provider, effort: str, thinking_on: bool) -> tuple[str, str]:
     """(shown_grade, note) for any effort readout — the single source of truth
     shared by the /effort set-confirmation and the bare readout, so the two
@@ -4203,9 +4232,9 @@ def effort_display(provider: Provider, effort: str, thinking_on: bool) -> tuple[
       - DeepSeek rounded the grade         -> "rounded up to DeepSeek grade"
       - effort honored but thinking is off -> append "needs /thinking on"
     """
-    if not effort_applies(provider):
+    if not provider.effort_applies():
         return effort, "no effect on this provider/model"
-    shown, clamp = effective_effort(provider, effort)
+    shown, clamp = provider.effective_effort(effort)
     notes = [clamp] if clamp else []
     if not thinking_on:
         notes.append("needs /thinking on")
@@ -4220,7 +4249,7 @@ def _effort_usage_levels(provider: Provider) -> tuple[str, ...]:
     *accepted* inputs everywhere (DeepSeek rounds); this only shapes the hint."""
     seen: list[str] = []
     for lvl in _VALID_EFFORTS:
-        grade, _ = effective_effort(provider, lvl)
+        grade, _ = provider.effective_effort(lvl)
         if grade not in seen:
             seen.append(grade)
     return tuple(seen)
@@ -4246,7 +4275,7 @@ def print_help(
     print(dim(
         f"  state: auto-approve={auto_approve}  "
         f"show-tokens={show_tokens}  "
-        f"thinking={thinking_status(provider, thinking_enabled)}  "
+        f"thinking={provider.thinking_status(thinking_enabled)}  "
         f"effort={effort}  "
         f"color={_color_enabled}  "
         f"audit={'on' if _audit_path else 'off'}"
@@ -4676,10 +4705,10 @@ def run_repl(provider: Provider) -> None:
                 rec["stderr"] = stderr[:OUTPUT_MAX_CHARS]
         write_audit(rec)
 
-    if thinking_enabled or thinking_active(provider, thinking_enabled):
-        thinking_note = f"  thinking={thinking_status(provider, thinking_enabled)}"
-        if (thinking_enabled and thinking_active(provider, thinking_enabled)
-                and effort_applies(provider)):
+    if thinking_enabled or provider.thinking_active(thinking_enabled):
+        thinking_note = f"  thinking={provider.thinking_status(thinking_enabled)}"
+        if (thinking_enabled and provider.thinking_active(thinking_enabled)
+                and provider.effort_applies()):
             thinking_note += f" effort={effort}"
     else:
         thinking_note = ""
@@ -4804,14 +4833,8 @@ def run_repl(provider: Provider) -> None:
                 "auto_approve": auto_approve,
                 "show_tokens": show_tokens,
                 "thinking_enabled": thinking_enabled,
-                "thinking_active": thinking_active(provider, thinking_enabled),
-                "thinking_mode": (
-                    _thinking_mode(provider.model) if provider.name == "anthropic"
-                    else ("reasoning_effort" if provider.name == "deepseek"
-                          else ("reasoning.effort" if provider.name == "openai"
-                                and provider.model in _OPENAI_REASONING_EFFORTS
-                                else None))
-                ),
+                "thinking_active": provider.thinking_active(thinking_enabled),
+                "thinking_mode": provider.thinking_mode(),
                 "effort": effort,
                 "color": _color_enabled,
                 "audit_enabled": _audit_path is not None,
@@ -4929,11 +4952,11 @@ def run_repl(provider: Provider) -> None:
             if len(parts) == 2 and parts[1] in ("on", "off"):
                 thinking_enabled = parts[1] == "on"
                 print(dim(
-                    f"[thinking = {thinking_status(provider, thinking_enabled)}]"
+                    f"[thinking = {provider.thinking_status(thinking_enabled)}]"
                 ))
             else:
                 print(dim(
-                    f"[thinking = {thinking_status(provider, thinking_enabled)}]"
+                    f"[thinking = {provider.thinking_status(thinking_enabled)}]"
                     "  usage: /thinking on|off"
                 ))
             continue
@@ -5156,7 +5179,7 @@ def run_repl(provider: Provider) -> None:
             # long). Activity stops + clears its line on __exit__ — including
             # the KeyboardInterrupt path below, before the rollback prints.
             act_label = ("thinking"
-                         if thinking_active(provider, thinking_enabled)
+                         if provider.thinking_active(thinking_enabled)
                          else "working")
             try:
                 with Activity(act_label):

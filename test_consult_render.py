@@ -186,9 +186,9 @@ for lvl, grade in exp.items():
     if DS.client.kw.get("extra_body") != {"thinking": {"type": "enabled"}, "reasoning_effort": grade}:
         ok_on = False
 ok_lv = S._effort_usage_levels(DS) == ("low", "high", "max")
-ok_note = (S.effective_effort(DS, "low") == ("low", "")
-           and S.effective_effort(DS, "medium")[1] != ""
-           and S.effective_effort(DS, "max") == ("max", ""))
+ok_note = (DS.effective_effort("low") == ("low", "")
+           and DS.effective_effort("medium")[1] != ""
+           and DS.effective_effort("max") == ("max", ""))
 ok_ds = ok_off and ok_on and ok_lv and ok_note
 print(f"[deepseek] thinking off->disabled, effort low|high|max mapping: {'OK' if ok_ds else 'FAIL'}")
 if not ok_ds: fails.append("ds-thinking")
@@ -504,13 +504,13 @@ _luna = _mk(S.OpenAIProvider, "openai", "gpt-6-luna")
 _4o = _mk(S.OpenAIProvider, "openai", "gpt-4o-mini")
 _mini = _mk(S.OpenAIProvider, "openai", "gpt-5.4-mini")
 ok_disp = (
-    S.thinking_active(_sol, False) and S.thinking_status(_sol, False).startswith("on (always on")
-    and not S.thinking_active(_luna, False) and S.thinking_status(_luna, False) == "off"
-    and S.thinking_active(_luna, True) and S.thinking_status(_luna, True) == "on"
-    and not S.thinking_active(_4o, True) and "inactive" in S.thinking_status(_4o, True)
-    and S.effort_applies(_luna) and not S.effort_applies(_4o)
-    and S.effective_effort(_mini, "max")[0] == "xhigh"
-    and S.effective_effort(_luna, "max") == ("max", "")
+    _sol.thinking_active(False) and _sol.thinking_status(False).startswith("on (always on")
+    and not _luna.thinking_active(False) and _luna.thinking_status(False) == "off"
+    and _luna.thinking_active(True) and _luna.thinking_status(True) == "on"
+    and not _4o.thinking_active(True) and "inactive" in _4o.thinking_status(True)
+    and _luna.effort_applies() and not _4o.effort_applies()
+    and _mini.effective_effort("max")[0] == "xhigh"
+    and _luna.effective_effort("max") == ("max", "")
     and S._effort_usage_levels(_mini) == ("low", "medium", "high", "xhigh"))
 print(f"[openai] thinking/effort displays match the effort table: "
       f"{'OK' if ok_disp else 'FAIL'}")
@@ -684,20 +684,20 @@ print(f"[anthropic] conversation cached on every live request, not on "
 if not ok_cache: fails.append("conversation-cache")
 _prov = lambda m: _mk(S.AnthropicProvider, "anthropic", m)
 ok_ant = (_ant_got == _ant_want
-          and S.thinking_status(_prov("claude-opus-5-5"), False)
+          and _prov("claude-opus-5-5").thinking_status(False)
               == "on (always on for claude-opus-5-5)"
-          and S.thinking_active(_prov("claude-opus-5-5"), False)
-          and S.thinking_status(_prov("claude-fable-5-2"), False)
+          and _prov("claude-opus-5-5").thinking_active(False)
+          and _prov("claude-fable-5-2").thinking_status(False)
               == "on (always on for claude-fable-5-2)"
-          and S.thinking_status(_prov("claude-haiku-4-5-20251001"), False) == "off"
-          and not S.thinking_active(_prov("claude-haiku-4-5-20251001"), False)
-          and S.thinking_status(_prov("claude-sonnet-5-5"), False)
+          and _prov("claude-haiku-4-5-20251001").thinking_status(False) == "off"
+          and not _prov("claude-haiku-4-5-20251001").thinking_active(False)
+          and _prov("claude-sonnet-5-5").thinking_status(False)
               .startswith("off (between_tools")
-          and not S.thinking_active(_prov("claude-sonnet-5-5"), False)
-          and S.thinking_status(_prov("claude-haiku-5-5"), False) == "off"
-          and S.thinking_status(_prov("claude-opus-6"), False)
+          and not _prov("claude-sonnet-5-5").thinking_active(False)
+          and _prov("claude-haiku-5-5").thinking_status(False) == "off"
+          and _prov("claude-opus-6").thinking_status(False)
               == "off (unverified for claude-opus-6: it may think by default)"
-          and S.thinking_status(_prov("claude-opus-6"), True) == "on"
+          and _prov("claude-opus-6").thinking_status(True) == "on"
           and "thinking default is unverified"
               in S.unlisted_model_warning("anthropic", "claude-opus-6")
           and "unverified" not in S.unlisted_model_warning(
