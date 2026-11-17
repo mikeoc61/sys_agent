@@ -270,6 +270,8 @@ for their names and settings.
   disk-health detection, execution controls, audit format, and architecture.
 - **[Model monitoring](docs/model-monitoring.md):** check provider inventories and
   give a monitoring agent evidence for model-update suggestions.
+- **[Model notes](docs/models.md):** prices, test results, and why each model is
+  listed, unlisted, or removed.
 
 sys_agent is designed for interactive system administration. It is not a coding
 agent — use a tool built for authoring code for that — and it is not

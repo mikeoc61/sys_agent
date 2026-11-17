@@ -55,6 +55,10 @@ should say:
 > concrete update is warranted or when coverage needs repair. Do not edit
 > sys_agent or switch its default model automatically.
 
+The evidence behind sys_agent's current choices (prices, earlier probe
+results, why each model is listed or not) is in [Model notes](models.md),
+which gives the monitor a baseline to compare new findings against.
+
 Provider inventory is an early signal, not a support verdict. OpenAI's list
 provides little capability metadata; model IDs there can include models meant
 for other tasks. An ID absent from an account's list may reflect access rather

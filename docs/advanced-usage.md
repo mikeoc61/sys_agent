@@ -86,6 +86,8 @@ The OpenAI model list, in order:
 | `gpt-6.1-sol` | $2 / $10 | Newest Sol; always reasons |
 | `gpt-5.4-mini` | $0.75 / $4.50 | Default until 2026-11-16 |
 
+[Model notes](models.md) has the prices and test results behind each choice.
+
 `gpt-6.1-sol` always reasons: it rejects reasoning effort `none`, so with
 `/thinking off` sys_agent sends its lowest grade, `low`, and the state reads
 `on (always on ...)`.

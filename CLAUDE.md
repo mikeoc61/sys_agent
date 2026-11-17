@@ -11,7 +11,9 @@ the tool is, the safety model, install, first session, everyday commands.
 Reference material lives in `docs/` — `configuration.md` (all `SYS_*` vars,
 files, alternative install), `advanced-usage.md` (all meta-commands, consult,
 thinking, line editing), `technical-reference.md` (host facts, hardware
-identity, SMART, safety layers, audit format, architecture). Keep new detail
+identity, SMART, safety layers, audit format, architecture), `models.md`
+(per-model evidence: prices, probes, why each model is listed, unlisted or
+removed). Keep new detail
 out of the README; link to the page that owns it.
 
 ## Hard constraints
@@ -28,7 +30,9 @@ out of the README; link to the page that owns it.
   entry at import (without it, Backspace echoed a space on the Pi).
 - **Model changes touch PROVIDER & MODEL CONFIG only** (`DEFAULT_*_MODEL`,
   `CONTEXT_WINDOWS`, `PROVIDER_MODELS`, `PROVIDER_MODEL_PREFIXES`) plus
-  provider-specific request quirks in the provider class.
+  provider-specific request quirks in the provider class. The evidence for a
+  model goes in its `docs/models.md` entry, not in config comments, which keep
+  only what the code relies on.
 
 ## Targets and backend asymmetries
 - Real sessions launch through the `~/.local/bin/sys_agent` symlink (shebang

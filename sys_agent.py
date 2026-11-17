@@ -134,191 +134,32 @@ from typing import Any
 #   1. add it to PROVIDER_MODELS under its provider,
 #   2. add a CONTEXT_WINDOWS entry so the context-% display works,
 #   3. if it introduces a new name prefix, extend PROVIDER_MODEL_PREFIXES.
-# Nothing below this section needs to change for a model update.
+# Nothing below this section needs to change for a model update. The evidence
+# behind each choice (prices, probes, why a model is listed, unlisted or
+# removed) is in docs/models.md: update its entry in the same commit.
 # =============================================================================
 
 # Default model per provider, overridable via env. Defaults favor dependable
 # tool calling at a sensible price tier; switch at runtime with /model.
-# Every OpenAI model runs on the Responses API (see OpenAIProvider); the
-# effort each accepts is in _OPENAI_REASONING_EFFORTS below.
-# OpenAI options (verified Nov 2026; prices per 1M tok, in/out), in picker
-# order:
-#   gpt-6-luna    — $0.10/$0.50, GPT-6 low tier. Default since 2026-11-16.
-#                   Probe 2026-09-23 (Chat Completions): tool call -> replay
-#                   -> final answer round-trips with effort "none".
-#                   Probe 2026-11-16 (Pi, real system prompt, 3-prompt canned
-#                   session, twice, Chat Completions at effort "none"):
-#                   correct answers both runs at about a seventh of
-#                   gpt-5.4-mini's cost. One run chained commands with &&
-#                   against the one-step-per-call rule, so its discipline is
-#                   weaker than mini's; the evidence is three easy read-only
-#                   prompts, nothing multi-step. On Responses it reasons with
-#                   tools (79 reasoning tokens at "high", probe 2026-11-16).
-#   gpt-6.1-terra — $1/$5, cached input $0.05 (docs 2026-11-16; knowledge
-#                   cutoff 2026-06-01). GPT-6.1 mid tier, the middle pick.
-#   gpt-6-sol     — $2/$10, GPT-6 tier above Luna (GPT-6 had no Terra; in
-#                   GPT-5.6 Sol was the top). Not deprecated (deprecations
-#                   page, 2026-11-16).
-#   gpt-6.1-sol   — $2/$10, cached input $0.10. Same price as gpt-6-sol, one
-#                   generation newer. Always reasons: rejects effort "none"
-#                   and "minimal". Tools work only on the Responses API
-#                   (OpenAI reasoning guide: "Chat Completions does not
-#                   support function calling with GPT-6 Astra or GPT-6.1
-#                   Sol"); unusable here until the Responses path landed.
-#   gpt-5.4-mini  — $0.75/$4.50, 400K context. The default until 2026-11-16.
-#                   Kept listed as the fallback when a newer model falls
-#                   short. No deprecation entry (2026-11-16).
-# All GPT-6 / GPT-6.1 models: 1.05M context / 128K max output; above 272K
-# input, 2x input and 1.5x output rates.
-# Why not Chat Completions (history): there, GPT-5.6 and every GPT-6 model
-# except the two below accept function tools only at reasoning_effort "none"
-# (they ran as non-reasoning models here until the Responses path), and
-# gpt-6-astra / gpt-6.1-sol reject tools at every effort including "none"
-# (probes 2026-09-23, 2026-11-16).
-# Unlisted (CONTEXT_WINDOWS entries and effort-table rows kept, so
-# SYS_OPENAI_MODEL pins and /model still work via the "gpt-" prefix
-# fallback):
-#   gpt-6-astra   — Flagship, $10/$50: price alone puts it in the
-#                   claude-fable-5 tier, the wrong tier for routine host
-#                   work. Works on the Responses path; always reasons.
-#   gpt-4o-mini   — $0.15/$0.60; costlier than gpt-6-luna both ways and the
-#                   chattiest tier: under tool_choice=auto it tends to ASK
-#                   ("Would you like me to check…?") instead of emitting the
-#                   run_command call, stalling multi-step investigations.
-#                   Not a reasoning model: Responses 400s on reasoning.effort,
-#                   so it gets no reasoning field.
-#   gpt-5.6-luna  — $0.20/$1.20; gpt-6-luna is cheaper, same constraints.
-#   gpt-5.6-terra — $2/$12; gpt-6-sol matches input, cheaper output.
-#   gpt-5.6-sol   — $5/$30; never listed (wrong tier for this tool).
-# Removed outright 2026-11-11 (list, window, and all): gpt-4.1-nano — OpenAI
-# shut it down 2026-10-23 (deprecations page), so no pin can work and a
-# window entry would only make a dead model look supported. gpt-6-luna is
-# the low-cost pick ($0.10/$0.50 vs nano's $0.10/$0.40).
+#
+# OpenAI: every model runs on the Responses API (see OpenAIProvider); the
+# effort each accepts is in _OPENAI_REASONING_EFFORTS below. gpt-6-luna is
+# the cheapest listed model ($0.10/$0.50 per 1M tokens) and answered a canned
+# Pi session correctly; gpt-5.4-mini stays listed as the fallback.
 DEFAULT_OPENAI_MODEL = "gpt-6-luna"            # override: SYS_OPENAI_MODEL
 
-# Anthropic options (verified Oct 2026; prices per 1M tok, in/out):
-#   claude-haiku-5-5           — $0.10/$0.50, cache reads $0.01, for prompts
-#                                up to 100K tokens; $0.50/$2.50 above (whole
-#                                request, cache tokens counted). API 2026-10-07.
-#                                Adaptive thinking runs by DEFAULT absent the
-#                                thinking field; {"type":"disabled"} accepted at
-#                                effort high or below (thinking docs, Oct 2026),
-#                                so it is in _THINKING_OFF_PAYLOAD. Server
-#                                default effort is medium. Accepts forced
-#                                tool_choice; rejects prefill and sampling
-#                                params (neither used here). Default since
-#                                2026-11-11: live_probe haiku55_off/on
-#                                passed on the Pi 2026-10-20 and again
-#                                2026-11-11, at about one seventh of Haiku
-#                                4.5's cost per session.
-#   claude-sonnet-5-5          — $2/$10, cache reads $0.10 (0.05x; Sonnet 5:
-#                                $0.20). API 2026-09-28. Adaptive thinking runs
-#                                by DEFAULT; {"type":"disabled"} 400s. Its
-#                                lowest setting is {"type":"between_tools"}: no
-#                                up-front thinking, but notes written between
-#                                tool calls still return as thinking blocks
-#                                with summary text (shown dimmed like any
-#                                thinking). Accepted at effort high or below and
-#                                takes no other field; the off branch sends no
-#                                effort, so the server default (high) applies.
-#                                Models API capabilities.thinking.types
-#                                .between_tools (2026-10-15): true only here.
-#                                Rejects forced tool_choice (unused here: auto).
-#   claude-opus-5-5            — $4/$20, cache reads $0.20 (0.05x). Current
-#                                Opus (API 2026-09-21). THINKING ALWAYS ON:
-#                                thinking={"type":"disabled"} 400s at every
-#                                effort (probe 2026-09-24), so it is in
-#                                _THINKING_ALWAYS_ON_MODELS, never in
-#                                _THINKING_OFF_PAYLOAD. Server default
-#                                effort is medium (Opus 5: high). Probe with
-#                                sys_agent's thinking-off request shape (no
-#                                thinking field): clean run_command calls,
-#                                169-490 output tokens per turn over a 4-turn
-#                                session; empty thinking blocks (display
-#                                "omitted") replay without error. Rejects
-#                                forced tool_choice (unused here: auto).
-# Dropped from PROVIDER_MODELS (CONTEXT_WINDOWS entries and thinking-set
-# membership kept, so SYS_ANTHROPIC_MODEL pins and /model still work via the
-# prefix fallback):
-#   claude-haiku-4-5-20251001  — $1/$5; the default until 2026-11-11, when
-#                                Haiku 5.5 replaced it at a tenth of the
-#                                price. Legacy enabled+budget_tokens
-#                                thinking (_thinking_mode), 200K window.
-#   claude-sonnet-5            — $2/$10; Sonnet 5.5 has the same price and
-#                                half the cache-read rate (dropped 2026-10-20).
-#                                Thinking on by default; off is
-#                                {"type":"disabled"} (_THINKING_OFF_PAYLOAD).
-#   claude-opus-5              — $5/$25; Opus 5.5 is cheaper and newer.
-#                                Thinking on by default but can be disabled, so
-#                                it stays in _THINKING_OFF_PAYLOAD for
-#                                pins. Opus 5 400s on disabled at effort
-#                                xhigh|max; not hit here (the disabled branch
-#                                sends no effort, so the server default, high,
-#                                applies). With thinking off it can emit a
-#                                proposed command as text instead of tool_use.
-#   claude-opus-4-8            — $5/$25, thinking off by default; dominated by
-#                                Opus 5.5 on price.
-#   claude-opus-4-7            — $5/$25, two generations old.
-#   claude-sonnet-4-6          — $3/$15; Sonnet 5.5 is cheaper. Active upstream,
-#                                retirement not before Feb 17, 2027.
-# Never listed (wrong tier for this tool, cf. gpt-6-astra):
-#   claude-fable-5, claude-fable-5-1 — $10/$50, thinking ALWAYS ON (in
-#                                _THINKING_ALWAYS_ON_MODELS). Fable 5.1 (API
-#                                2026-08-28) also rejects forced tool_choice.
-#                                CONTEXT_WINDOWS entries only.
-#   claude-fable-5-2           — $8/$40, cache reads $0.20 (API 2026-11-09).
-#                                Same surface as Fable 5.1: thinking ALWAYS
-#                                ON, server default effort high, rejects
-#                                forced tool_choice. Enforces the
-#                                history-editing check on replayed thinking
-#                                blocks for EVERY account (5.1: new accounts
-#                                only). The REPL passes it: its only edits
-#                                are whole-turn tail rollbacks, and a system
-#                                prompt change resets the conversation.
-#                                Probe 2026-11-11 (Pi, live_probe fable52_*):
-#                                no thinking field -> thinking blocks on
-#                                tool turns, replayed with no 400 across an
-#                                on/off toggle and after a turn rollback.
-#                                CONTEXT_WINDOWS and always-on entries only.
+# Anthropic: claude-haiku-5-5 ($0.10/$0.50 for prompts up to 100K tokens)
+# passed live_probe haiku55_off/on on the Pi at about a seventh of Haiku
+# 4.5's cost per session. Per-model thinking behavior is in the _THINKING_*
+# tables below.
 DEFAULT_ANTHROPIC_MODEL = "claude-haiku-5-5"   # override: SYS_ANTHROPIC_MODEL
 
-# DeepSeek options (verified Oct 2026):
-#   deepseek-flash     — DeepSeek-V4.1-Flash (released 2026-09-10), new causal
-#                        encoder-decoder arch, 8B/16B active (input/output).
-#                        1M context, 384K max output, thinking + non-thinking,
-#                        tool calling, native vision (unused here). Per 1M tok,
-#                        off-peak/peak: in $0.15/$0.30 (cache hit $0.003/$0.006),
-#                        out $0.60/$1.20. Peak = 01-04 & 06-10 UTC Mon-Fri.
-#                        Unversioned alias: tracks DeepSeek's current Flash.
-#                        Now served by DeepSeek-V4.1-Flash-1017 (open-weights
-#                        minor update; per DeepSeek's docs, calling method
-#                        unchanged, 2026-10-20). The API reports only the
-#                        alias, so the snapshot is docs-asserted, not
-#                        probe-verifiable. Replay + thinking on/off/toggle
-#                        verified on the Pi via tools/live_probe.py ds_* checks.
-#                        Default.
-#   deepseek-v4-pro    — DeepSeek-V4-Pro-0813 (GA 2026-08-13). Per 1M tok,
-#                        off-peak/peak: in $0.66/$1.32 (cache hit $0.022/
-#                        $0.044), out $1.98/$3.96. 1M context, 384K max output,
-#                        thinking default on, effort low|high|max (default high).
-#                        The stronger DeepSeek option, though older than Flash.
-#                        NOT retired: the 2026-09-10 release notice announced
-#                        routing it to V4.1-Flash from 09-14, but the changelog
-#                        reversed that the same day ("in response to user
-#                        demand": service continues, billing unchanged). The
-#                        news page still shows the routing notice; the API is
-#                        authoritative — probe 2026-09-24: response `model` is
-#                        deepseek-v4-pro, and a 4-turn tool session replays
-#                        reasoning_content cleanly with thinking on and off.
-#                        Expect this name to move again when V4.1-Pro ships.
-#   deepseek-v4-flash  — Retired; server-routed to V4.1-Flash-1017, billed at
-#                        the Flash price (probe 2026-10-20: response `model`
-#                        reports deepseek-flash). Window entry kept for
-#                        existing SYS_DEEPSEEK_MODEL pins.
-# Thinking is ON by default server-side (probe 2026-09-10: no thinking field ->
-# reasoning_content + reasoning_tokens returned), so DeepSeekProvider sends an
-# explicit disabled when /thinking is off. Effort grades low|high|max.
-# OpenAI-compatible endpoint (see DeepSeekProvider).
+# DeepSeek: deepseek-flash is an unversioned alias that tracks DeepSeek's
+# current Flash. The API reports only the alias, so a snapshot change behind
+# it shows up only as a failed tools/live_probe.py ds_* check. Thinking is ON
+# by default server-side (probe 2026-09-10), so DeepSeekProvider sends an
+# explicit disabled when /thinking is off. OpenAI-compatible endpoint (see
+# DeepSeekProvider).
 DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"      # override: SYS_DEEPSEEK_MODEL
 
 # Per-provider startup default, indexed by provider name. Used by
@@ -3259,8 +3100,8 @@ class OpenAIProvider(Provider):
 
     Why Responses and not Chat Completions: gpt-6-astra and gpt-6.1-sol
     cannot call function tools on Chat Completions at all, and every other
-    current model there only with reasoning_effort "none" (see the OpenAI
-    options in PROVIDER & MODEL CONFIG). One endpoint for the whole provider
+    current model there only with reasoning_effort "none" (probes recorded
+    in docs/models.md). One endpoint for the whole provider
     keeps one wire format per provider name, which /model relies on (it
     switches model in place and keeps `messages`) and normalize() keys on.
 
