@@ -1336,6 +1336,24 @@ def _which_many(cmds: list[str]) -> list[str]:
     return [c for c in cmds if shutil.which(c)]
 
 
+def _probe(argv: list[str], timeout: float = 5) -> str | None:
+    """stdout of a read-only fact probe, or None when the tool is not on PATH,
+    fails to spawn, times out, or exits non-zero — every fact probe treats
+    those alike and falls back or omits the fact. stdin is detached so a probe
+    can never read the user's terminal; undecodable bytes are replaced rather
+    than raising, as in _safe_read. Callers that read the exit status itself
+    as the answer (VM detection, sudo) run subprocess directly."""
+    if not shutil.which(argv[0]):
+        return None
+    try:
+        res = subprocess.run(argv, stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, errors="replace",
+                             timeout=timeout, check=False)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return res.stdout if res.returncode == 0 else None
+
+
 # sysstat's daily data files: Debian keeps them in /var/log/sysstat, RHEL in
 # /var/log/sa. Binary data files are saDD (day of month) or saYYYYMMDD (sadc
 # -D); the sarDD text reports written by sa2 are deliberately not counted.
@@ -1497,26 +1515,19 @@ def _usb_bridge_ids(basename: str) -> tuple[str, str] | None:
     tree); falls back to ascending sysfs for idVendor/idProduct. Unprivileged,
     Linux-only. Returns None for non-USB transports so callers can attach the
     `usb_ids` key only when it actually means a USB bridge."""
-    if shutil.which("udevadm"):
-        try:
-            res = subprocess.run(
-                ["udevadm", "info", "--query=property", "-n", f"/dev/{basename}"],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-            if res.returncode == 0:
-                props: dict[str, str] = {}
-                for line in res.stdout.splitlines():
-                    k, _, v = line.partition("=")
-                    if v:
-                        props[k] = v
-                if props.get("ID_BUS") == "usb":
-                    vid = props.get("ID_VENDOR_ID")
-                    pid = props.get("ID_MODEL_ID")
-                    if vid and pid:
-                        return vid.strip().lower(), pid.strip().lower()
-                return None             # resolved, and it is not USB
-        except (subprocess.SubprocessError, OSError):
-            pass
+    out = _probe(["udevadm", "info", "--query=property", "-n", f"/dev/{basename}"])
+    if out is not None:
+        props: dict[str, str] = {}
+        for line in out.splitlines():
+            k, _, v = line.partition("=")
+            if v:
+                props[k] = v
+        if props.get("ID_BUS") == "usb":
+            vid = props.get("ID_VENDOR_ID")
+            pid = props.get("ID_MODEL_ID")
+            if vid and pid:
+                return vid.strip().lower(), pid.strip().lower()
+        return None                     # resolved, and it is not USB
     # sysfs fallback (no udevadm): climb from the block device toward the USB
     # device node, which is where idVendor/idProduct live. Depth is shallow;
     # the bound just prevents an unterminated walk.
@@ -1572,28 +1583,24 @@ def _read_block_devices() -> dict[str, dict[str, Any]]:
     physical block devices. Uses lsblk when present, /sys fallback otherwise.
     Unprivileged."""
     devices: dict[str, dict[str, Any]] = {}
-    if shutil.which("lsblk"):
+    out = _probe(["lsblk", "-J", "-b", "-d", "-o",
+                  "NAME,TYPE,SIZE,ROTA,TRAN,MODEL,VENDOR"])
+    if out is not None:
         try:
-            res = subprocess.run(
-                ["lsblk", "-J", "-b", "-d", "-o",
-                 "NAME,TYPE,SIZE,ROTA,TRAN,MODEL,VENDOR"],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-            if res.returncode == 0:
-                for d in json.loads(res.stdout).get("blockdevices", []):
-                    if d.get("type") != "disk":
-                        continue
-                    name = d["name"]
-                    if name.startswith(_DISK_SKIP_DEV_PREFIXES):
-                        continue
-                    devices[name] = {
-                        "model": (d.get("model") or "").strip() or None,
-                        "vendor": (d.get("vendor") or "").strip() or None,
-                        "size_bytes": int(d["size"]) if d.get("size") else None,
-                        "rotational": bool(int(d["rota"])) if d.get("rota") is not None else None,
-                        "transport": d.get("tran") or None,
-                    }
-        except (subprocess.SubprocessError, json.JSONDecodeError, ValueError, OSError):
+            for d in json.loads(out).get("blockdevices", []):
+                if d.get("type") != "disk":
+                    continue
+                name = d["name"]
+                if name.startswith(_DISK_SKIP_DEV_PREFIXES):
+                    continue
+                devices[name] = {
+                    "model": (d.get("model") or "").strip() or None,
+                    "vendor": (d.get("vendor") or "").strip() or None,
+                    "size_bytes": int(d["size"]) if d.get("size") else None,
+                    "rotational": bool(int(d["rota"])) if d.get("rota") is not None else None,
+                    "transport": d.get("tran") or None,
+                }
+        except ValueError:              # JSONDecodeError is a ValueError
             pass
     if devices:
         _augment_usb_smart_hints(devices)
@@ -1657,38 +1664,22 @@ def _gather_disk_facts_darwin() -> dict[str, Any]:
     additional value). Same outer shape as the Linux path so the agent's
     consumer code does not branch."""
     out: dict[str, Any] = {"mounts": [], "unmounted_devices": []}
-    if not shutil.which("df"):
-        return out
-    try:
-        # -P = POSIX output (stable columns, no wrap); -k = 1K blocks;
-        # -T <type> would filter, but BSD df spells filtering differently
-        # from GNU df, so we filter in Python instead.
-        res = subprocess.run(
-            ["df", "-P", "-k"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-        if res.returncode != 0:
-            return out
-    except (subprocess.SubprocessError, OSError):
+    # -P = POSIX output (stable columns, no wrap); -k = 1K blocks;
+    # -T <type> would filter, but BSD df spells filtering differently
+    # from GNU df, so we filter in Python instead.
+    df_out = _probe(["df", "-P", "-k"])
+    if df_out is None:
         return out
 
     # We need fstype too. `mount` is the reliable cross-mac source.
+    # Lines look like:  /dev/disk3s1s1 on / (apfs, ...)
     fstype_by_mount: dict[str, str] = {}
-    try:
-        mres = subprocess.run(
-            ["mount"], capture_output=True, text=True, timeout=5, check=False,
-        )
-        if mres.returncode == 0:
-            # Lines look like:  /dev/disk3s1s1 on / (apfs, ...)
-            import re as _re
-            for line in mres.stdout.splitlines():
-                m = _re.match(r"^(\S+) on (.+?) \(([^,)]+)", line)
-                if m:
-                    fstype_by_mount[m.group(2)] = m.group(3).strip()
-    except (subprocess.SubprocessError, OSError):
-        pass
+    for line in (_probe(["mount"]) or "").splitlines():
+        m = re.match(r"^(\S+) on (.+?) \(([^,)]+)", line)
+        if m:
+            fstype_by_mount[m.group(2)] = m.group(3).strip()
 
-    lines = res.stdout.splitlines()
+    lines = df_out.splitlines()
     if not lines:
         return out
     # First line is the header; skip it.
@@ -1842,10 +1833,9 @@ def _read_diskstats() -> dict[str, tuple[int, int]]:
 def _sample_disk_io(device_names) -> dict[str, dict[str, float]]:
     """1-second delta sample of /proc/diskstats. MB/s read/write per disk.
     Returns only entries for devices in `device_names` (the physical disks)."""
-    import time as _t
     wanted = set(device_names)
     first = _read_diskstats()
-    _t.sleep(1.0)
+    time.sleep(1.0)
     second = _read_diskstats()
     result: dict[str, dict[str, float]] = {}
     for name in wanted:
@@ -2008,16 +1998,7 @@ def _swap_gb_linux() -> float | None:
 
 def _sysctl_value(name: str) -> str:
     """`sysctl -n <name>` (macOS path); '' on any failure."""
-    if not shutil.which("sysctl"):
-        return ""
-    try:
-        res = subprocess.run(
-            ["sysctl", "-n", name],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return ""
-    return res.stdout.strip() if res.returncode == 0 else ""
+    return (_probe(["sysctl", "-n", name]) or "").strip()
 
 
 def _mac_has_battery() -> bool:
@@ -2025,16 +2006,7 @@ def _mac_has_battery() -> bool:
     Model identifiers stopped encoding the form factor on Apple Silicon
     ('Mac15,6' is an M3 MacBook Pro, 'Mac14,12' is a Mac Studio), so battery
     presence is the robust laptop signal, not the model-string prefix."""
-    if not shutil.which("pmset"):
-        return False
-    try:
-        res = subprocess.run(
-            ["pmset", "-g", "batt"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return False
-    return res.returncode == 0 and "InternalBattery" in res.stdout
+    return "InternalBattery" in (_probe(["pmset", "-g", "batt"]) or "")
 
 
 def _hwmon_sensors_linux() -> list[str]:
@@ -2219,77 +2191,37 @@ def _top_processes_by_rss_linux(limit: int) -> list[dict[str, Any]]:
     return out
 
 
-def _running_services_linux(limit: int, user: bool = False) -> list[str]:
-    """Running systemd service units via `systemctl`, when present.
+def _systemd_services(state: str, limit: int, user: bool = False) -> list[str]:
+    """systemd service units in `state` ("running" | "failed") via
+    `systemctl list-units`, when present. Script-stable flags only, matching
+    the guidance the prompt gives the model.
 
-    `user=False` queries the system manager (`systemctl list-units`); `user=True`
-    queries the per-user manager (`systemctl --user`), which is where services a
-    user runs for themselves live — e.g. a `bitcoind.service` started with
-    `systemctl --user`, invisible to the system-scope list. The user query needs
-    a reachable user D-Bus session (present when sys_agent runs in the invoking
-    user's login session; absent under sudo, cron, or a user without linger),
-    and exits non-zero when it is not — handled as [] like the no-bus case below.
+    `user=False` queries the system manager; `user=True` queries the per-user
+    manager (`systemctl --user`), which is where services a user runs for
+    themselves live — e.g. a `bitcoind.service` started with `systemctl
+    --user`, invisible to the system-scope list. The user query needs a
+    reachable user D-Bus session (present when sys_agent runs in the invoking
+    user's login session; absent under sudo, cron, or a user without linger).
+
+    Failed units are queried at SYSTEM scope only: high-signal for turn-one
+    triage (a unit named here is a failure the model would otherwise spend a
+    discovery pass finding), while user-scope failures are rarer and carry the
+    same bus caveat, so they are left to an explicit `systemctl --user
+    --failed` when a user unit is in question.
 
     Returns [] on non-systemd hosts (OpenRC, runit, sysvinit, ...): enumerating
     every init system is out of scope, and on those hosts `top_processes` still
-    carries the naming signal through the process basename. Also returns []
-    when systemd is installed but the relevant bus is unreachable (e.g. inside a
-    container, or no user bus), since list-units exits non-zero there. Script-
-    stable flags only, matching the guidance the prompt gives the model.
+    carries the naming signal through the process basename. Also [] when the
+    relevant bus is unreachable (container, no user bus), since list-units
+    exits non-zero there — and, for failed units, on a healthy host.
     """
-    if not shutil.which("systemctl"):
-        return []
-    argv = ["systemctl"]
-    if user:
-        argv.append("--user")
-    argv += ["list-units", "--type=service", "--state=running",
-             "--no-legend", "--plain", "--no-pager"]
-    try:
-        res = subprocess.run(
-            argv, capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return []
-    if res.returncode != 0:
-        return []
+    argv = ["systemctl", *(["--user"] if user else []), "list-units",
+            "--type=service", f"--state={state}",
+            "--no-legend", "--plain", "--no-pager"]
     units: list[str] = []
-    for line in res.stdout.splitlines():
+    for line in (_probe(argv) or "").splitlines():
         parts = line.split()
         # --plain --no-legend => "UNIT LOAD ACTIVE SUB DESCRIPTION"; take UNIT.
-        if parts and parts[0].endswith(".service"):
-            units.append(parts[0])
-            if len(units) >= limit:
-                break
-    return units
-
-
-def _failed_services_linux(limit: int) -> list[str]:
-    """Failed systemd SYSTEM units via `systemctl list-units --state=failed`.
-
-    Empty on a healthy host, on non-systemd hosts, and when the system bus is
-    unreachable — the same conditions under which the running-unit probe returns
-    []. High-signal for turn-one triage: a unit named here is a failure the
-    model would otherwise spend a discovery pass finding. SYSTEM scope only;
-    user-scope failures are rarer and carry the same bus-availability caveat as
-    `running_services_user`, so they are left to an explicit
-    `systemctl --user --failed` when a user unit is in question. Script-stable
-    flags only, matching the running-unit probe.
-    """
-    if not shutil.which("systemctl"):
-        return []
-    argv = ["systemctl", "list-units", "--type=service", "--state=failed",
-            "--no-legend", "--plain", "--no-pager"]
-    try:
-        res = subprocess.run(
-            argv, capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return []
-    if res.returncode != 0:
-        return []
-    units: list[str] = []
-    for line in res.stdout.splitlines():
-        parts = line.split()
         if parts and parts[0].endswith(".service"):
             units.append(parts[0])
             if len(units) >= limit:
@@ -2314,19 +2246,11 @@ def _top_processes_by_rss_darwin(limit: int) -> list[dict[str, Any]]:
     given macOS build truncates here, long names would clip the same way the
     Linux /proc/comm cap does — validate on the Mac (see module header).
     """
-    if not shutil.which("ps"):
-        return []
-    try:
-        res = subprocess.run(
-            ["ps", "-axo", "rss=,comm="],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return []
-    if res.returncode != 0:
+    out = _probe(["ps", "-axo", "rss=,comm="])
+    if out is None:
         return []
     agg: dict[str, list[int]] = {}      # name -> [summed_rss_kb, instances]
-    for line in res.stdout.splitlines():
+    for line in out.splitlines():
         # split(None, 1): first whitespace run separates rss from comm; the
         # remainder is kept verbatim so spaces inside app paths are preserved.
         parts = line.split(None, 1)
@@ -2365,20 +2289,12 @@ def _running_services_darwin(limit: int) -> list[str]:
     (`homebrew.mxcl.postgresql`) and rarely diverge from what you'd guess the
     way `openclaw` -> `openclaw-gateway.service` did.
     """
-    if not shutil.which("launchctl"):
-        return []
-    try:
-        res = subprocess.run(
-            ["launchctl", "list"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return []
-    if res.returncode != 0:
+    out = _probe(["launchctl", "list"])
+    if out is None:
         return []
     labels: list[str] = []
     # Output is TAB-separated: "PID\tStatus\tLabel", with a header row.
-    for line in res.stdout.splitlines():
+    for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) < 3:
             parts = line.split()
@@ -2419,10 +2335,10 @@ def _gather_runtime_facts() -> dict[str, Any]:
     system = platform.system()
     if system == "Linux":
         return {
-            "running_services": _running_services_linux(RUNTIME_MAX_SERVICES),
-            "running_services_user": _running_services_linux(
-                RUNTIME_MAX_SERVICES, user=True),
-            "failed_services": _failed_services_linux(RUNTIME_MAX_SERVICES),
+            "running_services": _systemd_services("running", RUNTIME_MAX_SERVICES),
+            "running_services_user": _systemd_services(
+                "running", RUNTIME_MAX_SERVICES, user=True),
+            "failed_services": _systemd_services("failed", RUNTIME_MAX_SERVICES),
             "top_processes": _top_processes_by_rss_linux(RUNTIME_TOP_PROCESSES),
         }
     if system == "Darwin":
@@ -2476,19 +2392,11 @@ def _gather_network_interfaces() -> dict[str, str]:
             out[name] = "wifi" if wireless else "ethernet"
         return out
     if system == "Darwin":
-        if not shutil.which("networksetup"):
-            return {}
-        try:
-            res = subprocess.run(
-                ["networksetup", "-listallhardwareports"],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return {}
-        if res.returncode != 0:
+        ports = _probe(["networksetup", "-listallhardwareports"])
+        if ports is None:
             return {}
         port = ""
-        for line in res.stdout.splitlines():
+        for line in ports.splitlines():
             if line.startswith("Hardware Port:"):
                 port = line.partition(":")[2].strip()
             elif line.startswith("Device:") and port:
@@ -5476,15 +5384,9 @@ def _github_json(path: str) -> Any:
 def _git_head(directory: str) -> str | None:
     """HEAD commit of the checkout holding this file, or None when it is not
     a checkout or git is unavailable."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", directory, "rev-parse", "HEAD"],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            timeout=UPDATE_HTTP_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    head = proc.stdout.strip()
-    return head if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", head) else None
+    head = (_probe(["git", "-C", directory, "rev-parse", "HEAD"],
+                   timeout=UPDATE_HTTP_TIMEOUT) or "").strip()
+    return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
 
 
 def update_status(path: str | None = None) -> tuple[bool, str]:
@@ -5552,15 +5454,9 @@ def check_for_update(path: str | None = None) -> str | None:
 def _git_describe(directory: str) -> str | None:
     """`git describe --tags --dirty --always` for the checkout holding this
     file: release tag, commits past it, commit, and local edits in one."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", directory, "describe", "--tags", "--dirty", "--always"],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            timeout=UPDATE_HTTP_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    out = proc.stdout.strip()
-    return out if proc.returncode == 0 and out else None
+    out = (_probe(["git", "-C", directory, "describe", "--tags", "--dirty",
+                   "--always"], timeout=UPDATE_HTTP_TIMEOUT) or "").strip()
+    return out or None
 
 
 def _readline_backend() -> str:
