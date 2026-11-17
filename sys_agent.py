@@ -1,21 +1,13 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# # Exactly 3.13 for every uv launch, including the unpinned shebang
-# # shortcut. uv keeps one environment per script path and reuses its
-# # interpreter while that still satisfies this range: under ">=3.10,<3.14"
-# # the Pi's May environment stayed on system 3.11 while the Mac moved from
-# # Homebrew 3.14 to 3.13. A single-version range forces every host onto the
-# # validated Python; uv downloads it where missing. Move both bounds
-# # together once a newer Python is validated. The pip path ignores this.
+# # Pin Python 3.13 so uv uses the same tested version on the Pi and Mac.
+# # A wider range can keep an older cached interpreter. Update both bounds together.
 # requires-python = ">=3.13,<3.14"
 # dependencies = [
-#     # Floors are the SDK versions validated on the Pi and Mac. uv re-syncs
-#     # an existing script environment when this list changes; before these
-#     # floors, the shortcut kept anthropic 0.103 while direct runs had 1.8.
+#     # Minimum SDK versions tested on the Pi and Mac. uv re-syncs when these change.
 #     "openai>=3.19",
 #     "anthropic>=1.8,<2.0",
-#     # GNU readline on every POSIX host. Without it, uv's standalone CPython
-#     # on Linux links libedit and macOS stdlib is libedit.
+#     # GNU readline keeps colored prompts and history working across POSIX hosts.
 #     "gnureadline>=8.1; sys_platform != 'win32'",
 # ]
 # ///
@@ -55,15 +47,9 @@ from __future__ import annotations
 import os as _os
 import sys as _sys
 
-# gnureadline's manylinux wheel bundles its own ncurses, compiled to search
-# only /etc/terminfo:/usr/share/terminfo. Debian and Ubuntu keep common
-# entries (xterm-256color, xterm, screen) in /lib/terminfo, so on the Pi the
-# terminal went unrecognised and readline fell back to dumb-terminal output:
-# Backspace echoed a space and the cursor moved right, although the edited
-# line was correct. Readline loads the entry at import, so this runs first.
-# Every standard directory that exists is listed, which matches the system
-# ncurses defaults for the commands that inherit it. A user's own TERMINFO
-# or TERMINFO_DIRS is left alone.
+# Set the terminfo search path before importing readline. The bundled ncurses
+# can miss Debian's /lib/terminfo, causing broken cursor movement and Backspace.
+# Preserve any TERMINFO or TERMINFO_DIRS set by the user.
 if (_sys.platform.startswith("linux")
         and "TERMINFO" not in _os.environ
         and "TERMINFO_DIRS" not in _os.environ):
@@ -73,12 +59,9 @@ if (_sys.platform.startswith("linux")
     if _terminfo_dirs:
         _os.environ["TERMINFO_DIRS"] = ":".join(_terminfo_dirs)
 
-# readline must be imported before any SSL-using library (openai, anthropic)
-# on macOS to avoid a segfault-on-exit quirk. Prefer gnureadline (proper GNU
-# readline, fixing colored prompts and history redraw that libedit gets
-# wrong), declared for every POSIX host. Falls back to stdlib readline, whose
-# backend depends on the interpreter (libedit on macOS and in uv's standalone
-# Linux CPython, GNU in distribution Pythons), then to none (Windows).
+# Import readline before the API SDKs to avoid a crash on exit on macOS.
+# Prefer GNU readline for colored prompts and history. Fall back to the
+# standard library's readline where available.
 try:
     import gnureadline as readline     # noqa: F401 — preferred backend
     _HAVE_READLINE = True
@@ -87,10 +70,8 @@ except ImportError:
     try:
         import readline                # noqa: F401 — stdlib fallback
         _HAVE_READLINE = True
-        # macOS stdlib readline links to libedit, which strips ANSI escapes
-        # between \001/\002 markers — killing colored prompts and causing
-        # prefix redraw issues on history navigation. Detect to degrade
-        # gracefully if gnureadline failed to install for any reason.
+        # libedit can misdraw colored prompts on history recall. Detect it
+        # so colored_input() can print the prompt prefix separately.
         _IS_LIBEDIT = bool(readline.__doc__ and "libedit" in readline.__doc__)
     except ImportError:
         _HAVE_READLINE = False
@@ -129,65 +110,36 @@ from typing import Any
 # =============================================================================
 # PROVIDER & MODEL CONFIG
 # -----------------------------------------------------------------------------
-# Single source of truth for everything that changes on an LLM-release cadence.
-# When a new model ships, edit ONLY this section:
-#   1. add it to PROVIDER_MODELS under its provider,
-#   2. add a CONTEXT_WINDOWS entry so the context-% display works,
-#   3. if it introduces a new name prefix, extend PROVIDER_MODEL_PREFIXES.
-# Nothing below this section needs to change for a model update. The evidence
-# behind each choice (prices, probes, why a model is listed, unlisted or
-# removed) is in docs/models.md: update its entry in the same commit.
+# For a new model, update PROVIDER_MODELS, CONTEXT_WINDOWS, and any new
+# prefix in PROVIDER_MODEL_PREFIXES. Check its reasoning settings below
+# and record the probe results and listing rationale in docs/models.md.
 # =============================================================================
 
-# Default model per provider, overridable via env. Defaults favor dependable
-# tool calling at a sensible price tier; switch at runtime with /model.
-#
-# OpenAI: every model runs on the Responses API (see OpenAIProvider); the
-# effort each accepts is in _OPENAI_REASONING_EFFORTS below. gpt-6-luna is
-# the cheapest listed model ($0.10/$0.50 per 1M tokens) and answered a canned
-# Pi session correctly; gpt-5.4-mini stays listed as the fallback.
+# Startup defaults. Override in the environment or switch with /model.
+# See docs/models.md for pricing, probe results, and the choice of defaults.
 DEFAULT_OPENAI_MODEL = "gpt-6-luna"            # override: SYS_OPENAI_MODEL
 
-# Anthropic: claude-haiku-5-5 ($0.10/$0.50 for prompts up to 100K tokens)
-# passed live_probe haiku55_off/on on the Pi at about a seventh of Haiku
-# 4.5's cost per session. Per-model thinking behavior is in the _THINKING_*
-# tables below.
 DEFAULT_ANTHROPIC_MODEL = "claude-haiku-5-5"   # override: SYS_ANTHROPIC_MODEL
 
-# DeepSeek: deepseek-flash is an unversioned alias that tracks DeepSeek's
-# current Flash. The API reports only the alias, so a snapshot change behind
-# it shows up only as a failed tools/live_probe.py ds_* check. Thinking is ON
-# by default server-side (probe 2026-09-10), so DeepSeekProvider sends an
-# explicit disabled when /thinking is off. OpenAI-compatible endpoint (see
-# DeepSeekProvider).
+# DeepSeek can update the model behind this alias without changing its name.
+# Run the ds_* probes in tools/live_probe.py to check its behavior.
 DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"      # override: SYS_DEEPSEEK_MODEL
 
-# Per-provider startup default, indexed by provider name. Used by
-# select_provider's interactive picker so it never instantiates an SDK client
-# just to label a menu row.
+# Let the startup picker display model names without creating API clients.
 DEFAULT_MODELS: dict[str, str] = {
     "openai": DEFAULT_OPENAI_MODEL,
     "anthropic": DEFAULT_ANTHROPIC_MODEL,
     "deepseek": DEFAULT_DEEPSEEK_MODEL,
 }
 
-# DeepSeek's OpenAI-compatible base URL. The DeepSeek path reuses the openai
-# SDK pointed here (see DeepSeekProvider), so no extra dependency is needed.
+# Use the OpenAI SDK with DeepSeek's endpoint.
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
-# Known context windows (Jul 2026). Used for the context-% display; unknown
-# models fall back to printing absolute token counts. Window sizes are in
-# tokens, not text volume — Sonnet 5's tokenizer produces ~30% more tokens
-# for the same input text than Sonnet 4.6's, so the 1M-token window covers
-# less text even though the number is identical.
+# Context limits in tokens, used for the percentage display. Unknown models
+# show token counts only. Keep older entries for pins and manual switches.
 CONTEXT_WINDOWS: dict[str, int] = {
     # OpenAI
     "gpt-5.4-mini":    400_000,
-    # GPT-5.6 and GPT-6 — every tier ships 1.05M context / 128K max output.
-    # GPT-6.1 the same (model pages, 2026-11-16).
-    # Entries kept for models not in PROVIDER_MODELS (gpt-4o-mini, all of
-    # GPT-5.6, gpt-6-astra) so pins and manual /model switches still show
-    # context-%.
     "gpt-4o-mini":     128_000,
     "gpt-5.6-luna":  1_050_000,
     "gpt-5.6-terra": 1_050_000,
@@ -197,13 +149,7 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-6-sol":     1_050_000,
     "gpt-6.1-sol":   1_050_000,
     "gpt-6.1-terra": 1_050_000,
-    # Anthropic — Opus 4.6 through 5.5, Sonnet 4.6/5/5.5, Haiku 5.5, and
-    # Fable 5/5.1 all ship a 1M window (Models API max_input_tokens,
-    # 2026-09-24; Sonnet/Haiku 5.5 per launch notes). Haiku 5.5 bills prompts
-    # over 100K at a higher tier; the window itself is 1M. Haiku 4.5 remains
-    # 200K. Entries kept for models not in PROVIDER_MODELS below (haiku-4-5,
-    # sonnet-5, sonnet-4-6, opus-4-7/4-8/5, fable-5/5-1/5-2) so /model still
-    # shows correct context-% on a manual switch.
+    # Anthropic
     "claude-haiku-4-5-20251001": 200_000,
     "claude-haiku-5-5":        1_000_000,
     "claude-sonnet-5-5":       1_000_000,
@@ -216,19 +162,14 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "claude-fable-5":          1_000_000,
     "claude-fable-5-1":        1_000_000,
     "claude-fable-5-2":        1_000_000,
-    # DeepSeek — V4.1 Flash and V4 Pro both ship a 1M window (Models API
-    # context_window 1048576). deepseek-v4-flash is a legacy name the server
-    # routes to V4.1 Flash; entry kept for existing pins.
+    # DeepSeek
     "deepseek-flash":          1_000_000,
-    "deepseek-v4-flash":       1_000_000,
+    "deepseek-v4-flash":       1_000_000,  # Old name kept for existing pins.
     "deepseek-v4-pro":         1_000_000,
 }
 
-# Known model names per provider — the suggestion list for /model and the
-# basis for sanity-checking. A name in this list switches silently; an
-# unlisted name whose prefix still matches the provider (see
-# PROVIDER_MODEL_PREFIXES) switches with a warning, so brand-new releases
-# work before this list is updated.
+# Models suggested by /model. Unlisted names with a recognized prefix still
+# work, with a warning.
 PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
     "openai": (
         "gpt-6-luna",
@@ -248,25 +189,19 @@ PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Model-name prefixes that legitimately belong to each provider. Used to
-# accept an unlisted-but-plausible model (with a warning) while still
-# rejecting a wrong-provider or nonsense name outright.
+# Use these prefixes to check unlisted model names against the active provider.
 PROVIDER_MODEL_PREFIXES: dict[str, tuple[str, ...]] = {
     "openai": ("gpt-", "o1", "o3", "o4", "chatgpt-"),
     "anthropic": ("claude-",),
     "deepseek": ("deepseek-",),
 }
 
-# reasoning.effort grades each OpenAI model accepts on the Responses API
-# with function tools, lowest first, copied from each model's 400 for an
-# unsupported value (probes 2026-11-16). No model accepts "minimal". An
-# exact name, not a prefix: grades differ inside one generation (gpt-6-sol
-# takes "none", gpt-6.1-sol does not), so add each model only after probing.
-# A model with no row gets no reasoning field at all: right for gpt-4o-mini
-# (400s on reasoning.effort) and the safe choice for an unprobed release
-# (the server default works with tools on Responses, but /thinking off
-# cannot stop it reasoning; GPT-5.6 reasons with no field, 12 tokens on a
-# trivial prompt).
+# Reasoning levels each model accepts with function tools, lowest first,
+# copied from its 400 for an unsupported value (no model accepts "minimal").
+# Keyed by exact name because levels vary within a generation (gpt-6-sol takes
+# "none", gpt-6.1-sol does not). A model with no entry gets no reasoning field:
+# required for gpt-4o-mini, which 400s on one, and the safe default for an
+# unprobed model, though /thinking off then cannot stop it reasoning.
 _OPENAI_EFFORTS_FULL = ("none", "low", "medium", "high", "xhigh", "max")
 _OPENAI_EFFORTS_NO_NONE = ("low", "medium", "high", "xhigh", "max")
 _OPENAI_REASONING_EFFORTS: dict[str, tuple[str, ...]] = {
@@ -285,9 +220,8 @@ _OPENAI_REASONING_EFFORTS: dict[str, tuple[str, ...]] = {
 # RUNTIME TUNING
 # =============================================================================
 
-# Optional shell-style env file. Loaded if present; existing env vars win.
-# Search order for env file when SYS_ENV_FILE is not set. First hit wins.
-# Values are expanded with os.path.expanduser/expandvars at lookup time.
+# Use the first env file found unless SYS_ENV_FILE selects one. Shell
+# variables take priority. Expand paths and variable references on lookup.
 def _default_env_candidates() -> list[str]:
     xdg = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
     return [
@@ -296,42 +230,28 @@ def _default_env_candidates() -> list[str]:
         "~/.sys_agent.env",                  # home dotfile fallback
     ]
 
-# How much subprocess output to forward back to the model (chars, per
-# stream). Longer output keeps its head AND tail (see CmdResult): the end of
-# a log or a failed build is usually where the error is.
+# Limit stdout and stderr sent to the model, in characters per stream.
+# Keep both ends because errors often appear at the end.
 OUTPUT_MAX_CHARS = 8000
 
-# Hard cap on what execute() holds in memory per stream (bytes). The model
-# cap above is applied only after the command ends, so without this a
-# command that never stops writing (`yes`, an unbounded journalctl) grew the
-# buffer for the whole COMMAND_TIMEOUT: gigabytes on a Pi. Past the cap the
-# process group is stopped and the command reports exit 125.
+# Limit how much output execute() buffers per stream while a command runs.
+# OUTPUT_MAX_CHARS applies only after the command ends, so without this an
+# endless writer (`yes`, unbounded journalctl) grew to gigabytes on the Pi.
+# Past the limit the process group is stopped and the command reports 125.
 OUTPUT_CAPTURE_MAX_BYTES = 4 * 1024 * 1024
 
-# Per-command wall-clock timeout (seconds). Override with SYS_COMMAND_TIMEOUT.
-# Default raised to 120s so package upgrades on slower hosts (e.g. a Pi) are
-# less likely to be killed mid-operation. On timeout the whole process group
-# is signalled (see execute()), so a killed apt-get does not orphan dpkg.
+# Command timeout in seconds, overridable with SYS_COMMAND_TIMEOUT.
+# Allow time for package upgrades on slower hosts. Stop the whole process
+# group on timeout so helpers such as dpkg do not keep running on their own.
 COMMAND_TIMEOUT = 120                          # override: SYS_COMMAND_TIMEOUT
 
 # Anthropic requires max_tokens; pick something generous for tool dialogs.
 ANTHROPIC_MAX_TOKENS = 4096
 
-# Extended thinking on the Anthropic path. Off by default: thinking tokens are
-# output-billed (expensive on Opus) and unnecessary for routine commands.
-# Toggle per session with /thinking; SYS_THINKING sets the startup state.
-# Thinking is Anthropic-only and never touches the OpenAI path.
-#
-# The thinking API differs by model generation (see _thinking_mode):
-#   - "adaptive": thinking={"type":"adaptive"} + output_config={"effort": E}.
-#     The model decides per-turn whether/how much to think; depth is steered by
-#     effort, NOT budget_tokens. Interleaved thinking is auto-enabled (no beta
-#     header). Required on Opus 4.7/4.8 (manual budget 400s); recommended on
-#     Opus 4.6 / Sonnet 4.6. Sent via extra_body so an older SDK that predates
-#     these fields doesn't reject them at the typed-param layer.
-#   - "enabled": thinking={"type":"enabled","budget_tokens":N} + the interleaved
-#     beta header (lets reasoning span tool calls and budget exceed max_tokens).
-#     Used by Haiku 4.5 and older Claude 4 models, which lack adaptive/effort.
+# Anthropic thinking defaults to off to save billed output tokens on routine
+# commands. Set the startup state with SYS_THINKING or toggle with /thinking.
+# Adaptive models use effort to guide how much they think. Legacy models use
+# a token budget and need a beta header to keep thinking across tool calls.
 ANTHROPIC_THINKING_DEFAULT = False             # override: SYS_THINKING
 
 # effort: low|medium|high|xhigh|max. Steers adaptive thinking depth; "high" is
@@ -342,40 +262,25 @@ ANTHROPIC_THINKING_EFFORT_DEFAULT = "high"     # override: SYS_THINKING_EFFORT
 # budget_tokens for the legacy "enabled" path only (Haiku 4.5 / older).
 ANTHROPIC_THINKING_BUDGET = 4000               # override: SYS_THINKING_BUDGET
 
-# On a thinking turn the model needs headroom to reason AND answer/act; the
-# 4096 default would truncate. Anthropic suggests a large cap at high+ effort.
-# 32K stays under every current model's output ceiling (Haiku/Sonnet 64K,
-# Opus 128K) and only bills for tokens actually produced.
+# Allow room for both reasoning and the reply on the same turn. 32K stays under
+# every current model's output limit and bills only for tokens produced.
 ANTHROPIC_THINKING_MAX_TOKENS = 32000          # override: SYS_THINKING_MAX_TOKENS
 
 # Interleaved-thinking beta header — needed only on the "enabled" path. It is
 # deprecated/ignored on adaptive models, so it is NOT sent in adaptive mode.
 ANTHROPIC_INTERLEAVED_BETA = "interleaved-thinking-2025-05-14"
 
-# Models that still require the legacy enabled+budget_tokens thinking form.
-# Everything current uses adaptive+effort, so unknown models default to
-# adaptive (manual budgets are being removed across the lineup).
+# These models use a fixed thinking budget. Unknown models default to adaptive.
 def _thinking_mode(model: str) -> str:
     """'enabled' for Haiku 4.5 / older Claude models, else 'adaptive'."""
     if "haiku-4-5" in model:
         return "enabled"
     return "adaptive"
 
-# Models where adaptive thinking runs by default when no `thinking` field is
-# sent, mapped to the payload that turns it off. Started with Sonnet 5; Opus 5,
-# Haiku 5.5, and Sonnet 5.5 behave the same (Sonnet 4.6 and Opus 4.6/4.7/4.8
-# still run without thinking absent the field). Omitting the field on these
-# models would silently defeat ANTHROPIC_THINKING_DEFAULT=off and its whole
-# rationale (thinking tokens are output-billed and unwanted for routine
-# commands), so chat() sends this payload when the session has thinking off.
-#
-# The off form is per model, not per generation: Sonnet 5.5 rejects "disabled"
-# and its lowest setting is "between_tools" (no up-front thinking; short notes
-# between tool calls still arrive as thinking blocks). Every off form here is
-# rejected at effort xhigh|max (Opus 5, Haiku 5.5, Sonnet 5.5), but the off
-# branch in chat() sends no effort field, so the server default (high, or
-# medium on Haiku 5.5) applies and it is accepted. A new model goes here only
-# once its Models API capabilities.thinking.types confirms the off form.
+# These models think by default, so /thinking off needs an explicit setting.
+# Sonnet 5.5 only supports "between_tools", which can still produce short
+# thinking blocks between tool calls. Omit effort because xhigh and max
+# reject these settings. Verify additions against the Models API.
 _THINKING_OFF_PAYLOAD: dict[str, dict[str, str]] = {
     "claude-sonnet-5": {"type": "disabled"},
     "claude-opus-5": {"type": "disabled"},
@@ -386,15 +291,11 @@ _THINKING_OFF_PAYLOAD: dict[str, dict[str, str]] = {
 def _thinking_off_payload(model: str) -> dict[str, str] | None:
     return _THINKING_OFF_PAYLOAD.get(model)
 
-# Models whose thinking cannot be turned off: {"type":"disabled"} 400s, so
-# they must never be in _THINKING_OFF_PAYLOAD (the two are
-# disjoint by construction and by test). /thinking off cannot be honored on
-# them; it only stops sys_agent sending an effort, leaving the server default
-# (medium on Opus 5.5). Because the model may still think on an "off" turn,
-# chat() gives these models the thinking-on token cap and streaming path
-# regardless — a 4096 cap sized for no-thinking turns could truncate a hard
-# turn, and the SDK's non-streaming guard rejects the larger cap.
-# Provider.thinking_status()/thinking_active() report them as on either way.
+# These models always think: {"type":"disabled"} 400s, so they must never be
+# in _THINKING_OFF_PAYLOAD (a test keeps the two disjoint). With /thinking off,
+# send no effort (server default) but keep the thinking-turn token limit, since
+# the 4096 cap could cut off a hard turn, and stream, since the SDK rejects
+# that limit on non-streaming requests.
 _THINKING_ALWAYS_ON_MODELS = frozenset({
     "claude-opus-5-5", "claude-fable-5", "claude-fable-5-1",
     "claude-fable-5-2",
@@ -451,22 +352,14 @@ def _openai_always_reasons(model: str) -> bool:
     levels = _OPENAI_REASONING_EFFORTS.get(model)
     return bool(levels) and levels[0] != "none"
 
-# SDK-level retry count. Both the openai and anthropic SDKs implement
-# exponential backoff with jitter and honor Retry-After headers; they retry
-# on 408/409/429 and 5xx (including Anthropic's 529 overloaded_error).
-# Default SDK value is 2; bump for resilience on flaky networks / busy API.
+# SDK retries use backoff and honor Retry-After for temporary API errors.
 API_MAX_RETRIES = 5
 
-# Startup disclaimer — one-time, dimmed reminder that model output is fallible
-# and the approval prompt is the review point. Generalized across providers:
-# the failure mode here is not just wrong prose but wrong COMMANDS
-# (hallucinated flags, paths, unit names; stale syntax for newer tool
-# versions). Suppress with SYS_DISCLAIMER=off once internalized.
+# Remind users to review proposed commands. Set SYS_DISCLAIMER=off to hide it.
 SHOW_DISCLAIMER = True                         # override: SYS_DISCLAIMER
 
-# Startup check that the running sys_agent.py matches GitHub main. Notify only:
-# an agent that runs shell commands must never replace its own code unasked.
-# See check_for_update().
+# Check for an update at startup and display a notice when one is available.
+# Notify only: an agent that runs shell commands must not replace its own code.
 UPDATE_CHECK = True                            # override: SYS_UPDATE_CHECK
 UPDATE_REPO_API = "https://api.github.com/repos/mikeoc61/sys_agent"
 UPDATE_BRANCH = "main"
@@ -479,8 +372,7 @@ DISCLAIMER = (
     "(/auto on disables it)."
 )
 
-# Meta-command reference — single source of truth for /help and the startup
-# banner. (command, description). Keep in sync with the handlers in run_repl.
+# Update this list whenever run_repl gains or changes a slash command.
 META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help",           "Show this command list and current toggle states"),
     ("/info",           "Provider, model, session token usage, host facts"),
@@ -502,21 +394,17 @@ META_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/exit, /quit",    "End the session"),
 )
 
-# Startup banner shows only these, so the meta line stays one short line;
-# /help lists the full META_COMMANDS table.
+# Keep the startup list short. /help lists every command.
 BANNER_META_COMMANDS: tuple[str, ...] = (
     "/info", "/model", "/provider", "/thinking", "/consult", "/auto", "/exit",
 )
 
-# Local hard-deny tables — these commands are never executed regardless of
-# provider or user approval. This is a backstop, not a security boundary: the
-# per-command approval prompt is the real gate. Matching is intent-based
-# (tokenised argv inspection), so a non-root path argument is allowed
-# (`rm -rf /home/x` runs) while the catastrophic shape is blocked
-# (`rm -rf /`, `rm -fr /`, `sudo rm -rf /*` do not).
+# Block these dangerous patterns even after approval. This is a backstop, not
+# the security boundary: the approval prompt is the gate. The checks inspect
+# arguments, so "rm -rf /home/x" can still reach the approval prompt
+# while "rm -rf /" and "sudo rm -rf /*" are blocked.
 
-# Fork bomb is matched against the WHOLE command — its separators are part
-# of the construct, so it must not be split into segments first.
+# Check for fork bombs before splitting on shell separators.
 _FORKBOMB_RE = re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&?\s*\}\s*;\s*:")
 
 # Shell segment separators: ; newline && || | and a bare & (but not >& / 2>&1).
@@ -593,7 +481,6 @@ def _wrap(text: str, *codes: str) -> str:
     return "".join(codes) + text + _ANSI.RESET
 
 
-# Semantic helpers — call sites read clearly, palette stays centralized.
 def dim(t: str) -> str:        return _wrap(t, _ANSI.DIM)
 def ok(t: str) -> str:         return _wrap(t, _ANSI.GREEN)
 def fail(t: str) -> str:       return _wrap(t, _ANSI.RED)
@@ -731,11 +618,8 @@ def _input_prefilled(prompt: str, text: str) -> str:
     return input(prompt)
 
 
-# Multi-line message delimiter. input() returns at every newline, so a pasted
-# block would otherwise arrive as one turn per line. Plain line reading, not
-# bracketed paste: it behaves identically on GNU readline and libedit (which
-# has no bracketed-paste support). The pasted lines still sitting in the tty
-# buffer are consumed by the successive continuation input() calls.
+# input() reads one line at a time. A delimiter lets users submit pasted
+# lines together on both GNU readline and libedit.
 PASTE_DELIM = '"""'
 
 
@@ -774,7 +658,6 @@ def read_paste_block(first: str) -> str:
 # readline (input history + line editing)
 # -----------------------------------------------------------------------------
 
-# Module-level path so /reset etc. can reference if needed later.
 _history_path: str | None = None
 
 
@@ -833,13 +716,8 @@ def init_readline() -> None:
         readline.set_history_length(HISTORY_MAX_LINES)
     except Exception:           # noqa: BLE001 — some libedit builds are picky
         pass
-    # Disable input()'s implicit history-add. It is unreliable across
-    # backends: stdlib GNU readline on Linux silently skips the add when the
-    # prompt carries \001/\002 width markers (as colored prompts do), so
-    # typed commands never reached history on the Pi. With auto-history off,
-    # history is added explicitly (see run_repl) — deterministic everywhere.
-    # libedit / older builds lack set_auto_history; there the implicit add
-    # still happens and input_no_history's drop handles short prompts.
+    # GNU readline can skip history entries for colored prompts. Add them
+    # ourselves, and use input_no_history() for prompts like command approval.
     if hasattr(readline, "set_auto_history"):
         try:
             readline.set_auto_history(False)
@@ -859,16 +737,12 @@ def save_readline_history() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Activity indicator (liveness during the blocking model call)
+# Progress while waiting for the model
 # -----------------------------------------------------------------------------
 #
-# provider.chat() blocks with no output, so without a cue the REPL looks hung
-# — worst on a slow link or a high-effort reasoning turn. On a TTY this paints
-# a spinner + elapsed-seconds counter on one line and erases it when the call
-# returns; off a TTY (piped/redirected) or on TERM=dumb it prints one static
-# marker so logs stay clean. Disable entirely with SYS_PROGRESS=off. Stdlib
-# only; the worker writes stdout solely while the main thread is parked in
-# chat(), and is stopped+joined before the line is cleared, so writes never race.
+# Show a spinner and elapsed time during slow model calls. Use one static
+# line for redirected output or TERM=dumb. Set SYS_PROGRESS=off to disable.
+# Join the spinner thread before clearing its line so writes stay ordered.
 SHOW_PROGRESS = True                           # override: SYS_PROGRESS
 _SPINNER_INTERVAL = 0.1                 # seconds between frames
 _SPINNER_DELAY = 1.5                    # suppress the spinner for ops faster than this
@@ -914,8 +788,7 @@ class Activity:
 
     def _run(self) -> None:
         start = time.monotonic()
-        # Hold off painting until the op has run longer than the threshold;
-        # if it finishes first, return without ever drawing (no flash).
+        # Skip the indicator for calls that finish quickly.
         if self._stop.wait(_SPINNER_DELAY):
             return
         self._painted = True
@@ -933,24 +806,19 @@ class Activity:
         self._stop.set()
         self._thread.join(timeout=1.0)
         if self._painted:
-            # CR + erase-to-EOL so the response starts on a clean line.
+            # Clear the spinner line before printing the reply.
             sys.stdout.write("\r\033[K")
             sys.stdout.flush()
 
 
 # -----------------------------------------------------------------------------
-# Audit log (append-only JSONL record of proposed commands + disposition)
+# Command audit log
 # -----------------------------------------------------------------------------
 #
-# Distinct from readline history, which stores only your prompts. The audit log
-# records what the MODEL proposed and what happened to it (run/edit/skip/deny/
-# abort) plus the exit code — the forensic trail a 24/7 server role needs.
-#
-# Default-on. Disable with SYS_AUDIT_LOG=off (or empty). Override the path with
-# SYS_AUDIT_LOG=/some/path. Command OUTPUT bodies (stdout/stderr) are NOT logged
-# unless SYS_AUDIT_BODY=on, because output can carry secrets; even then bodies
-# are capped at OUTPUT_MAX_CHARS. The log is not rotated — it is one short JSON
-# line per command; truncate with `> ~/.config/sys_agent/audit.log` if needed.
+# Record proposed commands, the approval decision, and any exit code.
+# SYS_AUDIT_LOG sets the path or disables logging with "off" or an empty value.
+# SYS_AUDIT_BODY=on includes capped stdout and stderr, which may carry secrets.
+# Each record is one JSON line. The file grows until manually rotated or cleared.
 AUDIT_LOG_DEFAULT = "~/.config/sys_agent/audit.log"
 _AUDIT_OFF_VALUES = frozenset(("", "off", "0", "false", "none"))
 
@@ -1101,8 +969,7 @@ def page_text(text: str) -> None:
     try:
         proc.communicate(text)
     except (BrokenPipeError, KeyboardInterrupt):
-        # User quit the pager early (q) or Ctrl-C'd — non-destructive, like the
-        # rest of the REPL. Reap the child and return to the prompt.
+        # Close the pager and return to the prompt on q or Ctrl-C.
         try:
             proc.terminate()
         except ProcessLookupError:
@@ -1195,9 +1062,8 @@ def _probe(argv: list[str], timeout: float = 5) -> str | None:
     return res.stdout if res.returncode == 0 else None
 
 
-# sysstat's daily data files: Debian keeps them in /var/log/sysstat, RHEL in
-# /var/log/sa. Binary data files are saDD (day of month) or saYYYYMMDD (sadc
-# -D); the sarDD text reports written by sa2 are deliberately not counted.
+# Check both sysstat directories for binary saDD or saYYYYMMDD files.
+# The sarDD files are text reports.
 _SAR_DATA_DIRS = ("/var/log/sysstat", "/var/log/sa")
 _SAR_DATA_FILE = re.compile(r"^sa(\d{2}|\d{8})$")
 
@@ -1272,8 +1138,7 @@ def _gather_memory_policy_linux() -> dict[str, Any]:
     elif os.path.isdir(root) and _safe_read(_PROC_CGROUPS, limit=64):
         mp["cgroup"] = "v1"
         mp["cgroup_memory"] = _cgroup_memory_v1_enabled()
-    # PSI disabled at boot: /proc/pressure is absent or reads fail
-    # (EOPNOTSUPP); either way _safe_read yields "".
+    # With PSI disabled, _safe_read() returns an empty string.
     mp["psi"] = _safe_read(_PSI_MEMORY, limit=256).startswith("some")
     sw = _safe_read(_SWAPPINESS, limit=16)
     if sw.isdigit():
@@ -1292,8 +1157,8 @@ def _gather_memory_policy_linux() -> dict[str, Any]:
     return mp
 
 
-# Pseudo / virtual filesystems and device classes we never want to surface.
-# Mirrors disk_smart.NO_SMART_PREFIXES plus filesystem-level pseudos.
+# Hide virtual devices and filesystems from the disk inventory.
+# Keep the device prefixes in sync with disk_smart.NO_SMART_PREFIXES.
 _DISK_SKIP_DEV_PREFIXES = ("loop", "ram", "zram", "dm-", "sr", "fd")
 _DISK_SKIP_FSTYPES = {
     "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2",
@@ -1301,22 +1166,15 @@ _DISK_SKIP_FSTYPES = {
     "securityfs", "mqueue", "hugetlbfs", "autofs", "rpc_pipefs",
     "binfmt_misc", "nsfs", "overlay", "squashfs", "ramfs",
 }
-# Mount-point prefixes that are noise for an agent (snap loops, container
-# layer mounts, init-time runtime dirs).
+# Hide snap, container, and temporary system mounts from the inventory.
 _DISK_SKIP_MOUNT_PREFIXES = (
     "/snap/", "/var/lib/docker/", "/var/lib/containers/",
     "/run/", "/sys/", "/proc/", "/dev/",
 )
 
-# macOS-specific filtering. APFS exposes many synthetic firmlinks and
-# system snapshots; agent context wants user-visible volumes only. The
-# /Volumes/.timemachine prefix is the automount root for Time Machine
-# destination snapshots: backing up to an attached volume mounts EVERY retained
-# snapshot there (`com.apple.TimeMachine.<ts>.backup@/dev/diskNsM`), which on a
-# host with regular backups is dozens of df entries that all report the
-# destination volume's identical totals and would otherwise bury the real
-# volumes. The destination volumes themselves (e.g. /Volumes/Backups of ...)
-# are NOT skipped — only the per-snapshot automounts under .timemachine.
+# Hide Time Machine snapshot mounts under /Volumes/.timemachine. They repeat
+# the backup disk's totals and can crowd out other volumes. Keep the backup
+# volumes themselves in the list.
 _DISK_SKIP_FSTYPES_DARWIN = {"devfs", "autofs", "lifs", "nullfs"}
 _DISK_SKIP_MOUNT_PREFIXES_DARWIN = (
     "/System/Volumes/VM",
@@ -1331,14 +1189,9 @@ _DISK_SKIP_MOUNT_PREFIXES_DARWIN = (
 )
 
 
-# USB-bridge SMART pass-through hints: "vvvv:pppp" (lowercase hex USB
-# vendor:product) -> the smartctl `-d` device-type token needed to reach SMART
-# through that enclosure. A USB bridge hides whether the drive behind it speaks
-# ATA or NVMe, and the correct pass-through token is bridge-chip-specific and
-# NOT derivable from anything the kernel block layer exposes — so a small
-# lookup is irreducible. The vendor:product pair itself IS derived at runtime
-# (udev / sysfs); only this chip→token mapping is hard-coded. Mirrors
-# disk_smart.py's KNOWN_BRIDGE_HINTS; keep the two in sync when adding bridges.
+# Map the USB enclosure's vendor:product ID to the smartctl -d option it
+# needs. The system provides the ID, but the option depends on the bridge
+# chip. Keep this in sync with disk_smart.py's KNOWN_BRIDGE_HINTS.
 _USB_BRIDGE_SMART_HINTS = {
     "04e8:4001": "sntasmedia",   # Samsung Portable SSD T7 (NVMe / ASMedia)
     "174c:55aa": "sntasmedia",   # ASMedia ASM1153/1351 generic
@@ -1369,9 +1222,8 @@ def _usb_bridge_ids(basename: str) -> tuple[str, str] | None:
             if vid and pid:
                 return vid.strip().lower(), pid.strip().lower()
         return None                     # resolved, and it is not USB
-    # sysfs fallback (no udevadm): climb from the block device toward the USB
-    # device node, which is where idVendor/idProduct live. Depth is shallow;
-    # the bound just prevents an unterminated walk.
+    # If udevadm is unavailable, look for idVendor and idProduct in sysfs
+    # by walking up from the block device.
     try:
         path = os.path.realpath(f"/sys/block/{basename}/device")
     except OSError:
@@ -1505,15 +1357,13 @@ def _gather_disk_facts_darwin() -> dict[str, Any]:
     additional value). Same outer shape as the Linux path so the agent's
     consumer code does not branch."""
     out: dict[str, Any] = {"mounts": [], "unmounted_devices": []}
-    # -P = POSIX output (stable columns, no wrap); -k = 1K blocks;
-    # -T <type> would filter, but BSD df spells filtering differently
-    # from GNU df, so we filter in Python instead.
+    # Use fixed columns and 1 KiB blocks. Filter in Python because macOS
+    # and Linux use different df options for filesystem type.
     df_out = _probe(["df", "-P", "-k"])
     if df_out is None:
         return out
 
-    # We need fstype too. `mount` is the reliable cross-mac source.
-    # Lines look like:  /dev/disk3s1s1 on / (apfs, ...)
+    # Read the filesystem type from mount, e.g. "/dev/disk3s1s1 on / (apfs, ...)".
     fstype_by_mount: dict[str, str] = {}
     for line in (_probe(["mount"]) or "").splitlines():
         m = re.match(r"^(\S+) on (.+?) \(([^,)]+)", line)
@@ -1523,7 +1373,6 @@ def _gather_disk_facts_darwin() -> dict[str, Any]:
     lines = df_out.splitlines()
     if not lines:
         return out
-    # First line is the header; skip it.
     for line in lines[1:]:
         parts = line.split(None, 5)
         if len(parts) < 6:
@@ -1541,8 +1390,7 @@ def _gather_disk_facts_darwin() -> dict[str, Any]:
             continue
         if mnt.startswith(_DISK_SKIP_MOUNT_PREFIXES_DARWIN):
             continue
-        # devfs mounts surface as /dev — filter for safety even if `mount`
-        # output was missed.
+        # Hide /dev even if mount could not identify its filesystem type.
         if source == "devfs" or mnt == "/dev":
             continue
 
@@ -1695,18 +1543,12 @@ def _sample_disk_io(device_names) -> dict[str, dict[str, float]]:
 # -----------------------------------------------------------------------------
 # Hardware identity (static platform facts)
 # -----------------------------------------------------------------------------
-# Resolved once at startup and injected under facts["hardware"] so the model
-# knows WHAT it is running on, not just which OS. The runtime snapshot answers
-# "what is this host doing"; this answers "what is this host" — and steers
-# which telemetry classes are even plausible (PMIC rails on a Pi, battery on
-# a laptop, IPMI on a server, none of those in a VM). Everything here is
-# static for the life of the host, so unlike the runtime snapshot it carries
-# no staleness caveat. All sources are unprivileged; the only subprocesses
-# are systemd-detect-virt / sysctl / pmset where applicable.
+# Gather static hardware facts at startup so the model knows which metrics
+# it can ask for, such as battery status on a laptop or IPMI on a server.
+# These checks need no elevated permissions.
 
-# SMBIOS chassis-type code -> coarse platform class (DMTF SMBIOS spec, System
-# Enclosure type 3). Deliberately coarse: the agent needs laptop-vs-server
-# priors, not the full 30-entry taxonomy. Unlisted codes resolve to no class.
+# Map SMBIOS enclosure codes to broad hardware types such as laptop or server.
+# The codes come from SMBIOS System Enclosure (type 3).
 _DMI_CHASSIS_CLASS: dict[int, str] = {
     3: "desktop", 4: "desktop", 5: "desktop", 6: "desktop", 7: "desktop",
     13: "desktop", 24: "desktop", 34: "desktop", 35: "desktop",
@@ -1715,36 +1557,28 @@ _DMI_CHASSIS_CLASS: dict[int, str] = {
     17: "server", 23: "server", 25: "server", 28: "server", 29: "server",
 }
 
-# DMI fields on consumer boards are frequently placeholder garbage; treat
-# these (case-insensitive) as absent rather than surfacing them as identity.
+# Ignore common placeholder values in hardware identity fields.
 _DMI_JUNK_VALUES = frozenset((
     "to be filled by o.e.m.", "system product name", "system manufacturer",
     "system version", "default string", "none", "unknown", "not specified",
     "not applicable", "oem",
 ))
 
-# product_name substrings identifying a hypervisor, used only when
-# systemd-detect-virt is unavailable. Lowercase needles.
+# Check these product names for a VM when systemd-detect-virt is unavailable.
 _DMI_VM_NEEDLES = (
     "kvm", "qemu", "vmware", "virtualbox", "virtual machine", "hvm domu",
     "xen", "amazon ec2", "parallels", "bochs",
 )
 
-# Cloud-provider classification from the same world-readable DMI fields VM
-# detection uses (sys_vendor/product_name). Lowercase needle -> provider label.
-# This is a CLASSIFICATION, not identity: it says "an EC2 instance", never which
-# instance or whose account. IMDS-derived fields (region, instance-id,
-# account-id, IAM role) are deliberately NOT gathered at startup — the model
-# queries the metadata service on demand for those.
+# Use DMI vendor and product names to identify the cloud provider.
+# Query the metadata service on demand for details such as region or instance ID.
 _DMI_CLOUD_NEEDLES = (
     ("amazon ec2", "aws"),
     ("google compute engine", "gcp"),
     ("oraclecloud", "oci"),
     ("digitalocean", "digitalocean"),
 )
-# Azure leaves no vendor/product needle — it sets sys_vendor to the generic
-# "Microsoft Corporation" (shared with on-prem Hyper-V), so the discriminator is
-# its fixed chassis_asset_tag. World-readable, no IMDS call.
+# Azure and local Hyper-V share a vendor name. Identify Azure by its chassis tag.
 _DMI_AZURE_ASSET_TAG = "7783-7084-3265-9085-8269-3286-77"
 
 
@@ -1944,29 +1778,15 @@ def _gather_hardware_facts() -> dict[str, Any]:
 # -----------------------------------------------------------------------------
 # Runtime snapshot (running services + top processes by memory)
 # -----------------------------------------------------------------------------
-# Gathered once at startup and injected into the system prompt so the model
-# knows real unit/process names on turn one — e.g. it proposes
-# `systemctl status openclaw-gateway` instead of burning round trips guessing
-# `openclaw`. This is a point-in-time SNAPSHOT, not live state: a process hot
-# at launch may be idle later, and the service list reflects startup. The
-# system prompt flags it as such; `/facts refresh` re-probes. Unprivileged.
+# Give the model real service and process names at startup. These are
+# point-in-time facts. Use /facts refresh to gather them again.
 
-# Running-service list cap. Service counts are naturally bounded (tens, not
-# hundreds), so this only guards a pathological host from bloating the prompt;
-# it is intentionally generous so the unit you are asking about is never
-# silently dropped.
+# Cap the service list so it cannot crowd out the rest of the model's prompt.
 RUNTIME_MAX_SERVICES = 80
 # Top-N processes by aggregate resident memory. Override with SYS_TOP_PROCESSES.
 RUNTIME_TOP_PROCESSES = 10                     # override: SYS_TOP_PROCESSES
-# macOS only: launchd label prefixes dropped from the service list, leaving the
-# user-relevant daemons (Homebrew, vendor helpers, custom LaunchAgents/Daemons)
-# the model actually needs to name.
-#   com.apple.   — Apple-owned system agents (hundreds of them).
-#   application. — launchd's per-GUI-app jobs (label form
-#                  `application.<bundle-id>.<n>.<n>`); these mean "this app is
-#                  open" (Safari, Chrome, Mail, ...), not a service, and their
-#                  memory is already covered by top_processes.
-# Extend if a host's noise differs.
+# Hide Apple system jobs and open GUI apps from the macOS service list.
+# GUI apps can still appear in the list of processes using the most memory.
 _DARWIN_SERVICE_SKIP_PREFIXES = ("com.apple.", "application.")
 
 
@@ -2003,8 +1823,7 @@ def _top_processes_by_rss_linux(limit: int) -> list[dict[str, Any]]:
             continue
         if resident_pages == 0:
             continue                    # kernel threads, fully-swapped, etc.
-        # cmdline is NUL-separated argv; empty for kernel threads. Read bytes
-        # directly (not _safe_read) to preserve the NUL boundaries.
+        # Read raw bytes to split arguments on NUL. Kernel threads have no cmdline.
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as f:
                 raw = f.read(4096)
@@ -2092,8 +1911,7 @@ def _top_processes_by_rss_darwin(limit: int) -> list[dict[str, Any]]:
         return []
     agg: dict[str, list[int]] = {}      # name -> [summed_rss_kb, instances]
     for line in out.splitlines():
-        # split(None, 1): first whitespace run separates rss from comm; the
-        # remainder is kept verbatim so spaces inside app paths are preserved.
+        # Split once to preserve spaces in application paths.
         parts = line.split(None, 1)
         if len(parts) != 2:
             continue
@@ -2288,22 +2106,13 @@ def _gather_time_facts() -> dict[str, Any]:
     return out
 
 
-# Can an approved command use sudo? execute() runs each command in a new
-# session with no controlling tty, so sudo can never prompt: a plain `sudo x`
-# fails in ~0.1s with "a terminal is required to read the password". Only a
-# NOPASSWD rule works there, and a credential the user cached in their own
-# terminal does not carry over (the ticket is keyed to that tty). The probe
-# reproduces execute()'s conditions exactly (new session, no stdin), so a
-# sudoers `requiretty` default is caught too, and `-n` guarantees it cannot
-# prompt even if those conditions change. The command must be RUN, not
-# queried, verified on the Pi (NOPASSWD) and the Mac (password): `sudo -n -v`
-# fails under NOPASSWD, and `sudo -n -l true` succeeds where a password is
-# required, so only `sudo -n true` answers the question the model needs.
-# Cost: 5-50ms, plus three auth-log lines per startup or /facts refresh on a
-# NOPASSWD host (COMMAND=/usr/bin/true and a pam session open/close).
-# "password_required" also covers a user with no sudo rights at all: sudo -n
-# reports both as "a password is required", and from the agent both mean the
-# same thing, sudo cannot be used.
+# Check whether approved commands can use sudo. They run in a new session
+# without a terminal, so sudo cannot prompt or use the user's cached password.
+# The probe runs under the same conditions (new session, no stdin), which also
+# catches a sudoers requiretty. Only running "sudo -n true" answers reliably:
+# "sudo -n -v" fails on a passwordless host, and "sudo -n -l true" succeeds
+# where a password is required. The probe can write to the system auth log.
+# "password_required" also covers users with no sudo access.
 SUDO_PROBE_TIMEOUT = 3.0
 
 
@@ -2379,8 +2188,6 @@ def gather_host_facts() -> dict[str, Any]:
     ]
     facts["available_tools"] = _which_many(candidates)
 
-    # Expanded but still privacy-conscious host facts. These are useful for
-    # selecting the right commands without requiring a first probing turn.
     facts["hostname"] = socket.gethostname()
     facts["package_managers"] = _which_many([
         "apt", "apt-get", "dnf", "yum", "pacman", "zypper", "brew", "apk", "pkg"
@@ -2389,37 +2196,28 @@ def gather_host_facts() -> dict[str, Any]:
     facts["container_tools"] = _which_many(["docker", "podman", "kubectl"])
     facts["virtual_env"] = os.environ.get("VIRTUAL_ENV", "")
 
-    # Whether approved commands can use sudo (see _sudo_mode). Omitted when
-    # the probe was inconclusive rather than guessed.
+    # Omit sudo status if the probe could not complete.
     sudo = _sudo_mode()
     if sudo:
         facts["sudo"] = sudo
 
-    # Stable interface inventory (name -> kind). Answers "which interface is
-    # Wi-Fi?" on turn one; IPs/MACs/link-state deliberately excluded.
+    # Include interface names and types. Leave addresses and link status out.
     interfaces = _gather_network_interfaces()
     if interfaces:
         facts["network_interfaces"] = interfaces
 
-    # Stable temporal orientation: timezone, last boot, uptime. Only resolved
-    # keys are attached. Lets the model read log timestamps and gauge reboot
-    # recency on turn one; live wall-clock is still a `date`/`uptime` away.
+    # Timezone and boot details help the model interpret logs on its first turn.
     facts.update(_gather_time_facts())
 
-    # Static hardware identity — what the host IS (Pi 5 / MacBook / VM /
-    # rack server), steering which telemetry questions are even answerable.
     hardware = _gather_hardware_facts()
     if hardware:
         facts["hardware"] = hardware
 
-    # Sensor-channel inventory (Linux): derived hwmon names, not a curated
-    # map — e.g. cpu_thermal, rpi_volt, pwmfan, nvme.
+    # Read sensor names from Linux hwmon, such as cpu_thermal or pwmfan.
     if platform.system() == "Linux":
         hwmon = _hwmon_sensors_linux()
         if hwmon:
             facts["hwmon_sensors"] = hwmon
-        # Effective memory policy: whether unit memory limits are enforced,
-        # PSI availability, live swappiness, what backs swap.
         memory_policy = _gather_memory_policy_linux()
         if memory_policy:
             facts["memory_policy"] = memory_policy
@@ -2437,14 +2235,11 @@ def gather_host_facts() -> dict[str, Any]:
     except OSError:
         pass
 
-    # Mount-first disk topology (Linux). Unprivileged, ~5-10ms cost.
     disk = _gather_disk_facts(verbose=False)
     if disk["mounts"] or disk["unmounted_devices"]:
         facts["disks"] = disk
 
-    # Runtime snapshot: running services + top processes by memory. Lets the
-    # model use real unit/process names on turn one instead of guessing.
-    # Linux only today (macOS stubbed); only non-empty keys are attached.
+    # Include only the service and process lists we could fill.
     runtime = _gather_runtime_facts()
     if runtime.get("running_services"):
         facts["running_services"] = runtime["running_services"]
@@ -2468,8 +2263,7 @@ def gather_verbose_host_facts() -> dict[str, Any]:
     network_tools = _which_many(["ip", "ifconfig", "netstat", "route"])
     facts["network_tools"] = network_tools
 
-    # Live IO sample (1s window). Skipped on non-Linux or if default tier
-    # already produced no disk facts.
+    # Sample disk I/O for one second when Linux disk facts are available.
     if "disks" in facts and platform.system() == "Linux":
         sample = _gather_disk_facts(verbose=True).get("io_sample")
         if sample:
@@ -2704,9 +2498,9 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
     """
     print()
     print(dim("─" * 72))
-    # Command body stays plain (per preference); only the label is loud.
-    # Shown through visible(): the string below is what the user approves, so
-    # it must not be able to hide or rewrite itself on the terminal.
+    # Only the label is colored; the command text stays plain (user
+    # preference). Control characters are shown visibly so a command cannot
+    # hide or rewrite part of itself in the approval prompt.
     shown_cmd, hidden = visible(cmd)
     print(f"{cmd_label('COMMAND:')}  {shown_cmd}")
     print(f"REASON:   {visible(explanation, newlines=False)[0]}")
@@ -2718,8 +2512,7 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
             "character(s), shown above as \\xNN / \\uNNNN escapes; it would "
             "run with the real characters]"))
         if auto:
-            # Auto-approve skips the human read that the escapes exist for,
-            # so a command carrying them falls back to the prompt.
+            # Require review when a command contains hidden characters.
             print(warn("[auto-approve on, but not applied to this command]"))
             auto = False
     if auto:
@@ -2731,13 +2524,10 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
                 warn_bold("Run? [y]es / [n]o / [e]dit / [q]uit-workflow: ")
             ).strip().lower()
         except EOFError:
-            # Ctrl-D at this sub-prompt stops the workflow (same as 'q'); it
-            # does not end the session — that is the idle prompt's job.
+            # Ctrl-D here cancels the turn, just like q.
             return "stop", None
         except KeyboardInterrupt:
-            # Ctrl-C anywhere in a turn aborts the whole workflow, non-
-            # destructively, and returns to the idle prompt. The caller prints
-            # the canonical stop marker; just end the input line cleanly here.
+            # Finish the input line so the caller can print the cancellation notice.
             print()
             return "stop", None
         if ans in ("y", "yes", ""):
@@ -2747,8 +2537,7 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
         if ans in ("q", "quit", "stop", "abort"):
             return "stop", None
         if ans in ("e", "edit"):
-            # edit prompt plain — it's a user input position. The command is
-            # pre-filled into the line buffer so it can be modified in place.
+            # Pre-fill the prompt with the proposed command for editing.
             try:
                 new = _input_prefilled("edit> ", cmd).strip()
             except EOFError:
@@ -2761,10 +2550,8 @@ def prompt_approval(cmd: str, explanation: str, auto: bool) -> tuple[str, str | 
                 return "run", new
 
 
-# Bounds on _terminate_group(). GRACE is how long the group gets to honour
-# SIGTERM before SIGKILL; only descendants that ignore or outlive SIGTERM pay
-# it, since a clear group is detected by polling. KILL_WAIT bounds reaping the
-# shell afterwards so a cancel can never hang the REPL indefinitely.
+# Give the group time to exit after SIGTERM before using SIGKILL.
+# Limit the final wait for the shell so cancellation cannot hang the REPL.
 _GROUP_TERM_GRACE = 5.0
 _GROUP_KILL_WAIT = 5.0
 
@@ -2887,9 +2674,8 @@ def execute(cmd: str) -> CmdResult:
         t.start()
 
     def collect() -> tuple[str, str]:
-        # After a kill the pipes close and the pumps finish; bounded in case
-        # a process that left the group still holds one open (the daemon
-        # thread is then abandoned, with whatever it had read so far).
+        # Stop waiting if a process outside the group still holds a pipe open.
+        # Keep whatever output the reader collected so far.
         for t in pumps:
             t.join(timeout=5)
         if not any(t.is_alive() for t in pumps):
@@ -2959,11 +2745,8 @@ class Usage:
 
     @property
     def context_tokens(self) -> int:
-        # True context size. Anthropic reports input_tokens as the non-cached
-        # portion only; cached tokens come back separately. OpenAI's
-        # input_tokens and DeepSeek's prompt_tokens are already the full
-        # count, so cache_read/cache_write stay 0 there and this sum is a
-        # no-op.
+        # Anthropic reports cached tokens separately. OpenAI and DeepSeek
+        # already include them in input_tokens, so their cache fields stay zero.
         return self.input_tokens + self.cache_read + self.cache_write
 
 
@@ -2974,17 +2757,10 @@ class ChatTurn:
     raw_message: Any           # provider-native dict, appended to history
     usage: Usage
     thinking_text: str = ""    # thinking scratchpad (Anthropic/DeepSeek) or OpenAI reasoning summary
-    # Provider-neutral stop classification. "" is a normal stop (end_turn /
-    # tool_use on Anthropic; stop / tool_calls on OpenAI-compatible APIs).
-    # STOP_REFUSAL: a safety classifier or the model itself declined — arrives
-    # as HTTP 200, so no exception fires, and any content present is partial
-    # (a tool_use can be cut mid-input). STOP_TRUNCATED: output hit the token
-    # cap or the context window. A truncated tool_use input parses as a valid
-    # partial object, so stop_reason is the ONLY signal that the command text
-    # is incomplete. The REPL never lets a stopped turn's tool calls reach the
-    # approval prompt; tool_calls is still populated so callers can tell a cut
-    # command from a cut text answer. stop_detail is the provider's one-line
-    # account for the user (refusal category, cap that was hit, remedy).
+    # An empty stop means the model finished normally. Refusals and output
+    # limits can leave an unfinished command that still parses. Keep tool_calls
+    # so the REPL can distinguish it from cut-off text and block approval.
+    # stop_detail explains the stop to the user.
     stop: str = ""
     stop_detail: str = ""
 
@@ -3008,11 +2784,8 @@ def stop_notice(turn: "ChatTurn") -> str:
 class Provider:
     name: str = ""
     model: str = ""
-    # Whether chat() may ask the API to cache the conversation as it grows
-    # (Anthropic only; other providers cache on their own or not at all).
-    # True for the live session, whose every request extends the last one.
-    # /consult turns it off on its one-shot providers: their transcript is
-    # sent once, so a cache write there is a surcharge nothing reads back.
+    # Anthropic caches the growing live conversation. /consult sends the
+    # transcript once, so it skips the cache write.
     cache_conversation: bool = True
 
     def initial_messages(self, system: str) -> list[dict]:
@@ -3033,23 +2806,16 @@ class Provider:
         raise NotImplementedError
 
     def render_assistant(self, text: str, tool_calls: list["ToolCall"]) -> dict:
-        # Rebuild an assistant message in this provider's wire format from
-        # neutral parts. Used by render() to replay a cross-provider transcript
-        # for /consult. Distinct from append_assistant (which stores a native
-        # ChatTurn this provider just produced).
+        # Convert a shared transcript turn to the receiving provider's format.
         raise NotImplementedError
 
     def append_rendered(
         self, messages: list[dict], text: str, tool_calls: list["ToolCall"]
     ) -> None:
-        # render()'s entry point. One message per assistant turn on Chat
-        # Completions and Anthropic; the Responses API overrides it because a
-        # turn there is several input items (a message plus function_calls).
+        # Responses overrides this because one turn can span several input items.
         messages.append(self.render_assistant(text, tool_calls))
 
-    # Thinking/effort capability. Each provider answers for its own model so
-    # the REPL's displays never branch on provider name. The defaults describe
-    # a model with no reasoning control, where the session flag is inert.
+    # Each provider reports the thinking controls its model supports.
 
     def _honors_thinking(self) -> bool:
         """The model thinks when the session flag is on."""
@@ -3141,8 +2907,6 @@ class OpenAIProvider(Provider):
         # System prompt goes in `instructions` on each call, not in input.
         return []
 
-    # Only models with probed grades get a reasoning field (no row = none;
-    # gpt-4o-mini 400s on one), so only they honor thinking and effort.
     def _honors_thinking(self) -> bool:
         return self.model in _OPENAI_REASONING_EFFORTS
 
@@ -3178,21 +2942,16 @@ class OpenAIProvider(Provider):
             tool_choice="auto",
             store=False,
         )
-        # None = send no reasoning field: a non-reasoning model (gpt-4o-mini
-        # 400s on reasoning.effort) or one whose grades are unprobed.
         eff = _openai_effort(self.model, thinking, effort)
         if eff is not None:
             reasoning: dict[str, str] = {"effort": eff}
-            # Summaries only when the user asked to see thinking; an
-            # always-reasoning model with /thinking off still reasons, but
-            # quietly.
+            # Ask for a visible summary only when /thinking is on.
             if thinking and eff != "none":
                 reasoning["summary"] = "auto"
             kwargs["reasoning"] = reasoning
         resp = self.client.responses.create(**kwargs)
         if resp.status not in ("completed", "incomplete"):
-            # failed / cancelled: no usable output. Raised so the REPL's
-            # api-error path handles it (and pops the orphan question).
+            # Treat failed or cancelled responses like API errors in the REPL.
             detail = getattr(getattr(resp, "error", None), "message", "") or ""
             raise RuntimeError(f"OpenAI response {resp.status}: {detail}".rstrip(": "))
         items = [it.model_dump(exclude_none=True) for it in resp.output]
@@ -3207,7 +2966,7 @@ class OpenAIProvider(Provider):
                     args = json.loads(it.get("arguments") or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                # call_id, not id: call_id pairs with function_call_output.
+                # Pair tool calls and results by call_id.
                 calls.append(ToolCall(id=it.get("call_id", ""),
                                       name=it.get("name", ""), arguments=args))
             elif kind == "message":
@@ -3225,10 +2984,7 @@ class OpenAIProvider(Provider):
             text="".join(text_parts),
             tool_calls=calls,
             raw_message=items,
-            # input_tokens INCLUDES cached tokens (probe 2026-11-16: 3045
-            # input, 3042 of them cached), like Chat Completions'
-            # prompt_tokens. cache_read stays 0 so context_tokens does not
-            # count the cached part twice.
+            # Cached tokens are already included in input_tokens.
             usage=Usage(
                 input_tokens=getattr(usage, "input_tokens", 0) or 0,
                 output_tokens=getattr(usage, "output_tokens", 0) or 0,
@@ -3335,9 +3091,6 @@ class ChatCompletionsProvider(Provider):
             })
 
     def render_assistant(self, text: str, tool_calls: list["ToolCall"]) -> dict:
-        # Rebuild an assistant message in Chat Completions shape from neutral parts
-        # (see normalize/render). Mirrors what chat() stored as raw_message, so
-        # a transcript normalized from any provider replays here verbatim.
         msg: dict[str, Any] = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = [{
@@ -3377,10 +3130,9 @@ class DeepSeekProvider(ChatCompletionsProvider):
     Anthropic path must echo back thinking blocks with their signatures.
     """
 
-    # sys_agent scale (low|medium|high|xhigh|max) -> DeepSeek grades
-    # (low|high|max). Levels without a native grade round UP: medium -> high
-    # (matches DeepSeek's server mapping), xhigh -> max (DeepSeek's own table
-    # maps xhigh -> high; rounding up keeps /effort xhigh distinct from high).
+    # Round unsupported levels up: medium -> high (as DeepSeek does), and
+    # xhigh -> max, where DeepSeek's own table says high, so /effort xhigh
+    # stays distinct from high.
     _EFFORT_MAP: dict[str, str] = {
         "low": "low", "medium": "high", "high": "high",
         "xhigh": "max", "max": "max",
@@ -3428,11 +3180,8 @@ class DeepSeekProvider(ChatCompletionsProvider):
             tools=CHAT_COMPLETIONS_TOOLS,
             tool_choice="auto",
         )
-        # Sent via extra_body (merged into the request JSON) rather than as
-        # typed kwargs, so neither field depends on the pinned openai SDK
-        # recognizing it — same defensive rationale as the Anthropic path.
-        # The disabled branch is load-bearing: thinking is the server default,
-        # so omitting the field would think (and bill) with /thinking off.
+        # Use extra_body so older SDKs can send these settings. DeepSeek
+        # thinks by default, so /thinking off must disable it explicitly.
         if thinking:
             kwargs["extra_body"] = {
                 "thinking": {"type": "enabled"},
@@ -3452,8 +3201,7 @@ class DeepSeekProvider(ChatCompletionsProvider):
             calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
         reasoning = getattr(msg, "reasoning_content", None) or ""
         raw = msg.model_dump(exclude_none=True)
-        # Always carry reasoning_content (verbatim, else "") so the replay
-        # contract holds for any /thinking toggle history within the session.
+        # Keep reasoning_content on every assistant message for later tool calls.
         raw["reasoning_content"] = reasoning
         stop, stop_detail = self._classify_finish(choice)
         return ChatTurn(
@@ -3470,11 +3218,8 @@ class DeepSeekProvider(ChatCompletionsProvider):
         )
 
     def render_assistant(self, text: str, tool_calls: list["ToolCall"]) -> dict:
-        # Chat Completions shape, plus the reasoning_content presence the
-        # DeepSeek replay contract requires on every assistant message once a
-        # thinking turn has tool-called. We have no scratchpad for a turn
-        # authored by another provider, so send "" — DeepSeek ignores an empty
-        # value but rejects a MISSING key with 400. (See class docstring.)
+        # DeepSeek requires reasoning_content when replaying tool use.
+        # Use an empty string for turns from another provider.
         msg = super().render_assistant(text, tool_calls)
         msg["reasoning_content"] = ""
         return msg
@@ -3522,14 +3267,8 @@ class AnthropicProvider(Provider):
         self, messages: list[dict], system: str,
         thinking: bool = False, effort: str = "high",
     ) -> ChatTurn:
-        # Send the system prompt as a cacheable block. The system prompt
-        # (instructions + host-facts JSON) is identical every turn, so
-        # marking it with cache_control lets Anthropic bill cache reads at
-        # ~10% of input rate after the first call. Cache TTL is 5 min,
-        # refreshed on each hit — fine for an interactive session. This
-        # explicit marker is the read point that survives anything that
-        # happens later in `messages` (a rollback, a /thinking toggle); the
-        # conversation itself is cached separately below.
+        # Cache the system prompt separately so it can still be reused after
+        # a rollback or a change to thinking settings.
         system_blocks = [{
             "type": "text",
             "text": system,
@@ -3543,23 +3282,17 @@ class AnthropicProvider(Provider):
             max_tokens=ANTHROPIC_MAX_TOKENS,
         )
         if thinking:
-            # tool_choice stays unset (=auto), the only mode compatible with
-            # thinking. Raise the token cap so the model has room to reason
-            # AND answer/act in one turn.
+            # Thinking requires automatic tool choice and more output tokens.
             kwargs["max_tokens"] = ANTHROPIC_THINKING_MAX_TOKENS
             if _thinking_mode(self.model) == "adaptive":
-                # Opus 4.7/4.8, Sonnet 4.6, Opus 4.6. Manual budget_tokens 400s
-                # on Opus 4.7/4.8. Interleaved thinking is auto-enabled, so no
-                # beta header. Routed through extra_body so an older pinned SDK
-                # that predates these fields doesn't reject them.
+                # Adaptive thinking works across tool calls without a beta
+                # header. Use extra_body for older SDKs.
                 kwargs["extra_body"] = {
                     "thinking": {"type": "adaptive"},
                     "output_config": {"effort": effort},
                 }
             else:
-                # Haiku 4.5 / older Claude 4: manual budget. The interleaved
-                # beta lets reasoning span tool calls and budget exceed
-                # max_tokens.
+                # The legacy beta lets reasoning span tools and exceed max_tokens.
                 kwargs["thinking"] = {
                     "type": "enabled",
                     "budget_tokens": ANTHROPIC_THINKING_BUDGET,
@@ -3568,43 +3301,27 @@ class AnthropicProvider(Provider):
                     "anthropic-beta": ANTHROPIC_INTERLEAVED_BETA
                 }
         elif _thinking_headroom(self.model):
-            # Opus 5.5 / Fable 5.x: no way to disable thinking (disabled 400s).
-            # Send no thinking field and no effort (server default applies),
-            # but size and stream the turn for thinking — see
-            # _THINKING_ALWAYS_ON_MODELS. An unlisted model gets the same
-            # shape, since it may think by default (_thinking_unverified).
+            # Use the server's defaults. Always-thinking and unverified
+            # models may still need the larger token limit.
             kwargs["max_tokens"] = ANTHROPIC_THINKING_MAX_TOKENS
         elif (off := _thinking_off_payload(self.model)) is not None:
-            # Sonnet 5 / Opus 5 / Haiku 5.5 / Sonnet 5.5 think by default when
-            # no `thinking` field is present. Send the model's off form
-            # explicitly to honor /thinking off and the off-by-default cost
-            # rationale above. No effort is sent: every off form 400s at
-            # xhigh|max, and the server default is high or below.
+            # Some models need an explicit setting for /thinking off.
+            # Let the server choose an effort compatible with that setting.
             kwargs["extra_body"] = {"thinking": dict(off)}
         if self.cache_conversation:
-            # Automatic caching: a top-level cache_control makes the API put
-            # a breakpoint on the last cacheable block of each request and
-            # move it forward as the conversation grows. Without it only the
-            # system prompt was cached, so every iteration of the tool loop
-            # re-billed the whole history (each command's output included)
-            # at the full input rate. Now the prior history reads back at
-            # the cache rate and only the new tail is written. It takes one
-            # of the four breakpoint slots (the system marker is the other)
-            # and shares that marker's 5-minute TTL, which the API requires
-            # to be no longer than the one before it. Via extra_body like
-            # the thinking fields, so the SDK floor need not know the param.
-            # A rollback only drops the tail: the next request's breakpoint
-            # looks back up to 20 positions and finds the earlier entry. A
-            # /thinking or /effort change re-writes the messages cache once.
+            # Advance the cache marker so Anthropic reuses earlier messages
+            # and caches only the new ones; without it every tool-loop call
+            # re-billed the whole history at the full input rate. It uses one
+            # of the four breakpoints and keeps the system marker's 5-minute
+            # lifetime, which the API requires to be no longer than the one
+            # before it. Sent via extra_body for older SDKs. After a rollback
+            # the API reuses an earlier entry within 20 blocks; changing
+            # thinking or effort rebuilds the message cache once.
             kwargs.setdefault("extra_body", {})["cache_control"] = {
                 "type": "ephemeral"}
         if thinking or _thinking_headroom(self.model):
-            # A thinking turn raises max_tokens high enough that the SDK's
-            # non-streaming guard refuses the request (it estimates worst-case
-            # duration from max_tokens and blocks anything that could exceed
-            # ~10 min on a slow model like Opus). Stream and reassemble the
-            # final Message — same object shape as create(), so parsing below
-            # is unchanged. .stream() accepts the same params incl. extra_body.
+            # The SDK requires streaming at this token limit. Reassemble
+            # the response into the same Message object used below.
             with self.client.messages.stream(**kwargs) as stream:
                 resp = stream.get_final_message()
         else:
@@ -3614,11 +3331,8 @@ class AnthropicProvider(Provider):
         calls: list[ToolCall] = []
         raw_content: list[dict] = []
         for block in resp.content:
-            # Echo every block back unmodified — thinking blocks (with their
-            # signature) and redacted_thinking blocks MUST be preserved in the
-            # assistant turn during tool use, in original order, or the API
-            # rejects the next call. exclude_none keeps the payload valid;
-            # signature/thinking/data are non-null so they survive.
+            # Preserve the original block order, reasoning signatures, and
+            # redacted thinking so the API accepts the next tool result.
             raw_content.append(block.model_dump(exclude_none=True))
             if block.type == "text":
                 text_parts.append(block.text)
@@ -3696,8 +3410,7 @@ class AnthropicProvider(Provider):
     def append_tool_results(
         self, messages: list[dict], results: list[tuple[str, str]]
     ) -> None:
-        # Anthropic: ALL tool_result blocks for one assistant turn go in
-        # a single user message; mismatched batches are rejected.
+        # Anthropic requires one user message with all results for the turn.
         blocks = [
             {"type": "tool_result", "tool_use_id": tc_id, "content": content}
             for tc_id, content in results
@@ -3705,12 +3418,8 @@ class AnthropicProvider(Provider):
         messages.append({"role": "user", "content": blocks})
 
     def render_assistant(self, text: str, tool_calls: list["ToolCall"]) -> dict:
-        # Anthropic assistant content is a block list. Thinking blocks are NOT
-        # reconstructed here — a cross-provider transcript carries none, and the
-        # signature-bearing block needed for native thinking-replay cannot be
-        # forged. Consult is a fresh read, so this is correct. An assistant turn
-        # with neither text nor tool_use is invalid (empty content 400s), so a
-        # single-space text block stands in for that degenerate case.
+        # Replay only text and tool calls from the shared transcript.
+        # Anthropic requires a content block, so use a space for empty turns.
         content: list[dict] = []
         if text:
             content.append({"type": "text", "text": text})
@@ -3722,21 +3431,13 @@ class AnthropicProvider(Provider):
 
 
 # -----------------------------------------------------------------------------
-# Canonical transcript (provider-neutral) — basis for cross-provider consult
+# Shared transcript for /consult
 # -----------------------------------------------------------------------------
 #
-# The live `messages` list is always in the ACTIVE provider's wire format and
-# remains the single source of truth for execution. To ask a DIFFERENT provider
-# for a second opinion (/consult) we cannot hand it that format directly:
-# DeepSeek emits one `role:tool` message per call, OpenAI (Responses) one
-# function_call_output item per call, while Anthropic batches tool_result
-# blocks into one user message, and the assistant-turn shapes differ too. So we read the active history into a neutral event list (normalize) and
-# replay it into the target's format (render). No second copy is stored; the
-# canonical form is derived on demand, which is why it cannot drift from
-# `messages`. Thinking scratchpads are intentionally dropped — a consult is a
-# fresh read, and Anthropic's signature-bearing thinking blocks (like OpenAI's
-# encrypted reasoning items) cannot be forged for a turn another model
-# authored.
+# /consult translates the live history through a shared transcript format.
+# Each provider structures messages and tool results differently, so build
+# the transcript from the active history on demand. Reasoning blocks stay
+# with the original provider because they may be signed or encrypted.
 
 
 @dataclass
@@ -3756,9 +3457,7 @@ def normalize(provider_name: str, messages: list[dict]) -> list[CanonicalEvent]:
     symmetric regardless of which provider produced it."""
     events: list[CanonicalEvent] = []
     if provider_name == "openai":
-        # Responses input items. One assistant turn is several items
-        # (reasoning, message, function_call...), so consecutive assistant
-        # items fold into one event; reasoning items carry nothing neutral.
+        # Join consecutive Responses assistant items into one turn. Skip reasoning.
         def _asst() -> CanonicalEvent:
             if not events or events[-1].kind != "assistant":
                 events.append(CanonicalEvent("assistant"))
@@ -3962,7 +3661,7 @@ def select_provider() -> Provider:
         print(dim(f"[only {only} key available — using {only}]"))
         return make_provider(only)
 
-    # Multiple available — prompt interactively over exactly those present.
+    # Offer only providers with configured keys.
     labels = {"openai": "OpenAI", "anthropic": "Anthropic", "deepseek": "DeepSeek"}
     print(banner("Select LLM provider:"))
     for idx, name in enumerate(available, 1):
@@ -4033,9 +3732,7 @@ def explain_api_error(e: Exception) -> str:
             for cls in type(e).__mro__)
             or any(word in s.lower() for word in
                    ("connection", "timeout", "timed out"))):
-        # Both SDKs wrap transport exceptions. Keep the underlying DNS/TLS/
-        # socket error: the generic SDK message cannot identify the cause.
-        # Follow normal traceback chaining, guarding against exception cycles.
+        # Follow the exception chain to find the original network error.
         details: list[str] = []
         for cause in chain:
             detail = _redact_api_error(
@@ -4432,9 +4129,7 @@ def print_consult(
             print(f"{agent_tag(name)} {dim('(' + model + ')')}")
             print(fail(f"  [error] {turn}"))
             continue
-        # A refused or truncated turn proposes nothing: its tool_use may have
-        # been cut mid-input, so listing it as a "first move" would compare a
-        # command the model never finished writing against the reference.
+        # A refusal or cutoff can leave an unfinished first command.
         cmds = [] if turn.stop else _turn_commands(turn)
         proposed_norms.append({_norm_cmd(c) for c, _ in cmds})
         print(f"{agent_tag(name)} {dim('(' + model + ')')}"
@@ -4455,7 +4150,7 @@ def print_consult(
         if not cmds and not turn.text.strip():
             print(dim("  (no command, no text)"))
 
-    # Convergence note — literal-equality only, across consulted providers.
+    # Check whether consulted providers proposed exactly the same first command.
     nonempty = [s for s in proposed_norms if s]
     if len(nonempty) >= 2:
         common = set.intersection(*nonempty)
@@ -4546,15 +4241,10 @@ def run_consult(
         turn = p.chat(rendered, system, thinking=thinking, effort=effort)
         return name, p.model, turn
 
-    # Daemon threads + a queue, not a ThreadPoolExecutor: Ctrl-C must
-    # return to the prompt at once, and an executor cannot give that.
-    # Its `with` exit joins the workers, and shutdown(wait=False,
-    # cancel_futures=True) cancels nothing here (every call is already
-    # running, one worker per target) while interpreter exit still
-    # joins the non-daemon workers, so /exit after a cancelled consult
-    # would hang for an SDK timeout times its retries. A cancelled
-    # consult abandons its requests; they finish (and bill) in the
-    # background and their results are dropped.
+    # Daemon threads and a queue, not a ThreadPoolExecutor: an executor joins
+    # its workers on exit, so Ctrl-C could not return at once and /exit after a
+    # cancelled consult would hang for an SDK timeout. Cancelled requests still
+    # finish (and bill) in the background; their results are discarded.
     results_q: queue.Queue[tuple[str, str, Any]] = queue.Queue()
 
     def consult_worker(name: str) -> None:
@@ -4583,9 +4273,7 @@ def run_consult(
     print_consult(provider, reference, consult_results,
                   ref_aborted, fresh)
 
-    # Consult spend is reported separately and NOT folded into the
-    # session counters, which stay coupled to the active conversation's
-    # context-% accounting.
+    # Report consult costs separately from the live conversation's token totals.
     c_in = sum(t.usage.input_tokens for _, _, t in consult_results
                if not isinstance(t, str))
     c_out = sum(t.usage.output_tokens for _, _, t in consult_results
@@ -4609,12 +4297,8 @@ def run_repl(provider: Provider) -> None:
     session_out = 0                      # cumulative output tokens this session
     last_usage = Usage()                 # token usage from most recent call
     ctx_window = CONTEXT_WINDOWS.get(provider.model)   # may be None
-    # Normalized events of the most recently ABORTED turn, or None. An abort
-    # (q / Ctrl-C) rolls its user prompt out of `messages`, so /consult would
-    # otherwise fall back to the prior surviving turn. Captured here (already
-    # provider-neutral, so it survives a /provider switch) it lets /consult
-    # re-pose the aborted question — the "second opinion before running
-    # anything" path. Cleared on the next normally-completed turn.
+    # Keep the last aborted question for /consult, even after a provider
+    # switch. Clear it after the next normally completed turn.
     aborted_turn_events: list[CanonicalEvent] | None = None
 
     def fmt_tokens(u: Usage) -> str:
@@ -4696,14 +4380,10 @@ def run_repl(provider: Provider) -> None:
         if _update_check and (notice := _update_check.take()):
             print(warn(f"[{notice}]"))
         try:
-            # SYS_AGENT@host> tag: SYS_AGENT and > bold cyan, @host bold
-            # magenta. The uppercase literal is what separates it from a
-            # shell's user@host prompt; neither color is the Debian/Pi PS1's
-            # bold green, cyan matches the approval prompt (cyan = waiting on
-            # you), and magenta is used nowhere else, so the host stands out.
-            # The model moved to the agent> line, where it labels who
-            # answered. Passed whole to colored_input(), which handles the
-            # \001/\002 width markers (GNU readline) or prefix-print (libedit).
+            # The uppercase tag tells this apart from a shell prompt. Cyan
+            # matches the approval prompt (waiting on you); magenta is used
+            # nowhere else, so the host stands out, and neither is the Pi
+            # PS1's green. colored_input() handles prompt width per backend.
             prompt = (user_tag("SYS_AGENT") + host_tag(f"@{facts['node']}")
                       + user_tag(">") + " ")
             user_in = colored_input(prompt).strip()
@@ -4729,13 +4409,8 @@ def run_repl(provider: Provider) -> None:
             if not user_in:
                 continue
 
-        # Add the typed line to history explicitly. input()'s implicit add is
-        # disabled (init_readline) because it is unreliable with colored
-        # prompts on stdlib readline; doing it here makes recall deterministic
-        # across backends. Meta-commands are then dropped again so they do not
-        # pollute Up-arrow recall of real conversational prompts. A pasted
-        # block is flattened to one line: recall hands input() a single line
-        # regardless, so store the form that resubmits as the same message.
+        # Add history explicitly for consistent behavior with colored prompts.
+        # Drop meta-commands and store pasted text on one line for recall.
         if _HAVE_READLINE:
             try:
                 readline.add_history(" ".join(user_in.split()) if pasted
@@ -4745,9 +4420,7 @@ def run_repl(provider: Provider) -> None:
         if user_in.startswith("/") and not pasted:
             drop_last_history_entry()
 
-        # REPL meta-commands. Matched against `meta`, which is blank for a
-        # pasted block: pasted text starting with "/model" or equal to "/exit"
-        # is conversation, never a command.
+        # Treat every pasted block as conversation, even if it starts with "/".
         meta = "" if pasted else user_in
         if meta in ("/exit", "/quit"):
             return
@@ -4758,15 +4431,12 @@ def run_repl(provider: Provider) -> None:
             messages = provider.initial_messages(system)
             session_in = session_out = 0
             last_usage = Usage()
-            # An aborted turn's question belongs to the conversation just
-            # discarded; /consult must not resurrect it.
+            # Remove the saved question too so /consult respects the reset.
             aborted_turn_events = None
             print(dim("[conversation reset, token counters cleared]"))
             continue
         if meta == "/version":
-            # Foreground GitHub check (up to two requests). Ctrl-C cancels it
-            # and returns to the prompt: the idle-prompt handler above does
-            # not cover a running meta-command.
+            # Let Ctrl-C cancel an in-progress update check.
             try:
                 with Activity("checking GitHub"):
                     lines = version_report()
@@ -4823,9 +4493,7 @@ def run_repl(provider: Provider) -> None:
             ):
                 print(dim("usage: /provider openai|anthropic|deepseek"))
                 continue
-            # make_provider() imports the SDK on first use of a provider, which
-            # takes long enough on the Pi to catch a Ctrl-C. `provider` is only
-            # rebound on success, so a cancel leaves the session untouched.
+            # Switch only after the new SDK client is ready so Ctrl-C can cancel.
             try:
                 provider = make_provider(parts[1])
             except ValueError as e:
@@ -4855,12 +4523,11 @@ def run_repl(provider: Provider) -> None:
             if requested and requested in known:
                 chosen = requested
             elif requested and requested.startswith(prefixes):
-                # Unlisted but the prefix matches this provider — likely a
-                # newer release. Accept it, but warn it is unrecognised.
+                # Accept a matching model prefix with a warning.
                 print(warn(unlisted_model_warning(provider.name, requested)))
                 chosen = requested
             else:
-                # No arg, or a wrong-provider / nonsense name: show selector.
+                # Offer the picker for a missing or unrecognized name.
                 if requested:
                     print(err_bold(
                         f"[not a valid {provider.name} model: {requested!r}]"
@@ -4882,9 +4549,7 @@ def run_repl(provider: Provider) -> None:
                        and parts[2] in ("on", "off"))
             if refresh or verbose:
                 want_verbose = parts[2] == "on" if verbose else facts_verbose
-                # Probe into locals and commit nothing until it completes: a
-                # Ctrl-C mid-probe keeps the previous facts, prompt, history,
-                # and verbose setting intact rather than half-updated.
+                # Apply the new facts only after the probe has finished.
                 try:
                     new_facts = (gather_verbose_host_facts() if want_verbose
                                  else gather_host_facts())
@@ -4928,9 +4593,7 @@ def run_repl(provider: Provider) -> None:
             continue
         if meta.startswith("/effort"):
             parts = meta.split()
-            # Valid set vs. bare/invalid query both render through the same
-            # readout, so the no-effect / clamp / thinking annotation is
-            # identical whether you set effort or just inspect it.
+            # Show the same effective effort when setting or inspecting it.
             if len(parts) == 2 and parts[1].lower() in _VALID_EFFORTS:
                 effort = parts[1].lower()
                 with_usage = False
@@ -4999,9 +4662,7 @@ def run_repl(provider: Provider) -> None:
                 print(dim("usage: /history | /history N | /history all"))
                 continue
             hist_path = _audit_path or os.path.expanduser(AUDIT_LOG_DEFAULT)
-            # render_history() reads and formats the whole log (`all` on a
-            # long-lived Pi log is slow); page_text() handles a Ctrl-C inside
-            # the pager, but not one during its reap wait. Read-only either way.
+            # Let Ctrl-C cancel slow log reads or waits for the pager to exit.
             try:
                 text = render_history(hist_path, limit)
                 if text is None:
@@ -5017,21 +4678,13 @@ def run_repl(provider: Provider) -> None:
                         aborted_turn_events, system, thinking_enabled, effort)
             continue
 
-        # Snapshot history length so a mid-turn abort (Ctrl-C / 'q') can roll
-        # back to exactly this point — discarding the user msg, the assistant
-        # tool_use msg, and any tool_results from this turn (Design B).
+        # Remember where this turn starts so cancellation can remove it from history.
         turn_start = len(messages)
         messages.append({"role": "user", "content": user_in})
 
-        # Inner loop: keep calling the model until it stops requesting tools.
-        # thinking_enabled is read once here and held constant for the whole
-        # turn — toggling /thinking mid-turn is impossible (input only happens
-        # at the outer prompt) and the API would silently ignore it anyway.
+        # Keep calling the model until it stops requesting tools.
         iteration = 0
         while True:
-            # Liveness cue during the blocking call (thinking turns can be
-            # long). Activity stops + clears its line on __exit__ — including
-            # the KeyboardInterrupt path below, before the rollback prints.
             act_label = ("thinking"
                          if provider.thinking_active(thinking_enabled)
                          else "working")
@@ -5042,10 +4695,8 @@ def run_repl(provider: Provider) -> None:
                         thinking=thinking_enabled, effort=effort,
                     )
             except KeyboardInterrupt:
-                # Ctrl-C during the API call aborts the whole turn (Design B
-                # rollback): discard everything appended since the prompt so
-                # the conversation is left exactly as before this turn, valid
-                # for every provider. Does not end the session.
+                # Save the interrupted exchange for /consult and remove it
+                # from the live conversation.
                 print(fail("\n[interrupted — stopping workflow]"))
                 aborted_turn_events = normalize(provider.name,
                                                 messages[turn_start:])
@@ -5053,38 +4704,24 @@ def run_repl(provider: Provider) -> None:
                 break
             except Exception as e:          # noqa: BLE001
                 print(err_bold(f"[api error] {explain_api_error(e)}"))
-                # Only pop on first iteration (orphan user msg);
-                # on later iterations the conversation is in a valid state.
+                # Drop the unanswered question if the very first call failed.
                 if iteration == 0:
                     messages.pop()
                 break
             iteration += 1
 
-            # Accumulate token usage from this API call
             last_usage = turn.usage
-            # Whole prompt, cached tokens included. Anthropic's input_tokens
-            # is only the uncached remainder, a handful of tokens per call
-            # once the conversation is cached, so summing it made the
-            # session total read near zero there while OpenAI's
-            # input_tokens counted everything. The per-turn line still
-            # breaks out in / cache read / cache write, which bill
-            # differently.
+            # Include cached tokens in the session total. The per-call
+            # display shows them separately because they bill differently.
             session_in += last_usage.context_tokens
             session_out += last_usage.output_tokens
             if show_tokens:
                 print(fmt_tokens(last_usage))
 
-            # Stop-reason guard — runs BEFORE the assistant message is stored
-            # and before any tool call can reach the approval prompt. HTTP 200
-            # with stop_reason refusal/max_tokens is the one way a command the
-            # model did not finish writing can arrive looking well-formed, so
-            # this is the only place it can be caught (the deny list and the
-            # prompt both see a plausible string).
+            # An unfinished command can look valid. Check why the model
+            # stopped before storing the reply or asking for approval.
             if turn.stop == STOP_REFUSAL:
-                # Partial output is discarded whole (a refusal can cut a
-                # tool_use mid-input). Roll the turn back like Ctrl-C (Design
-                # B) and keep the question for /consult, which is the natural
-                # next move — another provider runs different classifiers.
+                # Remove the refused turn from history and keep it for /consult.
                 print(fail(f"\n{stop_notice(turn)}"))
                 if turn.tool_calls:
                     print(fail("[proposed command discarded — nothing ran]"))
@@ -5093,12 +4730,9 @@ def run_repl(provider: Provider) -> None:
                 del messages[turn_start:]
                 break
             if turn.stop == STOP_TRUNCATED and turn.tool_calls:
-                # A cut tool_use input parses as a valid partial object, so
-                # its command text cannot be trusted. Drop the assistant turn
-                # exactly like the api-error path: nothing appended means no
-                # dangling tool_use awaiting a tool_result, and on the first
-                # iteration the orphan question goes too. Later iterations
-                # keep their tool results so a resend continues from there.
+                # Drop the incomplete command. Remove the user's question on
+                # the first call. On later calls, keep earlier tool results
+                # so the conversation can continue from there.
                 print(warn(f"\n{stop_notice(turn)}"))
                 print(warn("[proposed command discarded as incomplete — "
                            "nothing ran]"))
@@ -5108,26 +4742,18 @@ def run_repl(provider: Provider) -> None:
 
             provider.append_assistant(messages, turn)
 
-            # Surface the reasoning scratchpad dimmed, ahead of any proposed
-            # command or the final answer. Only present when thinking is on.
             if turn.thinking_text:
                 print(dim(textwrap.indent(turn.thinking_text, "  │ ")))
 
             if not turn.tool_calls:
                 if turn.text:
-                    # Prefix colored, body plain (per preference). The dim
-                    # [model] names who answered; provider.model is read fresh
-                    # so a /model switch shows on the next answer.
+                    # Colored prefix, plain body (user preference).
                     print(f"\n{dim(f'[{short_model(provider.model)}]')} "
                           f"{agent_tag('agent>')} {turn.text}\n")
                 if turn.stop == STOP_TRUNCATED:
-                    # Text-only answer cut at the cap: what arrived is shown
-                    # and kept (valid history), flagged so the cut-off is
-                    # not mistaken for the model's full answer.
+                    # Keep partial text in history and mark it as cut off.
                     print(warn(stop_notice(turn)))
-                # A turn completed cleanly; any earlier aborted question is now
-                # stale — its successor (this turn) lives in `messages`, so
-                # /consult reads it from there.
+                # /consult now uses the question from this completed turn.
                 aborted_turn_events = None
                 break
 
@@ -5146,7 +4772,6 @@ def run_repl(provider: Provider) -> None:
 
                 deny = is_denied(cmd)
                 if deny:
-                    # blocked tag loud; command body and reason in normal red
                     print(f"\n{err_bold('[blocked]')} {visible(cmd)[0]}")
                     print(fail(f"   reason: {deny}"))
                     results.append((tc.id, json.dumps({"error": f"blocked locally: {deny}"})))
@@ -5155,9 +4780,7 @@ def run_repl(provider: Provider) -> None:
 
                 action, edited = prompt_approval(cmd, why, auto_approve)
                 if action == "stop":
-                    # Abort the whole turn and roll back (Design B). No
-                    # tool_result is appended for this or any remaining call;
-                    # the assistant tool_use message is discarded below.
+                    # Stop before running any remaining tools in this turn.
                     audit("abort", cmd, explanation=why)
                     stop_turn = True
                     break
@@ -5168,10 +4791,8 @@ def run_repl(provider: Provider) -> None:
 
                 to_run = edited or cmd
                 if edited:
-                    # The deny check above ran against the model's proposal;
-                    # an edit replaces that string, so re-check what will
-                    # actually be spawned. Without this, editing is a hole in
-                    # an otherwise always-on backstop.
+                    # Recheck the edited command because it replaces the
+                    # proposal that already passed the deny check.
                     deny = is_denied(to_run)
                     if deny:
                         print(f"\n{err_bold('[blocked]')} {visible(to_run)[0]}")
@@ -5181,16 +4802,14 @@ def run_repl(provider: Provider) -> None:
                         audit("deny", cmd, explanation=why,
                               edited=to_run, reason=deny)
                         continue
-                    # tag colored, edited command body plain
                     print(f"{warn('[running edited]:')} {visible(to_run)[0]}")
 
                 try:
                     with Activity("running"):
                         result = execute(to_run)
                 except KeyboardInterrupt:
-                    # execute() already killed the process group before
-                    # re-raising. Ctrl-C aborts the whole turn (Design B):
-                    # audit the kill, then stop and roll back below.
+                    # execute() has already stopped the process group.
+                    # Record the interrupt before rolling back the conversation.
                     print(fail("\n[interrupted — command cancelled]"))
                     audit("edit" if edited else "run", cmd,
                           explanation=why, edited=edited,
@@ -5214,11 +4833,8 @@ def run_repl(provider: Provider) -> None:
                       stdout=result.stdout, stderr=result.stderr)
 
             if stop_turn:
-                # Roll the conversation back to before this user turn so the
-                # interrupted exchange leaves no trace and the next prompt is
-                # valid on every provider. NOTE: commands already executed are
-                # NOT undone — rollback only forgets them in-context; their
-                # host side effects (and audit records) stand.
+                # Remove the interrupted turn from the live conversation.
+                # Commands already run keep their effects and audit records.
                 aborted_turn_events = normalize(provider.name,
                                                 messages[turn_start:])
                 del messages[turn_start:]
@@ -5226,22 +4842,15 @@ def run_repl(provider: Provider) -> None:
                 break
 
             provider.append_tool_results(messages, results)
-            # otherwise loop back to feed tool results into the next chat call
 
 
 # -----------------------------------------------------------------------------
-# Update check (is this file what GitHub main ships?)
+# Startup update check
 # -----------------------------------------------------------------------------
-# Compares the running file's git blob hash with sys_agent.py on GitHub main,
-# so it needs no version constant to keep in sync and works for any install
-# (clone, copy, uv run). Equal hashes are silent. A difference alone cannot
-# say who is newer, so when the file sits in a git checkout the compare API
-# classifies local HEAD against main; the answer comes from GitHub, not a
-# `git fetch`, so the check never touches the repo. Quiet when local is ahead
-# or HEAD equals main (uncommitted edits): the user runs something at least as
-# new as main. Unauthenticated GitHub API: 60 req/h per IP, two per startup.
-# Every failure (offline, DNS, rate limit, no git) is silent: a missed notice
-# costs nothing, a startup error would.
+# Compare the running file with GitHub main by content hash. When the file
+# differs and is in a checkout, ask GitHub how the commits compare before
+# showing a notice. Report differences for standalone copies. Fail quietly
+# so offline hosts and API rate limits do not interrupt startup.
 
 def _git_blob_sha(data: bytes) -> str:
     """The object id `git hash-object` gives this content; GitHub's contents
@@ -5272,10 +4881,7 @@ def update_status(path: str | None = None) -> tuple[bool, str]:
     always set, so /version can report the silent outcomes too (current,
     ahead, local edits, or why the check failed). Never raises Exception."""
     try:
-        # realpath, not abspath: the documented shortcut is a symlink in
-        # ~/.local/bin, and its directory is not the checkout, so the git
-        # lookup below would miss and "N commits behind" would degrade to
-        # the vague "differs" notice.
+        # Follow the launcher symlink to find the actual Git checkout.
         path = os.path.realpath(path or __file__)
         with open(path, "rb") as fh:
             local = _git_blob_sha(fh.read())
@@ -5292,11 +4898,10 @@ def update_status(path: str | None = None) -> tuple[bool, str]:
         except urllib.error.HTTPError as e:
             if e.code != 404:
                 raise
-            # HEAD is not on GitHub: unpushed local commits, base unknown.
+            # GitHub cannot compare against a commit it does not have.
             return True, (f"sys_agent.py differs from GitHub {UPDATE_BRANCH} and "
                           "this checkout has commits GitHub does not")
-        # compare/BASE...HEAD reports main relative to local: "ahead" means
-        # main has commits this checkout lacks.
+        # In this comparison, "ahead" means GitHub main has newer commits.
         status = cmp.get("status")
         behind, ahead = cmp.get("ahead_by", 0), cmp.get("behind_by", 0)
         if status == "ahead":
@@ -5349,7 +4954,7 @@ def _readline_backend() -> str:
 
 
 def _dist_version(name: str) -> str:
-    # Package metadata, not `import`: reading a version must not import an SDK.
+    # Read SDK versions without importing the packages.
     try:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
@@ -5500,9 +5105,8 @@ def init_config() -> list[str]:
     DEFAULT_OPENAI_MODEL = _env_str("SYS_OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
     DEFAULT_ANTHROPIC_MODEL = _env_str("SYS_ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL)
     DEFAULT_DEEPSEEK_MODEL = _env_str("SYS_DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
-    # Derived table — mutated in place so references captured elsewhere stay
-    # valid. Model strings are not validated against PROVIDER_MODELS: pinning
-    # an unlisted model via SYS_*_MODEL is a supported escape hatch.
+    # Update in place so existing references see the new defaults.
+    # SYS_*_MODEL can pin models outside the picker.
     DEFAULT_MODELS.update({
         "openai": DEFAULT_OPENAI_MODEL,
         "anthropic": DEFAULT_ANTHROPIC_MODEL,
@@ -5535,9 +5139,7 @@ def main() -> None:
     global _update_check
     explicit = os.environ.get("SYS_ENV_FILE")
     env_file = find_env_file(explicit)
-    # The env file is loaded before the first coloured output and before
-    # config resolution: it may set SYS_COLOR/NO_COLOR (read by init_color)
-    # and any SYS_* setting captured at import.
+    # Load the env file before reading configuration or printing colored output.
     loaded = load_env_file(env_file) if env_file else 0
     init_color()
     init_readline()
