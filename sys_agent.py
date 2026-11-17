@@ -4470,6 +4470,131 @@ def print_consult(
     print(dim("consult is read-only; nothing above was executed."))
 
 
+def _consult_plan(
+    provider_name: str, messages: list[dict],
+    aborted_turn_events: list[CanonicalEvent] | None, fresh: bool,
+) -> tuple[list[CanonicalEvent], list[tuple[str, str]], bool] | None:
+    """What /consult sends and compares: (the transcript each consulted
+    provider gets, the active provider's first move as the reference, whether
+    that reference is from an aborted turn). None when there is no question.
+
+    Two sources for the question:
+     (a) an ABORTED turn: its prompt was rolled out of `messages`, so re-pose
+         it. This is the "second opinion before running anything" path.
+     (b) normal: the last user message still in `messages`, re-posed so each
+         provider works it INDEPENDENTLY from the same prior context rather
+         than continuing past the active provider's already-complete answer
+         (which leaves nothing to respond to: an empty or redundant turn).
+         Read-only, so only each provider's FIRST move is compared.
+
+    The default keeps prior context (apples-to-apples with what the active
+    provider saw); `fresh` drops it to the bare question, for a context
+    switch where the accumulated session is dead weight paid for on every
+    consulted provider. Rollback (q) discards only the aborted turn, not the
+    earlier session, so both paths carry the same prior history."""
+    aborted_q: str | None = None
+    if aborted_turn_events is not None:
+        au = next((e for e in aborted_turn_events if e.kind == "user"), None)
+        aborted_q = au.text.strip() if au else None
+
+    if aborted_q and aborted_turn_events is not None:
+        question = aborted_q
+        prior = normalize(provider_name, messages)
+        reference = _first_move_commands(aborted_turn_events)
+        ref_aborted = True
+    else:
+        if not any(m.get("role") == "user" and isinstance(m.get("content"), str)
+                   for m in messages):
+            return None
+        events = normalize(provider_name, messages)
+        last_user = max(i for i, ev in enumerate(events) if ev.kind == "user")
+        question = events[last_user].text
+        prior = events[:last_user]
+        reference = _first_move_commands(events[last_user + 1:])
+        ref_aborted = False
+
+    q_event = CanonicalEvent("user", text=question)
+    return ([q_event] if fresh else prior + [q_event]), reference, ref_aborted
+
+
+def run_consult(
+    args: list[str], provider: Provider, messages: list[dict],
+    aborted_turn_events: list[CanonicalEvent] | None, system: str,
+    thinking: bool, effort: str,
+) -> None:
+    """/consult [--fresh|fresh|-f]: pose the current (or just-aborted)
+    question to every other configured provider at once and print each one's
+    opening move beside the active provider's. Read-only: it changes no
+    session state and executes nothing. Ctrl-C cancels it and returns."""
+    targets = [n for n in available_provider_names() if n != provider.name]
+    if not targets:
+        print(dim("[no other providers configured — set another API key "
+                  "to enable consult]"))
+        return
+    fresh = any(a in ("--fresh", "fresh", "-f") for a in args)
+    plan = _consult_plan(provider.name, messages, aborted_turn_events, fresh)
+    if plan is None:
+        print(dim("[no conversation yet — ask something first, then "
+                  "/consult for a second opinion]"))
+        return
+    trimmed, reference, ref_aborted = plan
+
+    def consult_one(name: str) -> tuple[str, str, Any]:
+        p = make_provider(name)
+        p.cache_conversation = False    # one-shot: see Provider
+        rendered = render(p, trimmed, system)
+        turn = p.chat(rendered, system, thinking=thinking, effort=effort)
+        return name, p.model, turn
+
+    # Daemon threads + a queue, not a ThreadPoolExecutor: Ctrl-C must
+    # return to the prompt at once, and an executor cannot give that.
+    # Its `with` exit joins the workers, and shutdown(wait=False,
+    # cancel_futures=True) cancels nothing here (every call is already
+    # running, one worker per target) while interpreter exit still
+    # joins the non-daemon workers, so /exit after a cancelled consult
+    # would hang for an SDK timeout times its retries. A cancelled
+    # consult abandons its requests; they finish (and bill) in the
+    # background and their results are dropped.
+    results_q: queue.Queue[tuple[str, str, Any]] = queue.Queue()
+
+    def consult_worker(name: str) -> None:
+        try:
+            results_q.put(consult_one(name))
+        except Exception as e:                  # noqa: BLE001
+            results_q.put((name, DEFAULT_MODELS.get(name, "?"),
+                           explain_api_error(e)))
+
+    consult_results: list[tuple[str, str, Any]] = []
+    try:
+        with Activity(f"consulting {len(targets)} provider(s)"):
+            for n in targets:
+                threading.Thread(target=consult_worker, args=(n,),
+                                 name=f"consult-{n}", daemon=True).start()
+            for _ in targets:
+                consult_results.append(results_q.get())
+    except KeyboardInterrupt:
+        print()
+        print(dim("[consult cancelled; in-flight requests abandoned]"))
+        return
+    # Stable display order matching available_provider_names().
+    order = {n: i for i, n in enumerate(available_provider_names())}
+    consult_results.sort(key=lambda r: order.get(r[0], 99))
+
+    print_consult(provider, reference, consult_results,
+                  ref_aborted, fresh)
+
+    # Consult spend is reported separately and NOT folded into the
+    # session counters, which stay coupled to the active conversation's
+    # context-% accounting.
+    c_in = sum(t.usage.input_tokens for _, _, t in consult_results
+               if not isinstance(t, str))
+    c_out = sum(t.usage.output_tokens for _, _, t in consult_results
+                if not isinstance(t, str))
+    if c_in or c_out:
+        print(dim(f"[consult cost (separate from session): "
+                  f"in={c_in} out={c_out}]"))
+
+
 def run_repl(provider: Provider) -> None:
     global _color_enabled, _audit_path
     facts_verbose = False
@@ -4888,120 +5013,8 @@ def run_repl(provider: Provider) -> None:
                 print(dim("[history cancelled]"))
             continue
         if meta.startswith("/consult"):
-            targets = [n for n in available_provider_names() if n != provider.name]
-            if not targets:
-                print(dim("[no other providers configured — set another API key "
-                          "to enable consult]"))
-                continue
-
-            # --fresh: consult the question ALONE (question + host facts), with
-            # NO prior conversational turns. Use it on a context switch — a new,
-            # self-contained question where the accumulated session is dead
-            # weight you'd otherwise pay for on every consulted provider. Applies
-            # uniformly: rollback (q) discards only the aborted turn, not the
-            # earlier session, so the abort path carries the same history as the
-            # skip (n) path and benefits identically.
-            args = meta.split()[1:]
-            fresh = any(a in ("--fresh", "fresh", "-f") for a in args)
-
-            # Two sources for the question to consult on:
-            #  (a) an ABORTED turn — its prompt was rolled out of `messages`, so
-            #      re-pose it. This is the "second opinion before running
-            #      anything" path.
-            #  (b) normal — the last user message still in `messages`.
-            aborted_q: str | None = None
-            if aborted_turn_events is not None:
-                au = next((e for e in aborted_turn_events if e.kind == "user"),
-                          None)
-                aborted_q = au.text.strip() if au else None
-
-            if aborted_q:
-                question = aborted_q
-                prior = normalize(provider.name, messages)
-                reference = _first_move_commands(aborted_turn_events)
-                ref_aborted = True
-            else:
-                if not any(
-                    (m.get("role") == "user" and isinstance(m.get("content"), str))
-                    for m in messages
-                ):
-                    print(dim("[no conversation yet — ask something first, then "
-                              "/consult for a second opinion]"))
-                    continue
-                events = normalize(provider.name, messages)
-                # Re-pose the LAST user question so each provider works it
-                # INDEPENDENTLY from the same prior context, rather than
-                # continuing past the active provider's already-complete answer
-                # (which leaves nothing to respond to — empty/redundant turn).
-                # Read-only means we see each provider's FIRST move only.
-                last_user = max(
-                    i for i, ev in enumerate(events) if ev.kind == "user"
-                )
-                question = events[last_user].text
-                prior = events[:last_user]
-                reference = _first_move_commands(events[last_user + 1:])
-                ref_aborted = False
-
-            # Default keeps prior context (apples-to-apples with what the active
-            # provider saw); --fresh drops it to the bare question.
-            q_event = CanonicalEvent("user", text=question)
-            trimmed = [q_event] if fresh else prior + [q_event]
-
-            def consult_one(name: str) -> tuple[str, str, Any]:
-                p = make_provider(name)
-                p.cache_conversation = False    # one-shot: see Provider
-                rendered = render(p, trimmed, system)
-                turn = p.chat(rendered, system,
-                              thinking=thinking_enabled, effort=effort)
-                return name, p.model, turn
-
-            # Daemon threads + a queue, not a ThreadPoolExecutor: Ctrl-C must
-            # return to the prompt at once, and an executor cannot give that.
-            # Its `with` exit joins the workers, and shutdown(wait=False,
-            # cancel_futures=True) cancels nothing here (every call is already
-            # running, one worker per target) while interpreter exit still
-            # joins the non-daemon workers, so /exit after a cancelled consult
-            # would hang for an SDK timeout times its retries. A cancelled
-            # consult abandons its requests; they finish (and bill) in the
-            # background and their results are dropped.
-            results_q: queue.Queue[tuple[str, str, Any]] = queue.Queue()
-
-            def consult_worker(name: str) -> None:
-                try:
-                    results_q.put(consult_one(name))
-                except Exception as e:                  # noqa: BLE001
-                    results_q.put((name, DEFAULT_MODELS.get(name, "?"),
-                                   explain_api_error(e)))
-
-            consult_results: list[tuple[str, str, Any]] = []
-            try:
-                with Activity(f"consulting {len(targets)} provider(s)"):
-                    for n in targets:
-                        threading.Thread(target=consult_worker, args=(n,),
-                                         name=f"consult-{n}", daemon=True).start()
-                    for _ in targets:
-                        consult_results.append(results_q.get())
-            except KeyboardInterrupt:
-                print()
-                print(dim("[consult cancelled; in-flight requests abandoned]"))
-                continue
-            # Stable display order matching available_provider_names().
-            order = {n: i for i, n in enumerate(available_provider_names())}
-            consult_results.sort(key=lambda r: order.get(r[0], 99))
-
-            print_consult(provider, reference, consult_results,
-                          ref_aborted, fresh)
-
-            # Consult spend is reported separately and NOT folded into the
-            # session counters, which stay coupled to the active conversation's
-            # context-% accounting.
-            c_in = sum(t.usage.input_tokens for _, _, t in consult_results
-                       if not isinstance(t, str))
-            c_out = sum(t.usage.output_tokens for _, _, t in consult_results
-                        if not isinstance(t, str))
-            if c_in or c_out:
-                print(dim(f"[consult cost (separate from session): "
-                          f"in={c_in} out={c_out}]"))
+            run_consult(meta.split()[1:], provider, messages,
+                        aborted_turn_events, system, thinking_enabled, effort)
             continue
 
         # Snapshot history length so a mid-turn abort (Ctrl-C / 'q') can roll

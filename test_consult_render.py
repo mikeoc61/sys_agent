@@ -670,7 +670,7 @@ def _ant_cache(model: str, thinking: bool, cache: bool = True) -> tuple:
 _EPH = {"type": "ephemeral"}
 _cache_got = {k: _ant_cache(*k) for k in _ant_want}
 import inspect as _insp_c
-_consult_src = _insp_c.getsource(S.run_repl)
+_consult_src = _insp_c.getsource(S.run_consult)
 _co = _consult_src[_consult_src.find("def consult_one"):]
 ok_cache = (all(v == (_EPH, _EPH, False) for v in _cache_got.values())
             and _ant_cache("claude-haiku-5-5", False, cache=False)
@@ -1511,6 +1511,134 @@ print(f"[output] long output keeps head and tail, states what was cut: "
       f"{'OK' if ok_clip else 'FAIL'}")
 if not ok_clip: fails.append("output-clip")
 
+
+# 25) /consult driven directly through run_consult and _consult_plan, with
+#     fake providers and no REPL. Tests 5-7 rebuild the question selection
+#     by hand; these call the real code: which question is re-posed, with
+#     what history, against which reference; the flag forms; a failing
+#     provider beside a working one; uncached one-shot providers; nothing in
+#     the session changed; and a Ctrl-C that prints nothing after the cancel.
+def _cs_turn(cmd, tid):
+    return S.ToolCall(tid, S.TOOL_NAME, {"command": cmd, "explanation": "x"})
+_cs_m: list = []
+_cs_m.append({"role": "user", "content": "brew up to date?"})
+OAI.append_rendered(_cs_m, "", [_cs_turn("brew outdated", "c1")])
+OAI.append_tool_results(_cs_m, [("c1", '{"stdout":"ok"}')])
+OAI.append_rendered(_cs_m, "All current.", [])
+_cs_m.append({"role": "user", "content": "disk ok?"})
+OAI.append_rendered(_cs_m, "", [_cs_turn("df -h", "c2")])
+_cs_ab: list = [{"role": "user", "content": "  security?  "}]
+OAI.append_rendered(_cs_ab, "", [_cs_turn("csrutil status", "c3")])
+_cs_aborted = S.normalize("openai", _cs_ab)
+
+def _cs_kinds(evs):
+    return [(e.kind, e.text) for e in evs]
+_pn = S._consult_plan("openai", _cs_m, None, False)
+_pf = S._consult_plan("openai", _cs_m, None, True)
+_pa = S._consult_plan("openai", _cs_m, _cs_aborted, False)
+_pa_nouser = S._consult_plan("openai", _cs_m, [], False)
+ok_plan = (
+    _pn is not None and _pn[0][-1].kind == "user" and _pn[0][-1].text == "disk ok?"
+    and [e.text for e in _pn[0] if e.kind == "user"] == ["brew up to date?", "disk ok?"]
+    and not any(e.kind == "assistant" and any(
+        tc.arguments.get("command") == "df -h" for tc in e.tool_calls)
+        for e in _pn[0])                          # active answer not sent
+    and _pn[1] == [("df -h", "x")] and _pn[2] is False
+    and _pf is not None and _cs_kinds(_pf[0]) == [("user", "disk ok?")]
+    and _pf[1] == _pn[1]
+    and _pa is not None and _pa[0][-1].text == "security?" and _pa[2] is True
+    and _pa[1] == [("csrutil status", "x")]
+    and [e.text for e in _pa[0] if e.kind == "user"]
+        == ["brew up to date?", "disk ok?", "security?"]
+    and _pa_nouser is not None and _pa_nouser[0][-1].text == "disk ok?"
+    and S._consult_plan("openai", [], None, False) is None)
+print(f"[consult-plan] question, history, reference per path: "
+      f"{'OK' if ok_plan else f'FAIL {_pn} {_pf} {_pa}'}")
+if not ok_plan: fails.append("consult-plan")
+
+_cs_calls: list = []
+def _cs_make(name, model=None):
+    cls = {"anthropic": S.AnthropicProvider, "deepseek": S.DeepSeekProvider}[name]
+    p = _mk(cls, name, {"anthropic": "claude-haiku-5-5",
+                         "deepseek": "deepseek-flash"}[name])
+    def chat(messages, system, thinking=False, effort="high"):
+        _cs_calls.append((name, messages, thinking, effort,
+                          p.cache_conversation))
+        if name == "deepseek":
+            raise RuntimeError("deepseek exploded")
+        return S.ChatTurn(text="", tool_calls=[_cs_turn("df -h", "a1")],
+                          raw_message={}, usage=S.Usage(input_tokens=10,
+                                                        output_tokens=5))
+    p.chat = chat
+    return p
+def _cs_run(args, names=("openai", "anthropic", "deepseek"),
+            aborted=None, messages=None):
+    _cs_calls.clear()
+    saved = (S.available_provider_names, S.make_provider)
+    S.available_provider_names = lambda: list(names)
+    S.make_provider = _cs_make
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            S.run_consult(args, OAI, _cs_m if messages is None else messages,
+                          aborted, SYS, True, "max")
+    finally:
+        S.available_provider_names, S.make_provider = saved
+    return buf.getvalue()
+_cs_before = json.dumps(_cs_m, default=str)
+_o1 = _cs_run([])
+_c1 = list(_cs_calls)
+_ant1 = next(c for c in _c1 if c[0] == "anthropic")
+_o2 = _cs_run(["--fresh"]); _ant2 = next(c for c in _cs_calls if c[0] == "anthropic")
+_ufresh = {}
+for _flag in ("fresh", "-f", "--bogus"):
+    _cs_run([_flag])
+    _ufresh[_flag] = sum(1 for m in next(c for c in _cs_calls if c[0] == "anthropic")[1]
+                         if m.get("role") == "user")
+_o3 = _cs_run([], aborted=_cs_aborted)
+_o4 = _cs_run([], names=("openai",))
+_n4 = len(_cs_calls)
+_o5 = _cs_run([], messages=[])
+_n5 = len(_cs_calls)
+ok_run = (
+    "reference — openai/gpt-5.4-mini first move on this question" in _o1
+    and "[matches reference]" in _o1
+    and "deepseek exploded" in _o1 and "[error]" in _o1
+    and _o1.index("anthropic") < _o1.index("deepseek exploded")
+    and "consult cost (separate from session): in=10 out=5" in _o1
+    and "[--fresh" not in _o1
+    and {c[0] for c in _c1} == {"anthropic", "deepseek"}
+    and all(c[2] is True and c[3] == "max" and c[4] is False for c in _c1)
+    and _ant1[1][-1]["role"] == "user" and "disk ok?" in json.dumps(_ant1[1][-1])
+    and sum(1 for m in _ant1[1] if m.get("role") == "user") > 1
+    and "[--fresh" in _o2
+    and [m for m in _ant2[1] if m.get("role") == "user"] == [_ant2[1][-1]]
+    and len(_ant2[1]) == 1
+    and _ufresh["fresh"] == 1 and _ufresh["-f"] == 1 and _ufresh["--bogus"] > 1
+    and "first move on the aborted question (not run)" in _o3
+    and "csrutil status" in _o3
+    and "no other providers configured" in _o4 and _n4 == 0
+    and "no conversation yet" in _o5 and _n5 == 0
+    and json.dumps(_cs_m, default=str) == _cs_before)
+print(f"[consult-run] targets, flags, errors, order, cost, uncached, "
+      f"read-only: {'OK' if ok_run else 'FAIL'}")
+if not ok_run: fails.append("consult-run")
+
+class _CsInterrupt:
+    def __init__(self, label): pass
+    def __enter__(self): raise KeyboardInterrupt
+    def __exit__(self, *a): return False
+_cs_act = S.Activity
+S.Activity = _CsInterrupt
+try:
+    _o6 = _cs_run([])
+finally:
+    S.Activity = _cs_act
+ok_cs_cancel = ("[consult cancelled; in-flight requests abandoned]" in _o6
+                and "── consult" not in _o6 and "consult cost" not in _o6)
+print(f"[consult-run] Ctrl-C stops before any output: "
+      f"{'OK' if ok_cs_cancel else 'FAIL'}")
+if not ok_cs_cancel: fails.append("consult-cancel")
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILURES: {fails}")
 sys.exit(1 if fails else 0)
