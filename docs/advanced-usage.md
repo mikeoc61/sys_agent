@@ -63,7 +63,9 @@ are preserved.
 
 Changing the model keeps the same provider and session state, including the
 conversation. That holds across OpenAI models too: a conversation started on
-`gpt-6.1-sol` carries on after `/model gpt-6-luna` (checked 2026-11-16).
+`gpt-6.2-sol` carries on after `/model gpt-6-luna` (checked 2026-11-17). Moving
+to a less capable OpenAI model makes OpenAI discard the earlier turns' hidden
+reasoning; the conversation itself is kept.
 Unknown context windows are allowed; token display falls back to absolute
 token counts.
 
@@ -83,20 +85,21 @@ The OpenAI model list, in order:
 | `gpt-6-luna` | $0.10 / $0.50 | Default since 2026-11-16; lowest cost |
 | `gpt-6.1-terra` | $1 / $5 | Middle option |
 | `gpt-6-sol` | $2 / $10 | Strong option; can turn reasoning off |
-| `gpt-6.1-sol` | $2 / $10 | Newest Sol; always reasons |
+| `gpt-6.2-sol` | $2 / $10 | Newest Sol; always reasons |
 | `gpt-5.4-mini` | $0.75 / $4.50 | Default until 2026-11-16 |
 
 [Model notes](models.md) has the prices and test results behind each choice.
 
-`gpt-6.1-sol` always reasons: it rejects reasoning effort `none`, so with
+`gpt-6.2-sol` always reasons: it rejects reasoning effort `none`, so with
 `/thinking off` sys_agent sends its lowest grade, `low`, and the state reads
 `on (always on ...)`.
 
-`gpt-6-astra` works but is left out of the list. At $10/$50 per million
-input/output tokens it is in the same tier as `claude-fable-5`, which is too
-expensive for this workload. `/model gpt-6-astra` or `SYS_OPENAI_MODEL=gpt-6-astra`
-still selects it, with an unlisted-model warning. Like `gpt-6.1-sol`, it always
-reasons.
+`gpt-6-astra` and `gpt-6.2-astra` work but are left out of the list. At
+$10/$50 and $8/$40 per million input/output tokens they are in the same tier as
+`claude-fable-5`, which is too expensive for this workload. `/model gpt-6-astra`
+or `SYS_OPENAI_MODEL=gpt-6.2-astra` still selects one, with an unlisted-model
+warning. `gpt-6.1-sol`, listed until 2026-11-17, works the same way. All three
+always reason.
 
 `gpt-4o-mini`, `gpt-5.6-luna`, and `gpt-5.6-terra` were removed from the model
 list on 2026-09-23. Each costs the same as or more than a GPT-6 replacement.
@@ -340,11 +343,11 @@ which is shown dimmed like other providers' thinking. `gpt-5.4-mini` stops at
 `xhigh`, so `max` is sent as `xhigh` there and `/effort` says so. `/thinking off`
 sends each model's lowest grade: `none` on `gpt-6-luna`, `gpt-6.1-terra`,
 `gpt-6-sol`, `gpt-5.4-mini`, and GPT-5.6, which turns reasoning off; `low` on
-`gpt-6.1-sol` and `gpt-6-astra`, which reject `none` and so always reason (the
-state reads `on (always on ...)`). Every OpenAI model rejects `minimal`.
+`gpt-6.2-sol`, `gpt-6.1-sol`, and both Astras, which reject `none` and so always
+reason (the state reads `on (always on ...)`). Every OpenAI model rejects `minimal`.
 `gpt-4o-mini` is not a reasoning model and is sent no reasoning field; its
 state reads `on (inactive: ...)` when the flag is on. The grades each model
-accepts were taken from the API on 2026-11-16. A newer OpenAI model reached
+accepts were taken from the API on 2026-11-16 (GPT-6.2 on 2026-11-17). A newer OpenAI model reached
 through the `gpt-` prefix is sent no reasoning field until it has been
 checked, so it runs at OpenAI's default effort whatever `/thinking` says.
 `/info` reports `thinking_enabled`, `thinking_active`, and `thinking_mode`

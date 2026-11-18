@@ -149,6 +149,8 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-6-sol":     1_050_000,
     "gpt-6.1-sol":   1_050_000,
     "gpt-6.1-terra": 1_050_000,
+    "gpt-6.2-astra": 1_050_000,
+    "gpt-6.2-sol":   1_050_000,
     # Anthropic
     "claude-haiku-4-5-20251001": 200_000,
     "claude-haiku-5-5":        1_000_000,
@@ -175,7 +177,7 @@ PROVIDER_MODELS: dict[str, tuple[str, ...]] = {
         "gpt-6-luna",
         "gpt-6.1-terra",
         "gpt-6-sol",
-        "gpt-6.1-sol",
+        "gpt-6.2-sol",
         "gpt-5.4-mini",
     ),
     "anthropic": (
@@ -213,7 +215,9 @@ _OPENAI_REASONING_EFFORTS: dict[str, tuple[str, ...]] = {
     "gpt-5.6-sol":   _OPENAI_EFFORTS_FULL,
     "gpt-5.4-mini":  ("none", "low", "medium", "high", "xhigh"),
     "gpt-6.1-sol":   _OPENAI_EFFORTS_NO_NONE,
+    "gpt-6.2-sol":   _OPENAI_EFFORTS_NO_NONE,
     "gpt-6-astra":   _OPENAI_EFFORTS_NO_NONE,
+    "gpt-6.2-astra": _OPENAI_EFFORTS_NO_NONE,
 }
 
 # =============================================================================
@@ -332,7 +336,7 @@ def _openai_effort(model: str, thinking: bool, effort: str) -> str | None:
     """reasoning.effort to send for an OpenAI model, or None for no field.
 
     /thinking off sends the model's lowest grade: "none" where accepted,
-    else "low" (gpt-6.1-sol, gpt-6-astra always reason). /thinking on sends
+    else "low" (6.1/6.2-sol and the Astras always reason). /thinking on sends
     the session effort, clamped down to the highest grade the model accepts
     (max -> xhigh on gpt-5.4-mini), since sending an unlisted grade 400s."""
     levels = _OPENAI_REASONING_EFFORTS.get(model)
@@ -2891,7 +2895,10 @@ class OpenAIProvider(Provider):
     are accepted, which is what lets render() rebuild function_calls for a
     transcript another provider wrote. A reasoning model's items replayed
     to a different OpenAI model (gpt-6.1-sol -> gpt-6-luna) are accepted
-    too, so /model mid-session needs no history rewrite.
+    too, so /model mid-session needs no history rewrite. From GPT-6.2 the
+    server silently drops reasoning items after an edit BEFORE them or on a
+    downgrade; whole-item deletion and appending do not trigger it, so the
+    REPL's trailing-only rollbacks keep reasoning (probes 2026-11-17).
     """
 
     def __init__(self, model: str) -> None:
@@ -3749,7 +3756,7 @@ def unlisted_model_warning(provider_name: str, model: str) -> str:
     """Warning for a prefix-matched model absent from PROVIDER_MODELS.
 
     The context-% hedge applies only when CONTEXT_WINDOWS lacks the model;
-    deliberately-unlisted models (claude-fable-5, gpt-5.6-sol, gpt-6-astra)
+    deliberately-unlisted models (claude-fable-5, gpt-5.6-sol, gpt-6.2-astra)
     have windows recorded and display context-% normally.
     """
     tail = ("" if model in CONTEXT_WINDOWS

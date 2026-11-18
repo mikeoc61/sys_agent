@@ -27,8 +27,8 @@ Each model has one of three statuses:
 
 ## OpenAI
 
-Checked November 2026. Every GPT-6 and GPT-6.1 model has a 1.05M-token context
-and 128K max output; above 272K input tokens, the input rate doubles and the
+Checked November 2026. Every GPT-6, GPT-6.1 and GPT-6.2 model has a 1.05M-token
+context and 128K max output; above 272K input tokens, the input rate doubles and the
 output rate is 1.5x.
 
 ### Listed, in picker order
@@ -48,10 +48,25 @@ output rate is 1.5x.
 - **`gpt-6-sol`**: $2/$10. The GPT-6 tier above Luna (GPT-6 had no Terra; in
   GPT-5.6, Sol was the top tier). Not deprecated (deprecations page,
   2026-11-16).
-- **`gpt-6.1-sol`**: $2/$10, cached input $0.10. The same price as `gpt-6-sol`,
-  one generation newer. Always reasons: it rejects effort `none` and `minimal`.
-  Its tools work only on the Responses API, so it could not be used here until
-  v1.31.0 moved OpenAI to that API.
+- **`gpt-6.2-sol`**: $2/$10, cached input $0.10 (docs, 2026-11-17; knowledge
+  cutoff 2026-06-01). Released 2026-11-17; replaced `gpt-6.1-sol` in the list
+  the same day, at the same price and one generation newer. Always reasons:
+  its unsupported-value 400 lists `low`, `medium`, `high`, `xhigh`, `max`, so
+  `/thinking off` sends `low`.
+  - From GPT-6.2 on, the API silently removes replayed reasoning items after an
+    edit to the history before them (`prefix_mismatch`) or a move to a less
+    capable model (`model_mismatch`), per OpenAI's reasoning guide. Deleting
+    whole items or appending after them does not trigger it, so sys_agent's
+    rollbacks (trailing removals only) keep reasoning. No case 400s.
+  - 2026-11-17 raw probe (input tokens of the next call after a 748-token
+    reasoning turn): verbatim replay 1346; reasoning stripped 596; first user
+    message edited 595 (dropped); to `gpt-6-luna` 586 and `gpt-6.1-sol` 586
+    (dropped); to `gpt-6.2-astra` 1346 (kept, an upgrade); history plus a new
+    prompt, the shape a rollback leaves, 1356 (kept).
+  - 2026-11-17 live probes (Mac, real system prompt): `oai_sol62_off`,
+    `oai_sol62_toggle` (high, low, max), `oai_switch62` (to Luna) and
+    `oai_rollback62` (reasoning items from the first turn replay after the
+    second is rolled back; the third turn's input matches the second's) pass.
 - **`gpt-5.4-mini`**: $0.75/$4.50, 400K context. Default until 2026-11-16, kept
   listed as the fallback if a newer model falls short. No deprecation entry
   (2026-11-16).
@@ -69,6 +84,12 @@ value (2026-11-16); no model accepts `minimal`.
 
 ### Unlisted
 
+- **`gpt-6.1-sol`**: $2/$10. Listed until 2026-11-17, when `gpt-6.2-sol`
+  replaced it at the same price. Always reasons (rejects `none`). Its tools
+  work only on the Responses API. Not deprecated (2026-11-17).
+- **`gpt-6.2-astra`**: $8/$40, cached input $0.40 (docs, 2026-11-17). Cheaper
+  than `gpt-6-astra` but still in the `claude-fable-5-2` tier. Always reasons
+  (accepts `low` to `max`); not live-probed beyond its effort grades.
 - **`gpt-6-astra`**: the flagship, $10/$50. Its price alone puts it in the
   `claude-fable-5` tier, the wrong tier for routine host work. It works on the
   Responses path and always reasons.

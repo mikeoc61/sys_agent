@@ -432,7 +432,7 @@ print("[apierr] malformed credential headers identified, credentials redacted: O
 #     fake client records the request. Grades come from each model's 400
 #     (probes 2026-11-16): an unaccepted grade 400s the whole turn, so
 #     /thinking off must send "none" only where accepted and "low" on
-#     gpt-6.1-sol / gpt-6-astra; gpt-4o-mini 400s on any reasoning field.
+#     6.1/6.2-sol and the Astras; gpt-4o-mini 400s on any reasoning field.
 class _Item:
     def __init__(self, d: dict) -> None: self._d = d
     def model_dump(self, **_): return json.loads(json.dumps(self._d))
@@ -473,6 +473,7 @@ def _sent(model: str, thinking: bool = False, effort: str = "high"):
 _want_off = {"gpt-6-luna": "none", "gpt-6.1-terra": "none", "gpt-6-sol": "none",
              "gpt-5.6-luna": "none", "gpt-5.4-mini": "none",
              "gpt-6.1-sol": "low", "gpt-6-astra": "low",
+             "gpt-6.2-sol": "low", "gpt-6.2-astra": "low",
              "gpt-4o-mini": None, "gpt-9-nova": None}
 _eff_off = {m: _sent(m).get("reasoning", {}).get("effort") for m in _want_off}
 _k = _sent("gpt-6.1-sol", thinking=True, effort="xhigh")
@@ -489,7 +490,7 @@ ok_eff = (
     and _mini_max == {"effort": "xhigh", "summary": "auto"}   # clamped, not 400
     and "summary" not in _luna_off["reasoning"]               # off: no summary
     and _listed == ("gpt-6-luna", "gpt-6.1-terra", "gpt-6-sol",
-                    "gpt-6.1-sol", "gpt-5.4-mini")
+                    "gpt-6.2-sol", "gpt-5.4-mini")
     and "gpt-4.1-nano" not in S.CONTEXT_WINDOWS
     and all(m in S.CONTEXT_WINDOWS for m in _want_off if m != "gpt-9-nova"))
 print(f"[openai] Responses effort routing (none/low floor, clamp, no field "

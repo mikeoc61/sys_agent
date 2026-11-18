@@ -49,6 +49,14 @@ Checks:
   oai_switch       gpt-6.1-sol on(high), then /model gpt-6-luna (off) on the
                    SAME history: the 6.1-sol reasoning items replay to Luna.
   oai_rollback     gpt-6.1-sol: second turn rolled back whole, third sent.
+  oai_sol62_off    gpt-6.2-sol, /thinking off: effort "low" (it rejects "none").
+  oai_sol62_toggle gpt-6.2-sol on(high) -> off -> on(max) over one history.
+  oai_switch62     gpt-6.2-sol on(high), then /model gpt-6-luna (off): a
+                   downgrade, where 6.2 drops replayed reasoning server-side;
+                   it must still not 400.
+  oai_rollback62   gpt-6.2-sol on(high) -> off -> off, second turn rolled back
+                   whole: the first turn's reasoning items replay on the third
+                   (a trailing removal is not the prefix edit 6.2 drops on).
   oai_consult      gpt-6-luna on a history rendered from another provider's
                    transcript (assistant message + function_call items with
                    no ids or reasoning): what /consult sends.
@@ -326,24 +334,31 @@ def expect_oai(name: str, res: dict) -> list[str]:
     if name in ("oai_luna_off", "oai_consult"):
         if set(efforts) != {"none"} or any(summaries):
             bad.append(f"efforts={efforts} summaries={summaries}")
-    elif name in ("oai_sol61_off", "oai_rollback"):
+    elif name in ("oai_sol61_off", "oai_rollback", "oai_sol62_off"):
         if set(efforts) != {"low"} or any(summaries):
             bad.append(f"efforts={efforts} summaries={summaries}")
         if not all(t["status"].startswith("on (always on") for t in res["turns"]):
             bad.append("status line not 'on (always on ...)'")
-    elif name == "oai_sol61_toggle":
-        if not {"high", "low", "xhigh"} <= set(efforts):
-            bad.append(f"toggle did not exercise high/low/xhigh: {efforts}")
+    elif name == "oai_rollback62":
+        if not {"high", "low"} <= set(efforts):
+            bad.append(f"efforts={efforts}")
+        if not reqs or not reqs[-1]["n_reasoning_replayed"]:
+            bad.append("no reasoning items replayed after the rollback (case not exercised)")
+    elif name in ("oai_sol61_toggle", "oai_sol62_toggle"):
+        top = "xhigh" if name == "oai_sol61_toggle" else "max"
+        if not {"high", "low", top} <= set(efforts):
+            bad.append(f"toggle did not exercise high/low/{top}: {efforts}")
     elif name == "oai_astra_on":
         if not {"low"} == set(efforts):
             bad.append(f"efforts={efforts}")
-    elif name == "oai_switch":
+    elif name in ("oai_switch", "oai_switch62"):
+        src = "gpt-6.1-sol" if name == "oai_switch" else "gpt-6.2-sol"
         models = [r["model"] for r in reqs]
-        if "gpt-6-luna" not in models or "gpt-6.1-sol" not in models:
+        if "gpt-6-luna" not in models or src not in models:
             bad.append(f"switch not exercised: {models}")
         replayed = [r["n_reasoning_replayed"] for r in reqs if r["model"] == "gpt-6-luna"]
         if not any(replayed):
-            bad.append("no 6.1-sol reasoning items reached Luna (switch case not exercised)")
+            bad.append(f"no {src} reasoning items reached Luna (switch case not exercised)")
     return bad
 
 
@@ -402,6 +417,10 @@ def main() -> int:
         "oai_switch": ("gpt-6.1-sol", [(True, "high"), off, off]),
         "oai_rollback": ("gpt-6.1-sol", [off, off, off]),
         "oai_consult": ("gpt-6-luna", [off, off]),
+        "oai_sol62_off": ("gpt-6.2-sol", [off, off, off]),
+        "oai_sol62_toggle": ("gpt-6.2-sol", [(True, "high"), off, (True, "max")]),
+        "oai_switch62": ("gpt-6.2-sol", [(True, "high"), off, off]),
+        "oai_rollback62": ("gpt-6.2-sol", [(True, "high"), off, off]),
     }
     consult_seed = [
         S.CanonicalEvent("user", text="Is the root filesystem filling up?"),
@@ -434,8 +453,9 @@ def main() -> int:
         model, phases = checks[name]
         print(f"[{name}] {model} ...", flush=True)
         res = session(model, phases, system,
-                      rollback_phase=1 if name in ("fable52_rollback", "oai_rollback") else None,
-                      switch=(1, "gpt-6-luna") if name == "oai_switch" else None,
+                      rollback_phase=1 if name in ("fable52_rollback", "oai_rollback",
+                                                   "oai_rollback62") else None,
+                      switch=(1, "gpt-6-luna") if name in ("oai_switch", "oai_switch62") else None,
                       seed=consult_seed if name == "oai_consult" else None)
         bad = check_common(res)
         if name == "sonnet55_off":
